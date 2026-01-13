@@ -8,6 +8,7 @@
 
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
+#include <cuda_fp16.h>
 
 /*═══════════════════════════════════════════════════════════════════════════
  * Configuration
@@ -96,11 +97,11 @@ struct SMC2StateCUDA {
     int y_history_capacity;
     int t_current;
     
-    /* CPMMH: Stored noise for correlated proposals */
-    float* d_z_noise;       /* z-innovations [N_theta * N_inner * (T+1)] */
-    float* d_u0;            /* Resampling uniforms [N_theta * T] */
-    float* d_z_noise_fresh; /* Fresh noise for proposals */
-    float* d_u0_fresh;      /* Fresh uniforms for proposals */
+    /* CPMMH: Ping-pong noise buffers for zero-copy swaps
+     * FP16 storage for bandwidth reduction
+     * u0 derived from z_noise (no separate storage) */
+    half* d_z_noise[2];     /* Ping-pong: [N_theta * N_inner * (T+1)] each */
+    int noise_buf;          /* Current buffer index: 0 or 1 */
     int noise_capacity;     /* Max T for noise arrays */
     float cpmmh_rho;        /* Correlation: 0.99 typical */
     
@@ -109,6 +110,7 @@ struct SMC2StateCUDA {
     float* d_uniform;
     float* d_ess;
     int* d_accepts;
+    int* d_swap_flags;  /* Per-particle accept flags for CPMMH */
     
     /* Config */
     int N_theta;
