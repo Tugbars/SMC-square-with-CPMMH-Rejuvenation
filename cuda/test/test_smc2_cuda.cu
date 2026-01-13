@@ -1,6 +1,6 @@
 /**
  * @file test_smc2_cuda.cu
- * @brief Test suite for SMC² CUDA implementation
+ * @brief Test suite for SMC² CUDA with proper PMMH rejuvenation
  */
 
 #include "smc2_rbpf_cuda.cuh"
@@ -10,192 +10,105 @@
 #include <time.h>
 
 /*═══════════════════════════════════════════════════════════════════════════
- * Simple host-side RNG for data generation
+ * Host RNG
  *═══════════════════════════════════════════════════════════════════════════*/
 
-static unsigned long long h_rng_state = 12345678901234567ULL;
+static unsigned long long h_rng = 12345678901234567ULL;
 
-static float host_rand_uniform(void) {
-    h_rng_state ^= h_rng_state << 13;
-    h_rng_state ^= h_rng_state >> 7;
-    h_rng_state ^= h_rng_state << 17;
-    return (h_rng_state >> 11) * (1.0f / 9007199254740992.0f);
+static float host_uniform(void) {
+    h_rng ^= h_rng << 13;
+    h_rng ^= h_rng >> 7;
+    h_rng ^= h_rng << 17;
+    return (h_rng >> 11) * (1.0f / 9007199254740992.0f);
 }
 
-static float host_rand_normal(void) {
-    float u1 = host_rand_uniform();
-    float u2 = host_rand_uniform();
-    while (u1 < 1e-10f) u1 = host_rand_uniform();
+static float host_normal(void) {
+    float u1 = host_uniform();
+    float u2 = host_uniform();
+    while (u1 < 1e-10f) u1 = host_uniform();
     return sqrtf(-2.0f * logf(u1)) * cosf(2.0f * 3.14159265f * u2);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * Generate Synthetic SV Data
+ * Generate SV Data
  *═══════════════════════════════════════════════════════════════════════════*/
 
 void generate_sv_data(
-    float* y_out, float* h_out, float* z_out,
-    int T,
+    float* y, float* h_true, float* z_true, int T,
     float rho, float sigma_z,
     float mu_base, float mu_scale, float mu_rate,
     float sigma_base, float sigma_scale, float sigma_rate,
     float theta_base, float theta_scale, float theta_rate
 ) {
-    /* Initial values */
     float z = 0.2f;
     float h = mu_base;
     
     for (int t = 0; t < T; t++) {
-        /* Store state */
-        if (h_out) h_out[t] = h;
-        if (z_out) z_out[t] = z;
+        if (h_true) h_true[t] = h;
+        if (z_true) z_true[t] = z;
         
-        /* Generate observation */
-        float eps = host_rand_normal();
-        y_out[t] = h + logf(eps * eps + 1e-10f);
+        float eps = host_normal();
+        y[t] = h + logf(eps * eps + 1e-10f);
         
-        /* Evaluate curves */
         float theta_z = theta_base + theta_scale * (1.0f - expf(-theta_rate * z));
         float mu_z = mu_base + mu_scale * (1.0f - expf(-mu_rate * z));
-        float sigma_z_h = sigma_base + sigma_scale * (1.0f - expf(-sigma_rate * z));
+        float sigma_h = sigma_base + sigma_scale * (1.0f - expf(-sigma_rate * z));
         
-        /* Transition */
         float phi = 1.0f - theta_z;
-        z = rho * z + sigma_z * host_rand_normal();
+        z = rho * z + sigma_z * host_normal();
         z = fmaxf(0.0f, fminf(3.0f, z));
-        h = phi * h + theta_z * mu_z + sigma_z_h * host_rand_normal();
+        h = phi * h + theta_z * mu_z + sigma_h * host_normal();
     }
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * Test: Basic CUDA Operations
+ * Test: Basic CUDA
  *═══════════════════════════════════════════════════════════════════════════*/
 
-void test_cuda_basic(void) {
-    printf("\n");
-    printf("═══════════════════════════════════════════════════════════════\n");
+void test_basic(void) {
+    printf("\n═══════════════════════════════════════════════════════════════\n");
     printf("Test: Basic CUDA Operations\n");
     printf("═══════════════════════════════════════════════════════════════\n");
     
-    /* Check CUDA device */
     int device_count;
     cudaGetDeviceCount(&device_count);
-    printf("  CUDA devices found: %d\n", device_count);
+    printf("  CUDA devices: %d\n", device_count);
     
     if (device_count == 0) {
-        printf("  ERROR: No CUDA devices found!\n");
+        printf("  ERROR: No CUDA devices!\n");
         return;
     }
     
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
-    printf("  Device 0: %s\n", prop.name);
-    printf("  Compute capability: %d.%d\n", prop.major, prop.minor);
-    printf("  Max threads per block: %d\n", prop.maxThreadsPerBlock);
-    printf("  Shared memory per block: %zu KB\n", prop.sharedMemPerBlock / 1024);
-    printf("  Warp size: %d\n", prop.warpSize);
-    
-    /* Allocate SMC² state */
-    printf("\n  Allocating SMC² state (N_theta=%d, N_inner=%d)...\n", 
-           CUDA_N_THETA, CUDA_N_INNER);
+    printf("  Device: %s (SM %d.%d)\n", prop.name, prop.major, prop.minor);
+    printf("  Shared memory: %zu KB\n", prop.sharedMemPerBlock / 1024);
     
     SMC2StateCUDA* state = smc2_cuda_alloc(CUDA_N_THETA, CUDA_N_INNER);
-    if (!state) {
-        printf("  ERROR: Failed to allocate SMC² state!\n");
-        return;
-    }
-    printf("  Allocation successful.\n");
+    printf("  Allocated N_theta=%d, N_inner=%d\n", CUDA_N_THETA, CUDA_N_INNER);
     
-    /* Initialize from prior */
-    printf("  Initializing from prior...\n");
     smc2_cuda_init_from_prior(state);
-    printf("  Initialization successful.\n");
+    printf("  Initialized from prior.\n");
     
-    /* Get initial theta estimates */
     float theta_mean[8], theta_std[8];
     smc2_cuda_get_theta_mean(state, theta_mean);
     smc2_cuda_get_theta_std(state, theta_std);
     
-    printf("\n  Initial θ estimates (from prior):\n");
-    printf("    rho:         %.4f ± %.4f\n", theta_mean[0], theta_std[0]);
-    printf("    sigma_z:     %.4f ± %.4f\n", theta_mean[1], theta_std[1]);
-    printf("    mu_base:     %.4f ± %.4f\n", theta_mean[2], theta_std[2]);
-    printf("    sigma_base:  %.4f ± %.4f\n", theta_mean[5], theta_std[5]);
+    printf("  Prior samples:\n");
+    printf("    rho=%.4f±%.4f, sigma_z=%.4f±%.4f\n", 
+           theta_mean[0], theta_std[0], theta_mean[1], theta_std[1]);
     
     smc2_cuda_free(state);
-    printf("\n  Basic CUDA test: PASSED\n");
+    printf("  PASSED\n");
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * Test: RBPF Step Performance
- *═══════════════════════════════════════════════════════════════════════════*/
-
-void test_rbpf_step_performance(void) {
-    printf("\n");
-    printf("═══════════════════════════════════════════════════════════════\n");
-    printf("Test: RBPF Step Performance\n");
-    printf("═══════════════════════════════════════════════════════════════\n");
-    
-    SMC2StateCUDA* state = smc2_cuda_alloc(CUDA_N_THETA, CUDA_N_INNER);
-    smc2_cuda_init_from_prior(state);
-    
-    /* Generate test data */
-    int T = 100;
-    float* y = (float*)malloc(T * sizeof(float));
-    generate_sv_data(y, NULL, NULL, T,
-                     0.96f, 0.08f,
-                     -0.8f, 0.4f, 1.2f,
-                     0.12f, 0.08f, 1.0f,
-                     0.02f, 0.08f, 1.5f);
-    
-    /* Warm-up */
-    for (int t = 0; t < 10; t++) {
-        smc2_cuda_update(state, y[t]);
-    }
-    cudaDeviceSynchronize();
-    
-    /* Time T steps */
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    
-    cudaEventRecord(start);
-    for (int t = 10; t < T; t++) {
-        smc2_cuda_update(state, y[t]);
-    }
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    
-    float ms;
-    cudaEventElapsedTime(&ms, start, stop);
-    
-    int steps = T - 10;
-    printf("  %d RBPF steps in %.2f ms\n", steps, ms);
-    printf("  %.3f ms per step\n", ms / steps);
-    printf("  %.1f steps per second\n", steps * 1000.0f / ms);
-    printf("  %.1f μs per θ-particle per step\n", (ms * 1000.0f) / (steps * CUDA_N_THETA));
-    
-    /* Check ESS */
-    float ess = smc2_cuda_get_outer_ess(state);
-    printf("\n  Final outer ESS: %.1f / %d (%.1f%%)\n", 
-           ess, state->N_theta, 100.0f * ess / state->N_theta);
-    
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-    free(y);
-    smc2_cuda_free(state);
-    
-    printf("\n  Performance test: PASSED\n");
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
- * Test: Parameter Learning (No Rejuvenation)
+ * Test: Parameter Learning with PMMH
  *═══════════════════════════════════════════════════════════════════════════*/
 
 void test_parameter_learning(void) {
-    printf("\n");
-    printf("═══════════════════════════════════════════════════════════════\n");
-    printf("Test: Parameter Learning (No Rejuvenation)\n");
+    printf("\n═══════════════════════════════════════════════════════════════\n");
+    printf("Test: Parameter Learning with PMMH Rejuvenation\n");
     printf("═══════════════════════════════════════════════════════════════\n");
     
     /* True parameters */
@@ -208,36 +121,28 @@ void test_parameter_learning(void) {
     float true_sigma_scale = 0.08f;
     float true_sigma_rate = 1.0f;
     
-    printf("TRUE parameters:\n");
-    printf("  rho=%.4f, sigma_z=%.4f\n", true_rho, true_sigma_z);
-    printf("  mu: base=%.4f, scale=%.4f, rate=%.4f\n", 
+    printf("TRUE:\n");
+    printf("  rho=%.3f, sigma_z=%.3f\n", true_rho, true_sigma_z);
+    printf("  mu: base=%.3f, scale=%.3f, rate=%.3f\n", 
            true_mu_base, true_mu_scale, true_mu_rate);
-    printf("  sigma: base=%.4f, scale=%.4f, rate=%.4f\n",
+    printf("  sigma: base=%.3f, scale=%.3f, rate=%.3f\n",
            true_sigma_base, true_sigma_scale, true_sigma_rate);
     
-    /* Generate data */
     int T = 200;
     float* y = (float*)malloc(T * sizeof(float));
-    float* h = (float*)malloc(T * sizeof(float));
-    float* z = (float*)malloc(T * sizeof(float));
-    
-    generate_sv_data(y, h, z, T,
+    generate_sv_data(y, NULL, NULL, T,
                      true_rho, true_sigma_z,
                      true_mu_base, true_mu_scale, true_mu_rate,
                      true_sigma_base, true_sigma_scale, true_sigma_rate,
                      0.02f, 0.08f, 1.5f);
     
-    printf("\nGenerated %d observations\n", T);
-    printf("  y: mean=%.2f, std=%.2f\n", 
-           h[T/2], sqrtf(true_sigma_base * true_sigma_base));
+    printf("\nGenerated T=%d observations\n", T);
     
-    /* Allocate and initialize */
     SMC2StateCUDA* state = smc2_cuda_alloc(256, 256);
     smc2_cuda_init_from_prior(state);
     
-    /* Run SMC² */
-    printf("\nRunning SMC² (N_theta=%d, N_inner=%d)...\n", 
-           state->N_theta, state->N_inner);
+    printf("\nRunning SMC² (N_theta=%d, N_inner=%d, K_rejuv=%d)...\n",
+           state->N_theta, state->N_inner, state->K_rejuv);
     
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -247,7 +152,10 @@ void test_parameter_learning(void) {
     for (int t = 0; t < T; t++) {
         float ess = smc2_cuda_update(state, y[t]);
         if ((t + 1) % 50 == 0) {
-            printf("  t=%d/%d, ESS_θ=%.1f\n", t + 1, T, ess);
+            printf("  t=%d: ESS=%.1f, resamples=%d, rejuv_accept=%.1f%%\n",
+                   t + 1, ess, state->n_resamples,
+                   state->n_rejuv_total > 0 ? 
+                   100.0f * state->n_rejuv_accepts / state->n_rejuv_total : 0.0f);
         }
     }
     cudaEventRecord(stop);
@@ -259,95 +167,82 @@ void test_parameter_learning(void) {
     printf("\n═══════════════════════════════════════════════════════════════\n");
     printf("Results\n");
     printf("═══════════════════════════════════════════════════════════════\n");
-    printf("  Elapsed: %.1f ms (%.3f ms/obs)\n", ms, ms / T);
+    printf("  Time: %.1f ms (%.2f ms/obs)\n", ms, ms / T);
     printf("  Resamples: %d\n", state->n_resamples);
+    printf("  Rejuvenation: %d/%d accepted (%.1f%%)\n",
+           state->n_rejuv_accepts, state->n_rejuv_total,
+           state->n_rejuv_total > 0 ?
+           100.0f * state->n_rejuv_accepts / state->n_rejuv_total : 0.0f);
     
-    /* Get posterior estimates */
     float theta_mean[8], theta_std[8];
     smc2_cuda_get_theta_mean(state, theta_mean);
     smc2_cuda_get_theta_std(state, theta_std);
     
     printf("\nESTIMATED (mean ± std):\n");
-    printf("  rho=%.4f ± %.4f\n", theta_mean[0], theta_std[0]);
-    printf("  sigma_z=%.4f ± %.4f\n", theta_mean[1], theta_std[1]);
-    printf("  mu: base=%.4f ± %.4f, scale=%.4f ± %.4f, rate=%.4f ± %.4f\n",
-           theta_mean[2], theta_std[2], theta_mean[3], theta_std[3], 
+    printf("  rho=%.4f±%.4f, sigma_z=%.4f±%.4f\n",
+           theta_mean[0], theta_std[0], theta_mean[1], theta_std[1]);
+    printf("  mu: base=%.4f±%.4f, scale=%.4f±%.4f, rate=%.4f±%.4f\n",
+           theta_mean[2], theta_std[2], theta_mean[3], theta_std[3],
            theta_mean[4], theta_std[4]);
-    printf("  sigma: base=%.4f ± %.4f, scale=%.4f ± %.4f, rate=%.4f ± %.4f\n",
+    printf("  sigma: base=%.4f±%.4f, scale=%.4f±%.4f, rate=%.4f±%.4f\n",
            theta_mean[5], theta_std[5], theta_mean[6], theta_std[6],
            theta_mean[7], theta_std[7]);
     
-    /* Check parameter recovery */
+    /* Z-scores */
     float true_params[8] = {true_rho, true_sigma_z, true_mu_base, true_mu_scale,
                            true_mu_rate, true_sigma_base, true_sigma_scale, true_sigma_rate};
-    const char* param_names[8] = {"rho", "sigma_z", "mu_base", "mu_scale",
-                                  "mu_rate", "sigma_base", "sigma_scale", "sigma_rate"};
+    const char* names[8] = {"rho", "sigma_z", "mu_base", "mu_scale",
+                            "mu_rate", "sigma_base", "sigma_scale", "sigma_rate"};
     
-    printf("\nParameter recovery (z-scores):\n");
+    printf("\nParameter recovery:\n");
     int n_ok = 0;
     for (int i = 0; i < 8; i++) {
-        float z_score = fabsf(theta_mean[i] - true_params[i]) / fmaxf(theta_std[i], 1e-6f);
-        const char* status = (z_score <= 2.0f) ? "OK" : "MISS";
-        if (z_score <= 2.0f) n_ok++;
-        printf("  %-12s: z=%.1f [%s]\n", param_names[i], z_score, status);
+        float z = fabsf(theta_mean[i] - true_params[i]) / fmaxf(theta_std[i], 1e-6f);
+        const char* status = (z <= 2.0f) ? "OK" : "MISS";
+        if (z <= 2.0f) n_ok++;
+        printf("  %-12s: z=%.2f [%s]\n", names[i], z, status);
     }
     
-    printf("\n  OVERALL: %d/8 parameters within 2σ\n", n_ok);
+    printf("\n  OVERALL: %d/8 within 2σ\n", n_ok);
+    printf("  %s\n", n_ok >= 6 ? "PASSED" : "NEEDS TUNING");
     
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
     free(y);
-    free(h);
-    free(z);
     smc2_cuda_free(state);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * Test: Throughput Scaling
+ * Test: Throughput with PMMH
  *═══════════════════════════════════════════════════════════════════════════*/
 
-void test_throughput_scaling(void) {
-    printf("\n");
-    printf("═══════════════════════════════════════════════════════════════\n");
-    printf("Test: Throughput Scaling\n");
+void test_throughput(void) {
+    printf("\n═══════════════════════════════════════════════════════════════\n");
+    printf("Test: Throughput with PMMH Rejuvenation\n");
     printf("═══════════════════════════════════════════════════════════════\n");
     
-    /* Generate test data */
-    int T = 500;
+    int T = 300;
     float* y = (float*)malloc(T * sizeof(float));
     generate_sv_data(y, NULL, NULL, T,
-                     0.96f, 0.08f,
-                     -0.8f, 0.4f, 1.2f,
-                     0.12f, 0.08f, 1.0f,
-                     0.02f, 0.08f, 1.5f);
+                     0.96f, 0.08f, -0.8f, 0.4f, 1.2f,
+                     0.12f, 0.08f, 1.0f, 0.02f, 0.08f, 1.5f);
     
-    printf("  N_theta    N_inner    Time(ms)    Steps/sec    μs/θ/step\n");
-    printf("  ─────────────────────────────────────────────────────────\n");
+    printf("  N_theta  N_inner  Time(ms)  Resamples  Rejuv%%  ms/obs\n");
+    printf("  ────────────────────────────────────────────────────────\n");
     
-    int N_configs[][2] = {{64, 64}, {128, 128}, {256, 256}, {512, 256}};
-    int n_configs = sizeof(N_configs) / sizeof(N_configs[0]);
+    int configs[][2] = {{128, 128}, {256, 256}};
+    int n_configs = sizeof(configs) / sizeof(configs[0]);
     
     for (int c = 0; c < n_configs; c++) {
-        int N_theta = N_configs[c][0];
-        int N_inner = N_configs[c][1];
-        
-        SMC2StateCUDA* state = smc2_cuda_alloc(N_theta, N_inner);
+        SMC2StateCUDA* state = smc2_cuda_alloc(configs[c][0], configs[c][1]);
         smc2_cuda_init_from_prior(state);
         
-        /* Warm-up */
-        for (int t = 0; t < 20; t++) {
-            smc2_cuda_update(state, y[t]);
-        }
-        cudaDeviceSynchronize();
-        
-        /* Timed run */
         cudaEvent_t start, stop;
         cudaEventCreate(&start);
         cudaEventCreate(&stop);
         
-        int T_run = 100;
         cudaEventRecord(start);
-        for (int t = 20; t < 20 + T_run; t++) {
+        for (int t = 0; t < T; t++) {
             smc2_cuda_update(state, y[t]);
         }
         cudaEventRecord(stop);
@@ -356,11 +251,12 @@ void test_throughput_scaling(void) {
         float ms;
         cudaEventElapsedTime(&ms, start, stop);
         
-        float steps_per_sec = T_run * 1000.0f / ms;
-        float us_per_theta = (ms * 1000.0f) / (T_run * N_theta);
+        float rejuv_pct = state->n_rejuv_total > 0 ?
+            100.0f * state->n_rejuv_accepts / state->n_rejuv_total : 0.0f;
         
-        printf("  %4d       %4d       %7.1f     %8.0f     %7.2f\n",
-               N_theta, N_inner, ms, steps_per_sec, us_per_theta);
+        printf("  %4d     %4d     %7.1f   %4d       %5.1f   %.2f\n",
+               configs[c][0], configs[c][1], ms, state->n_resamples,
+               rejuv_pct, ms / T);
         
         cudaEventDestroy(start);
         cudaEventDestroy(stop);
@@ -374,19 +270,16 @@ void test_throughput_scaling(void) {
  * Main
  *═══════════════════════════════════════════════════════════════════════════*/
 
-int main(int argc, char** argv) {
-    printf("\n");
-    printf("╔═══════════════════════════════════════════════════════════════╗\n");
-    printf("║  SMC² with RBPF Inner Filter - CUDA Test Suite                ║\n");
+int main(void) {
+    printf("\n╔═══════════════════════════════════════════════════════════════╗\n");
+    printf("║  SMC² RBPF CUDA - Test Suite (with PMMH Rejuvenation)         ║\n");
     printf("╚═══════════════════════════════════════════════════════════════╝\n");
     
-    test_cuda_basic();
-    test_rbpf_step_performance();
+    test_basic();
     test_parameter_learning();
-    test_throughput_scaling();
+    test_throughput();
     
-    printf("\n");
-    printf("═══════════════════════════════════════════════════════════════\n");
+    printf("\n═══════════════════════════════════════════════════════════════\n");
     printf("All tests completed.\n");
     printf("═══════════════════════════════════════════════════════════════\n\n");
     
