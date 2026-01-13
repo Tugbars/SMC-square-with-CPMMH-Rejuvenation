@@ -26,6 +26,11 @@ endif()
 find_package(CUDAToolkit REQUIRED)
 message(STATUS "[CUDA] Toolkit Version: ${CUDAToolkit_VERSION}")
 
+# Blackwell (sm_120) requires CUDA 12.8+
+if(CUDAToolkit_VERSION VERSION_LESS "12.8")
+    message(WARNING "[CUDA] CUDA ${CUDAToolkit_VERSION} detected. Blackwell (sm_120) requires CUDA 12.8+")
+endif()
+
 # =============================================================================
 # CUDA Configuration
 # =============================================================================
@@ -41,8 +46,8 @@ set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "-O2 -g -lineinfo" CACHE STRING "" FORCE)
 
 # GPU architectures (auto-detect or use common ones)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    # Common architectures: Volta(70), Turing(75), Ampere(80,86), Ada(89), Hopper(90)
-    set(CMAKE_CUDA_ARCHITECTURES "70;75;80;86;89;90" CACHE STRING "CUDA architectures" FORCE)
+    # Volta(70), Turing(75), Ampere(80,86), Ada(89), Hopper(90), Blackwell(120)
+    set(CMAKE_CUDA_ARCHITECTURES "75;86;89;120" CACHE STRING "CUDA architectures" FORCE)
 endif()
 message(STATUS "[CUDA] Architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 

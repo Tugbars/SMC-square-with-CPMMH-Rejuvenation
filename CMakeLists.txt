@@ -10,7 +10,7 @@ project(smc2_rbpf
 # =============================================================================
 
 option(SMC2_BUILD_CPU  "Build CPU implementation"  ON)
-option(SMC2_BUILD_CUDA "Build CUDA implementation" OFF)
+option(SMC2_BUILD_CUDA "Build CUDA implementation" ON)
 
 # =============================================================================
 # Build type
