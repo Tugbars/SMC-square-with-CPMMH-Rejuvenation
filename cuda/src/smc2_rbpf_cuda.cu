@@ -125,6 +125,45 @@ __device__ __forceinline__ float clampf(float x, float lo, float hi) {
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
+ * Log Prior for θ parameters
+ * Returns -INFINITY if out of bounds, otherwise sum of Gaussian log-densities
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+__device__ float log_prior_theta(
+    float rho, float sigma_z,
+    float mu_base, float mu_scale, float mu_rate,
+    float sigma_base, float sigma_scale, float sigma_rate
+) {
+    /* Bounds check - return -inf if any parameter out of bounds */
+    if (rho < d_bounds.rho_min || rho > d_bounds.rho_max) return -INFINITY;
+    if (sigma_z < d_bounds.sigma_z_min || sigma_z > d_bounds.sigma_z_max) return -INFINITY;
+    if (mu_base < d_bounds.mu_base_min || mu_base > d_bounds.mu_base_max) return -INFINITY;
+    if (mu_scale < d_bounds.mu_scale_min || mu_scale > d_bounds.mu_scale_max) return -INFINITY;
+    if (mu_rate < d_bounds.mu_rate_min || mu_rate > d_bounds.mu_rate_max) return -INFINITY;
+    if (sigma_base < d_bounds.sigma_base_min || sigma_base > d_bounds.sigma_base_max) return -INFINITY;
+    if (sigma_scale < d_bounds.sigma_scale_min || sigma_scale > d_bounds.sigma_scale_max) return -INFINITY;
+    if (sigma_rate < d_bounds.sigma_rate_min || sigma_rate > d_bounds.sigma_rate_max) return -INFINITY;
+    
+    /* Gaussian log-prior (ignoring normalization constants - they cancel in MH ratio) */
+    float lp = 0.0f;
+    
+    float d_rho = (rho - d_prior.rho_mean) / d_prior.rho_std;
+    float d_sigma_z = (sigma_z - d_prior.sigma_z_mean) / d_prior.sigma_z_std;
+    float d_mu_base = (mu_base - d_prior.mu_base_mean) / d_prior.mu_base_std;
+    float d_mu_scale = (mu_scale - d_prior.mu_scale_mean) / d_prior.mu_scale_std;
+    float d_mu_rate = (mu_rate - d_prior.mu_rate_mean) / d_prior.mu_rate_std;
+    float d_sigma_base = (sigma_base - d_prior.sigma_base_mean) / d_prior.sigma_base_std;
+    float d_sigma_scale = (sigma_scale - d_prior.sigma_scale_mean) / d_prior.sigma_scale_std;
+    float d_sigma_rate = (sigma_rate - d_prior.sigma_rate_mean) / d_prior.sigma_rate_std;
+    
+    lp += -0.5f * (d_rho * d_rho + d_sigma_z * d_sigma_z +
+                   d_mu_base * d_mu_base + d_mu_scale * d_mu_scale + d_mu_rate * d_mu_rate +
+                   d_sigma_base * d_sigma_base + d_sigma_scale * d_sigma_scale + d_sigma_rate * d_sigma_rate);
+    
+    return lp;
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
  * OCSN Kalman Update
  *═══════════════════════════════════════════════════════════════════════════*/
 
@@ -345,8 +384,9 @@ __global__ void kernel_rbpf_step(
                         + (int64_t)(t_current + 1) * N_inner + inner_idx;
     int64_t u0_idx = (int64_t)theta_idx * noise_capacity + t_current;
     
-    /* Resampling */
-    if (s_ess < ess_threshold_inner * N_inner) {
+    /* ALWAYS RESAMPLE (R1): Eliminates ESS-based branching for CPMMH consistency
+     * This ensures forward filter and replay make identical resampling decisions */
+    {
         float log_max = block_reduce_max(log_w, s_reduction);
         if (inner_idx == 0) s_log_max = log_max;
         __syncthreads();
@@ -388,11 +428,6 @@ __global__ void kernel_rbpf_step(
         log_w = -__logf((float)N_inner);
         
         __syncthreads();
-    } else {
-        /* No resampling - still store a dummy u0 for consistency */
-        if (inner_idx == 0) {
-            d_u0[u0_idx] = 0.5f;  /* Won't be used but needs to be defined */
-        }
     }
     
     /* Generate and STORE z-innovation */
@@ -674,7 +709,7 @@ __device__ float rbpf_replay_with_correlated_noise(
     for (int t = 0; t <= t_current; t++) {
         float y_obs = y_history[t];
         
-        /* Compute ESS */
+        /* Normalize weights for resampling */
         float log_max = block_reduce_max(log_w, s_reduction);
         if (inner_idx == 0) *s_log_max_ptr = log_max;
         __syncthreads();
@@ -691,8 +726,8 @@ __device__ float rbpf_replay_with_correlated_noise(
         float sum_w_sq = block_reduce_sum(w_sq, s_reduction);
         ess = 1.0f / fmaxf(sum_w_sq, 1e-30f);
         
-        /* Resample if needed */
-        if (ess < ess_threshold_inner * N_inner && t > 0) {
+        /* ALWAYS RESAMPLE (R1): Must match forward filter exactly */
+        {
             s_z[inner_idx] = z;
             s_mu[inner_idx] = mu_h;
             s_var[inner_idx] = var_h;
@@ -892,11 +927,12 @@ __global__ void kernel_cpmmh_rejuvenate(
     __shared__ float s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop;
     
     __shared__ float s_ll_curr, s_ll_prop;
+    __shared__ float s_lp_curr, s_lp_prop;  /* Log priors */
     __shared__ int s_accept, s_valid;
     
     curandState local_rng = particles.rng_states[global_idx];
     
-    /* Thread 0: Load current θ, propose θ', get cached ll_curr */
+    /* Thread 0: Load current θ, propose θ', compute log priors */
     if (inner_idx == 0) {
         s_rho_curr = particles.rho[theta_idx];
         s_sigma_z_curr = particles.sigma_z[theta_idx];
@@ -910,38 +946,34 @@ __global__ void kernel_cpmmh_rejuvenate(
         /* CRITICAL: ll_curr comes from forward filter, NO replay needed! */
         s_ll_curr = particles.log_likelihood[theta_idx];
         
-        /* Propose θ' with random walk */
-        s_valid = 1;
-        int attempts = 0;
-        int valid = 0;
-        while (!valid && attempts < 100) {
-            s_rho_prop = s_rho_curr + d_proposal_std[0] * curand_normal(&local_rng);
-            s_sigma_z_prop = s_sigma_z_curr + d_proposal_std[1] * curand_normal(&local_rng);
-            s_mu_base_prop = s_mu_base_curr + d_proposal_std[2] * curand_normal(&local_rng);
-            s_mu_scale_prop = s_mu_scale_curr + d_proposal_std[3] * curand_normal(&local_rng);
-            s_mu_rate_prop = s_mu_rate_curr + d_proposal_std[4] * curand_normal(&local_rng);
-            s_sigma_base_prop = s_sigma_base_curr + d_proposal_std[5] * curand_normal(&local_rng);
-            s_sigma_scale_prop = s_sigma_scale_curr + d_proposal_std[6] * curand_normal(&local_rng);
-            s_sigma_rate_prop = s_sigma_rate_curr + d_proposal_std[7] * curand_normal(&local_rng);
-            
-            valid = (s_rho_prop >= d_bounds.rho_min && s_rho_prop <= d_bounds.rho_max &&
-                     s_sigma_z_prop >= d_bounds.sigma_z_min && s_sigma_z_prop <= d_bounds.sigma_z_max &&
-                     s_mu_base_prop >= d_bounds.mu_base_min && s_mu_base_prop <= d_bounds.mu_base_max &&
-                     s_mu_scale_prop >= d_bounds.mu_scale_min && s_mu_scale_prop <= d_bounds.mu_scale_max &&
-                     s_mu_rate_prop >= d_bounds.mu_rate_min && s_mu_rate_prop <= d_bounds.mu_rate_max &&
-                     s_sigma_base_prop >= d_bounds.sigma_base_min && s_sigma_base_prop <= d_bounds.sigma_base_max &&
-                     s_sigma_scale_prop >= d_bounds.sigma_scale_min && s_sigma_scale_prop <= d_bounds.sigma_scale_max &&
-                     s_sigma_rate_prop >= d_bounds.sigma_rate_min && s_sigma_rate_prop <= d_bounds.sigma_rate_max);
-            attempts++;
-        }
-        if (!valid) {
-            s_valid = 0;  /* Invalid proposal - will reject */
-        }
+        /* Log prior for current θ */
+        s_lp_curr = log_prior_theta(s_rho_curr, s_sigma_z_curr,
+                                     s_mu_base_curr, s_mu_scale_curr, s_mu_rate_curr,
+                                     s_sigma_base_curr, s_sigma_scale_curr, s_sigma_rate_curr);
+        
+        /* ONE-SHOT proposal: Gaussian RW, immediate reject if out of bounds
+         * This keeps proposal symmetric: q(θ'|θ) = q(θ|θ'), no Hastings correction */
+        s_rho_prop = s_rho_curr + d_proposal_std[0] * curand_normal(&local_rng);
+        s_sigma_z_prop = s_sigma_z_curr + d_proposal_std[1] * curand_normal(&local_rng);
+        s_mu_base_prop = s_mu_base_curr + d_proposal_std[2] * curand_normal(&local_rng);
+        s_mu_scale_prop = s_mu_scale_curr + d_proposal_std[3] * curand_normal(&local_rng);
+        s_mu_rate_prop = s_mu_rate_curr + d_proposal_std[4] * curand_normal(&local_rng);
+        s_sigma_base_prop = s_sigma_base_curr + d_proposal_std[5] * curand_normal(&local_rng);
+        s_sigma_scale_prop = s_sigma_scale_curr + d_proposal_std[6] * curand_normal(&local_rng);
+        s_sigma_rate_prop = s_sigma_rate_curr + d_proposal_std[7] * curand_normal(&local_rng);
+        
+        /* Log prior for proposed θ' (returns -inf if out of bounds) */
+        s_lp_prop = log_prior_theta(s_rho_prop, s_sigma_z_prop,
+                                     s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop,
+                                     s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop);
+        
+        /* Invalid if log prior is -inf (out of bounds) */
+        s_valid = isfinite(s_lp_prop) ? 1 : 0;
         s_accept = 0;
     }
     __syncthreads();
     
-    /* Early exit for invalid proposals */
+    /* Early exit for invalid proposals (out of bounds) */
     if (s_valid == 0) {
         particles.rng_states[global_idx] = local_rng;
         return;
@@ -976,11 +1008,13 @@ __global__ void kernel_cpmmh_rejuvenate(
     __syncthreads();
     
     /*═══════════════════════════════════════════════════════════════════════
-     * MH Accept/Reject using CORRELATED likelihoods
-     * Var(ll_prop - ll_curr) ≈ (1-rho²) * Var(ll) << 2*Var(ll)
+     * MH Accept/Reject targeting POSTERIOR (likelihood + prior)
+     * log α = (ll_prop + lp_prop) - (ll_curr + lp_curr)
+     * With CPMMH: Var(ll_prop - ll_curr) ≈ (1-rho²) * Var(ll) << 2*Var(ll)
      *═══════════════════════════════════════════════════════════════════════*/
     if (inner_idx == 0) {
-        float log_alpha = s_ll_prop - s_ll_curr;
+        /* CORRECT MH ratio: includes log prior */
+        float log_alpha = (s_ll_prop + s_lp_prop) - (s_ll_curr + s_lp_curr);
         
         float u = curand_uniform(&local_rng);
         s_accept = (__logf(u) < log_alpha) ? 1 : 0;
