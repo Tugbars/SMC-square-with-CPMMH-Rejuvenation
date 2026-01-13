@@ -1192,6 +1192,31 @@ void smc2_cuda_free(SMC2StateCUDA* state) {
     free(state);
 }
 
+void smc2_cuda_set_noise_capacity(SMC2StateCUDA* state, int capacity) {
+    if (capacity <= state->noise_capacity) return;  /* Already big enough */
+    
+    int64_t new_z_size = (int64_t)state->N_theta * state->N_inner * (capacity + 1);
+    int64_t old_z_size = (int64_t)state->N_theta * state->N_inner * (state->noise_capacity + 1);
+    
+    half *new_z_0, *new_z_1;
+    CUDA_CHECK(cudaMalloc(&new_z_0, new_z_size * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&new_z_1, new_z_size * sizeof(half)));
+    
+    /* Copy existing data if any */
+    if (state->d_z_noise[0] && old_z_size > 0) {
+        CUDA_CHECK(cudaMemcpy(new_z_0, state->d_z_noise[0], 
+                              old_z_size * sizeof(half), cudaMemcpyDeviceToDevice));
+    }
+    
+    cudaFree(state->d_z_noise[0]);
+    cudaFree(state->d_z_noise[1]);
+    
+    state->d_z_noise[0] = new_z_0;
+    state->d_z_noise[1] = new_z_1;
+    state->noise_buf = 0;
+    state->noise_capacity = capacity;
+}
+
 void smc2_cuda_init_from_prior(SMC2StateCUDA* state) {
     CUDA_CHECK(cudaMemcpyToSymbol(d_prior, &state->prior, sizeof(SVPrior)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_bounds, &state->bounds, sizeof(SVBounds)));

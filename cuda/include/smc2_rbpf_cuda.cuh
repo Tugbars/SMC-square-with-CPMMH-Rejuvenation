@@ -141,6 +141,7 @@ extern "C" {
 
 SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner);
 void smc2_cuda_free(SMC2StateCUDA* state);
+void smc2_cuda_set_noise_capacity(SMC2StateCUDA* state, int capacity);
 void smc2_cuda_init_from_prior(SMC2StateCUDA* state);
 float smc2_cuda_update(SMC2StateCUDA* state, float y_obs);
 void smc2_cuda_get_theta_mean(SMC2StateCUDA* state, float* theta_mean);
