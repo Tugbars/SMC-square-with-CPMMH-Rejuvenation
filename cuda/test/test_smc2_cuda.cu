@@ -128,7 +128,7 @@ void test_parameter_learning(void) {
     printf("  sigma: base=%.3f, scale=%.3f, rate=%.3f\n",
            true_sigma_base, true_sigma_scale, true_sigma_rate);
     
-    int T = 200;
+    int T = 500;  /* Increased from 200 for better accuracy */
     float* y = (float*)malloc(T * sizeof(float));
     generate_sv_data(y, NULL, NULL, T,
                      true_rho, true_sigma_z,
@@ -139,6 +139,10 @@ void test_parameter_learning(void) {
     printf("\nGenerated T=%d observations\n", T);
     
     SMC2StateCUDA* state = smc2_cuda_alloc(256, 256);
+    
+    /* Pre-allocate noise capacity to avoid reallocations mid-run */
+    smc2_cuda_set_noise_capacity(state, T + 128);
+    
     smc2_cuda_init_from_prior(state);
     
     printf("\nRunning SMC² (N_theta=%d, N_inner=%d, K_rejuv=%d)...\n",
@@ -151,7 +155,7 @@ void test_parameter_learning(void) {
     cudaEventRecord(start);
     for (int t = 0; t < T; t++) {
         float ess = smc2_cuda_update(state, y[t]);
-        if ((t + 1) % 50 == 0) {
+        if ((t + 1) % 100 == 0) {
             printf("  t=%d: ESS=%.1f, resamples=%d, rejuv_accept=%.1f%%\n",
                    t + 1, ess, state->n_resamples,
                    state->n_rejuv_total > 0 ? 
@@ -188,22 +192,38 @@ void test_parameter_learning(void) {
            theta_mean[5], theta_std[5], theta_mean[6], theta_std[6],
            theta_mean[7], theta_std[7]);
     
-    /* Z-scores */
+    /* Parameter recovery with percentage error */
     float true_params[8] = {true_rho, true_sigma_z, true_mu_base, true_mu_scale,
                            true_mu_rate, true_sigma_base, true_sigma_scale, true_sigma_rate};
     const char* names[8] = {"rho", "sigma_z", "mu_base", "mu_scale",
                             "mu_rate", "sigma_base", "sigma_scale", "sigma_rate"};
     
     printf("\nParameter recovery:\n");
+    printf("  %-12s  %8s  %8s  %8s  %6s\n", "Parameter", "True", "Est", "Err%", "Status");
+    printf("  ─────────────────────────────────────────────────────────\n");
+    
     int n_ok = 0;
     for (int i = 0; i < 8; i++) {
-        float z = fabsf(theta_mean[i] - true_params[i]) / fmaxf(theta_std[i], 1e-6f);
+        float err = theta_mean[i] - true_params[i];
+        float pct_err;
+        
+        /* For parameters that can be zero or negative, use absolute error threshold */
+        if (fabsf(true_params[i]) < 0.01f) {
+            pct_err = err * 100.0f;  /* Just show as absolute * 100 */
+        } else {
+            pct_err = 100.0f * err / true_params[i];
+        }
+        
+        /* Check if within 2 standard deviations */
+        float z = fabsf(err) / fmaxf(theta_std[i], 1e-6f);
         const char* status = (z <= 2.0f) ? "OK" : "MISS";
         if (z <= 2.0f) n_ok++;
-        printf("  %-12s: z=%.2f [%s]\n", names[i], z, status);
+        
+        printf("  %-12s  %8.4f  %8.4f  %+7.1f%%  [%s]\n", 
+               names[i], true_params[i], theta_mean[i], pct_err, status);
     }
     
-    printf("\n  OVERALL: %d/8 within 2σ\n", n_ok);
+    printf("\n  OVERALL: %d/8 within 2σ of true value\n", n_ok);
     printf("  %s\n", n_ok >= 6 ? "PASSED" : "NEEDS TUNING");
     
     cudaEventDestroy(start);
@@ -221,7 +241,7 @@ void test_throughput(void) {
     printf("Test: Throughput with PMMH Rejuvenation\n");
     printf("═══════════════════════════════════════════════════════════════\n");
     
-    int T = 300;
+    int T = 500;
     float* y = (float*)malloc(T * sizeof(float));
     generate_sv_data(y, NULL, NULL, T,
                      0.96f, 0.08f, -0.8f, 0.4f, 1.2f,
@@ -235,6 +255,7 @@ void test_throughput(void) {
     
     for (int c = 0; c < n_configs; c++) {
         SMC2StateCUDA* state = smc2_cuda_alloc(configs[c][0], configs[c][1]);
+        smc2_cuda_set_noise_capacity(state, T + 128);
         smc2_cuda_init_from_prior(state);
         
         cudaEvent_t start, stop;
