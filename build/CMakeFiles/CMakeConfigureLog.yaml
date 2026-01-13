@@ -1,0 +1,126 @@
+
+---
+events:
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-3.28/Modules/CMakeDetermineSystem.cmake:233 (message)"
+      - "CMakeLists.txt:10 (project)"
+    message: |
+      The system is: Windows - 10.0.26200 - AMD64
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-3.28/Modules/CMakeDetermineCompilerId.cmake:17 (message)"
+      - "C:/Program Files/CMake/share/cmake-3.28/Modules/CMakeDetermineCompilerId.cmake:64 (__determine_compiler_id_test)"
+      - "C:/Program Files/CMake/share/cmake-3.28/Modules/CMakeDetermineCCompiler.cmake:123 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "CMakeLists.txt:10 (project)"
+    message: |
+      Compiling the C compiler identification source file "CMakeCCompilerId.c" succeeded.
+      Compiler: C:/Program Files (x86)/Intel/oneAPI/compiler/latest/bin/icx.exe 
+      Build flags: 
+      Id flags:  
+      
+      The output was:
+      0
+      Intel(R) oneAPI DPC++/C++ Compiler for applications running on Intel(R) 64, Version 2025.3.0 Build 20251023
+      Copyright (C) 1985-2025 Intel Corporation. All rights reserved.
+      
+      
+      
+      Compilation of the C compiler identification source "CMakeCCompilerId.c" produced "CMakeCCompilerId.exe"
+      
+      The C compiler identification is IntelLLVM, found in:
+        C:/Users/Tugbars/Desktop/Sequential-Monte-Carlo-Square-in-CUDA/build/CMakeFiles/3.28.4/CompilerIdC/CMakeCCompilerId.exe
+      
+  -
+    kind: "message-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-3.28/Modules/CMakeDetermineCompilerId.cmake:1206 (message)"
+      - "C:/Program Files/CMake/share/cmake-3.28/Modules/CMakeDetermineCompilerId.cmake:247 (CMAKE_DETERMINE_MSVC_SHOWINCLUDES_PREFIX)"
+      - "C:/Program Files/CMake/share/cmake-3.28/Modules/CMakeDetermineCCompiler.cmake:123 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "CMakeLists.txt:10 (project)"
+    message: |
+      Detecting C compiler /showIncludes prefix:
+        Note: including file: .\\foo.h
+        
+      Found prefix "Note: including file: "
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-3.28/Modules/CMakeDetermineCompilerABI.cmake:57 (try_compile)"
+      - "C:/Program Files/CMake/share/cmake-3.28/Modules/CMakeTestCCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:10 (project)"
+    checks:
+      - "Detecting C compiler ABI info"
+    directories:
+      source: "C:/Users/Tugbars/Desktop/Sequential-Monte-Carlo-Square-in-CUDA/build/CMakeFiles/CMakeScratch/TryCompile-ifqmbu"
+      binary: "C:/Users/Tugbars/Desktop/Sequential-Monte-Carlo-Square-in-CUDA/build/CMakeFiles/CMakeScratch/TryCompile-ifqmbu"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "/DWIN32 /D_WINDOWS"
+      CMAKE_C_FLAGS_DEBUG: "/Zi /Ob0 /Od /RTC1"
+      CMAKE_EXE_LINKER_FLAGS: "/Qoption,link,/machine:x64"
+    buildResult:
+      variable: "CMAKE_C_ABI_COMPILED"
+      cached: true
+      stdout: |
+        Change Dir: 'C:/Users/Tugbars/Desktop/Sequential-Monte-Carlo-Square-in-CUDA/build/CMakeFiles/CMakeScratch/TryCompile-ifqmbu'
+        
+        Run Build Command(s): C:/PROGRA~1/MIB055~1/2022/COMMUN~1/Common7/IDE/COMMON~1/MICROS~1/CMake/Ninja/ninja.exe -v cmTC_2ee19
+        [1/2] C:\\PROGRA~2\\Intel\\oneAPI\\compiler\\latest\\bin\\icx.exe  /nologo   /DWIN32 /D_WINDOWS  /Zi /Ob0 /Od /RTC1 -MDd -QMD -QMT CMakeFiles\\cmTC_2ee19.dir\\CMakeCCompilerABI.c.obj -QMF CMakeFiles\\cmTC_2ee19.dir\\CMakeCCompilerABI.c.obj.d /FoCMakeFiles\\cmTC_2ee19.dir\\CMakeCCompilerABI.c.obj /FdCMakeFiles\\cmTC_2ee19.dir\\ -c "C:\\Program Files\\CMake\\share\\cmake-3.28\\Modules\\CMakeCCompilerABI.c"
+        [2/2] C:\\WINDOWS\\system32\\cmd.exe /C "cd . && "C:\\Program Files\\CMake\\bin\\cmake.exe" -E vs_link_exe --intdir=CMakeFiles\\cmTC_2ee19.dir --rc=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100226~1.0\\x64\\rc.exe --mt=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100226~1.0\\x64\\mt.exe --manifests  -- C:\\PROGRA~2\\Intel\\oneAPI\\compiler\\latest\\bin\\icx.exe /nologo CMakeFiles\\cmTC_2ee19.dir\\CMakeCCompilerABI.c.obj  /Qoption,link,/machine:x64  /debug /INCREMENTAL /Qoption,link,/subsystem:console   /link /out:cmTC_2ee19.exe /implib:cmTC_2ee19.lib /pdb:cmTC_2ee19.pdb /version:0.0  && cd ."
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-3.28/Modules/FindOpenMP.cmake:219 (try_compile)"
+      - "C:/Program Files/CMake/share/cmake-3.28/Modules/FindOpenMP.cmake:486 (_OPENMP_GET_FLAGS)"
+      - "CMakeLists.txt:69 (find_package)"
+    description: "Detecting C OpenMP compiler info"
+    directories:
+      source: "C:/Users/Tugbars/Desktop/Sequential-Monte-Carlo-Square-in-CUDA/build/CMakeFiles/CMakeScratch/TryCompile-g2npid"
+      binary: "C:/Users/Tugbars/Desktop/Sequential-Monte-Carlo-Square-in-CUDA/build/CMakeFiles/CMakeScratch/TryCompile-g2npid"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "/DWIN32 /D_WINDOWS /Qstd=c11"
+      CMAKE_C_FLAGS_DEBUG: "/Od /Zi /DEBUG"
+      CMAKE_EXE_LINKER_FLAGS: "/Qoption,link,/machine:x64"
+    buildResult:
+      variable: "OpenMP_COMPILE_RESULT_C_Qiopenmp"
+      cached: true
+      stdout: |
+        Change Dir: 'C:/Users/Tugbars/Desktop/Sequential-Monte-Carlo-Square-in-CUDA/build/CMakeFiles/CMakeScratch/TryCompile-g2npid'
+        
+        Run Build Command(s): C:/PROGRA~1/MIB055~1/2022/COMMUN~1/Common7/IDE/COMMON~1/MICROS~1/CMake/Ninja/ninja.exe -v cmTC_8cb15
+        [1/2] C:\\PROGRA~2\\Intel\\oneAPI\\compiler\\latest\\bin\\icx.exe  /nologo   /DWIN32 /D_WINDOWS /Qstd=c11 -Qiopenmp /Od /Zi /DEBUG -MDd -QMD -QMT CMakeFiles\\cmTC_8cb15.dir\\OpenMPTryFlag.c.obj -QMF CMakeFiles\\cmTC_8cb15.dir\\OpenMPTryFlag.c.obj.d /FoCMakeFiles\\cmTC_8cb15.dir\\OpenMPTryFlag.c.obj /FdCMakeFiles\\cmTC_8cb15.dir\\ -c C:\\Users\\Tugbars\\Desktop\\Sequential-Monte-Carlo-Square-in-CUDA\\build\\CMakeFiles\\CMakeScratch\\TryCompile-g2npid\\OpenMPTryFlag.c
+        icx: warning: using /MTd or /MDd with '#pragma omp simd' may lead to unexpected fails due to the debugging version of iterators that cannot be vectorized correctly [-Wdebug-option-simd]\x0d
+        [2/2] C:\\WINDOWS\\system32\\cmd.exe /C "cd . && "C:\\Program Files\\CMake\\bin\\cmake.exe" -E vs_link_exe --intdir=CMakeFiles\\cmTC_8cb15.dir --rc=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100226~1.0\\x64\\rc.exe --mt=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100226~1.0\\x64\\mt.exe --manifests  -- C:\\PROGRA~2\\Intel\\oneAPI\\compiler\\latest\\bin\\icx.exe /nologo CMakeFiles\\cmTC_8cb15.dir\\OpenMPTryFlag.c.obj  /Qoption,link,/machine:x64  /debug /INCREMENTAL /Qoption,link,/subsystem:console  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib /link /out:cmTC_8cb15.exe /implib:cmTC_8cb15.lib /pdb:cmTC_8cb15.pdb /version:0.0  && cd ."
+        
+      exitCode: 0
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "C:/Program Files/CMake/share/cmake-3.28/Modules/FindOpenMP.cmake:420 (try_compile)"
+      - "C:/Program Files/CMake/share/cmake-3.28/Modules/FindOpenMP.cmake:560 (_OPENMP_GET_SPEC_DATE)"
+      - "CMakeLists.txt:69 (find_package)"
+    description: "Detecting C OpenMP version"
+    directories:
+      source: "C:/Users/Tugbars/Desktop/Sequential-Monte-Carlo-Square-in-CUDA/build/CMakeFiles/CMakeScratch/TryCompile-foor3w"
+      binary: "C:/Users/Tugbars/Desktop/Sequential-Monte-Carlo-Square-in-CUDA/build/CMakeFiles/CMakeScratch/TryCompile-foor3w"
+    cmakeVariables:
+      CMAKE_C_FLAGS: "/DWIN32 /D_WINDOWS /Qstd=c11"
+      CMAKE_C_FLAGS_DEBUG: "/Od /Zi /DEBUG"
+      CMAKE_EXE_LINKER_FLAGS: "/Qoption,link,/machine:x64"
+    buildResult:
+      variable: "OpenMP_SPECTEST_C_Qopenmp"
+      cached: true
+      stdout: |
+        Change Dir: 'C:/Users/Tugbars/Desktop/Sequential-Monte-Carlo-Square-in-CUDA/build/CMakeFiles/CMakeScratch/TryCompile-foor3w'
+        
+        Run Build Command(s): C:/PROGRA~1/MIB055~1/2022/COMMUN~1/Common7/IDE/COMMON~1/MICROS~1/CMake/Ninja/ninja.exe -v cmTC_3edcf
+        [1/2] C:\\PROGRA~2\\Intel\\oneAPI\\compiler\\latest\\bin\\icx.exe  /nologo   /DWIN32 /D_WINDOWS /Qstd=c11 -Qiopenmp /Od /Zi /DEBUG -MDd -QMD -QMT CMakeFiles\\cmTC_3edcf.dir\\OpenMPCheckVersion.c.obj -QMF CMakeFiles\\cmTC_3edcf.dir\\OpenMPCheckVersion.c.obj.d /FoCMakeFiles\\cmTC_3edcf.dir\\OpenMPCheckVersion.c.obj /FdCMakeFiles\\cmTC_3edcf.dir\\ -c C:\\Users\\Tugbars\\Desktop\\Sequential-Monte-Carlo-Square-in-CUDA\\build\\CMakeFiles\\CMakeScratch\\TryCompile-foor3w\\OpenMPCheckVersion.c
+        icx: warning: using /MTd or /MDd with '#pragma omp simd' may lead to unexpected fails due to the debugging version of iterators that cannot be vectorized correctly [-Wdebug-option-simd]\x0d
+        [2/2] C:\\WINDOWS\\system32\\cmd.exe /C "cd . && "C:\\Program Files\\CMake\\bin\\cmake.exe" -E vs_link_exe --intdir=CMakeFiles\\cmTC_3edcf.dir --rc=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100226~1.0\\x64\\rc.exe --mt=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100226~1.0\\x64\\mt.exe --manifests  -- C:\\PROGRA~2\\Intel\\oneAPI\\compiler\\latest\\bin\\icx.exe /nologo CMakeFiles\\cmTC_3edcf.dir\\OpenMPCheckVersion.c.obj  /Qoption,link,/machine:x64  /debug /INCREMENTAL /Qoption,link,/subsystem:console  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib /link /out:cmTC_3edcf.exe /implib:cmTC_3edcf.lib /pdb:cmTC_3edcf.pdb /version:0.0  && cd ."
+        
+      exitCode: 0
+...
