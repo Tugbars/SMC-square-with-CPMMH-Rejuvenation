@@ -96,6 +96,14 @@ struct SMC2StateCUDA {
     int y_history_capacity;
     int t_current;
     
+    /* CPMMH: Stored noise for correlated proposals */
+    float* d_z_noise;       /* z-innovations [N_theta * N_inner * (T+1)] */
+    float* d_u0;            /* Resampling uniforms [N_theta * T] */
+    float* d_z_noise_fresh; /* Fresh noise for proposals */
+    float* d_u0_fresh;      /* Fresh uniforms for proposals */
+    int noise_capacity;     /* Max T for noise arrays */
+    float cpmmh_rho;        /* Correlation: 0.99 typical */
+    
     /* Scratch */
     int* d_ancestors;
     float* d_uniform;

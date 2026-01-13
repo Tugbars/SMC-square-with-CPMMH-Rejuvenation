@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <time.h>
+#include <curand.h>  /* For curandGenerator_t */
 
 /*═══════════════════════════════════════════════════════════════════════════
  * OCSN Constants in Constant Memory
@@ -192,12 +193,14 @@ __global__ void kernel_init_rng(curandState* states, unsigned long long seed, in
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * Initialize θ-particles from Prior
+ * Initialize θ-particles from Prior (with noise storage for CPMMH)
  *═══════════════════════════════════════════════════════════════════════════*/
 
 __global__ void kernel_init_from_prior(
     ThetaParticlesSoA particles,
-    int N_theta, int N_inner
+    int N_theta, int N_inner,
+    float* d_z_noise,    /* Store t=0 z-noise for CPMMH */
+    int noise_capacity
 ) {
     int theta_idx = blockIdx.x;
     int inner_idx = threadIdx.x;
@@ -258,7 +261,12 @@ __global__ void kernel_init_from_prior(
     float one_minus_rho_sq = fmaxf(1.0f - rho * rho, 1e-6f);
     float z_stat_std = sigma_z / sqrtf(one_minus_rho_sq);
     
-    float z = z_stat_std * curand_normal(rng);
+    /* Generate and STORE t=0 z-noise */
+    float z_noise_init = curand_normal(rng);
+    int64_t z_noise_idx = (int64_t)theta_idx * N_inner * (noise_capacity + 1) + inner_idx;  /* t=0 slot */
+    d_z_noise[z_noise_idx] = z_noise_init;
+    
+    float z = z_stat_std * z_noise_init;
     z = clampf(z, 0.0f, 3.0f);
     
     float theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
@@ -276,14 +284,25 @@ __global__ void kernel_init_from_prior(
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * Inner RBPF Step
+ * Inner RBPF Step - WITH NOISE STORAGE FOR CPMMH
+ * 
+ * The forward filter:
+ *   1. Generates fresh noise via curand
+ *   2. Stores it in d_z_noise and d_u0
+ *   3. Uses stored noise for z propagation and resampling
+ * 
+ * This enables CPMMH rejuvenation to correlate against stored noise.
  *═══════════════════════════════════════════════════════════════════════════*/
 
 __global__ void kernel_rbpf_step(
     ThetaParticlesSoA particles,
     float y_obs,
     int N_theta, int N_inner,
-    float ess_threshold_inner
+    float ess_threshold_inner,
+    float* d_z_noise,  /* [N_theta * N_inner * (T+1)] - stores z-innovations */
+    float* d_u0,       /* [N_theta * T] - stores resampling uniforms */
+    int t_current,     /* Current timestep (0-indexed) */
+    int noise_capacity /* Max T for noise arrays */
 ) {
     int theta_idx = blockIdx.x;
     int inner_idx = threadIdx.x;
@@ -321,6 +340,11 @@ __global__ void kernel_rbpf_step(
     float var_h = particles.inner_var_h[global_idx];
     float log_w = particles.inner_log_w[global_idx];
     
+    /* Noise index: slot t+1 for propagation (slot 0 is init) */
+    int64_t z_noise_idx = (int64_t)theta_idx * N_inner * (noise_capacity + 1) 
+                        + (int64_t)(t_current + 1) * N_inner + inner_idx;
+    int64_t u0_idx = (int64_t)theta_idx * noise_capacity + t_current;
+    
     /* Resampling */
     if (s_ess < ess_threshold_inner * N_inner) {
         float log_max = block_reduce_max(log_w, s_reduction);
@@ -341,7 +365,11 @@ __global__ void kernel_rbpf_step(
                 s_cumsum[i] = s_cumsum[i-1] + s_weights[i];
             }
             s_cumsum[N_inner - 1] = 1.0f;
-            s_u0 = curand_uniform(&local_rng);
+            
+            /* Generate and STORE resampling uniform */
+            float u0_fresh = curand_uniform(&local_rng);
+            d_u0[u0_idx] = u0_fresh;
+            s_u0 = u0_fresh;
         }
         __syncthreads();
         
@@ -360,10 +388,19 @@ __global__ void kernel_rbpf_step(
         log_w = -__logf((float)N_inner);
         
         __syncthreads();
+    } else {
+        /* No resampling - still store a dummy u0 for consistency */
+        if (inner_idx == 0) {
+            d_u0[u0_idx] = 0.5f;  /* Won't be used but needs to be defined */
+        }
     }
     
-    /* Propagate z */
-    float z_new = s_rho * z + s_sigma_z * curand_normal(&local_rng);
+    /* Generate and STORE z-innovation */
+    float z_noise = curand_normal(&local_rng);
+    d_z_noise[z_noise_idx] = z_noise;
+    
+    /* Propagate z using stored noise */
+    float z_new = s_rho * z + s_sigma_z * z_noise;
     z_new = clampf(z_new, 0.0f, 3.0f);
     
     /* Kalman predict */
@@ -534,20 +571,63 @@ __global__ void kernel_copy_theta_particles(
     }
 }
 
+/* Copy noise arrays after outer resampling */
+__global__ void kernel_copy_noise_arrays(
+    const float* src_z_noise,
+    float* dst_z_noise,
+    const float* src_u0,
+    float* dst_u0,
+    const int* d_ancestors,
+    int N_theta, int N_inner,
+    int t_current, int noise_capacity
+) {
+    int theta_idx = blockIdx.x;
+    int inner_idx = threadIdx.x;
+    
+    if (theta_idx >= N_theta || inner_idx >= N_inner) return;
+    
+    int ancestor = d_ancestors[theta_idx];
+    
+    int64_t dst_z_base = (int64_t)theta_idx * N_inner * (noise_capacity + 1);
+    int64_t src_z_base = (int64_t)ancestor * N_inner * (noise_capacity + 1);
+    
+    /* Copy z-noise for all timesteps up to t_current+1 */
+    for (int t = 0; t <= t_current + 1; t++) {
+        int64_t src_idx = src_z_base + t * N_inner + inner_idx;
+        int64_t dst_idx = dst_z_base + t * N_inner + inner_idx;
+        dst_z_noise[dst_idx] = src_z_noise[src_idx];
+    }
+    
+    /* Thread 0: copy u0 */
+    if (inner_idx == 0) {
+        int64_t dst_u0_base = (int64_t)theta_idx * noise_capacity;
+        int64_t src_u0_base = (int64_t)ancestor * noise_capacity;
+        for (int t = 0; t <= t_current; t++) {
+            dst_u0[dst_u0_base + t] = src_u0[src_u0_base + t];
+        }
+    }
+}
+
 /*═══════════════════════════════════════════════════════════════════════════
- * PMMH Rejuvenation - CORRECT Implementation
+ * CPMMH Rejuvenation - Correlated Pseudo-Marginal MH
  * 
- * Key requirements for pseudo-marginal correctness:
- *   1. Both θ_curr and θ_prop evaluated with same estimator
- *   2. Replay outputs full PF state (z, mu_h, var_h, log_w)
- *   3. After accept/reject, PF state is copied (not reinitialized)
- *   4. Resampling must handle ALL state variables (z, mu_h, var_h)
+ * Key insight: Use CORRELATED noise to reduce variance of likelihood ratio.
+ *   noise_prop = rho * noise_curr + scale * noise_fresh
+ *   where rho ≈ 0.99 gives ~100× variance reduction
  * 
- * Cost: 2 * O(T * N_inner) per θ-particle per rejuvenation move
+ * Algorithm:
+ *   1. Generate fresh noise
+ *   2. Compute correlated: prop = rho * curr + scale * fresh
+ *   3. Run replay with θ' and prop_noise → ll_prop
+ *   4. Use cached ll_curr (from forward filter, NO replay!)
+ *   5. MH accept/reject
+ *   6. On accept: update θ, PF state, curr_noise ← prop_noise
+ * 
+ * Cost: 1 * O(T * N_inner) per θ-particle (half of standard PMMH!)
  *═══════════════════════════════════════════════════════════════════════════*/
 
-/* Device function: RBPF replay that outputs both likelihood AND final PF state */
-__device__ float rbpf_replay_with_state(
+/* Device function: RBPF replay using PRE-COMPUTED correlated noise */
+__device__ float rbpf_replay_with_correlated_noise(
     /* θ parameters */
     float rho, float sigma_z,
     float mu_base, float mu_scale, float mu_rate,
@@ -557,30 +637,25 @@ __device__ float rbpf_replay_with_state(
     int t_current,
     int N_inner,
     float ess_threshold_inner,
-    curandState* rng,
+    /* CPMMH: Use pre-computed correlated noise instead of RNG */
+    const float* z_noise_prop,    /* [N_inner * (T+1)] - correlated z-innovations */
+    const float* u0_prop,         /* [T] - correlated resampling uniforms */
+    int noise_capacity,
     /* Shared memory for reductions/resampling */
-    float* s_reduction,  /* 32 floats for warp reductions */
-    float* s_z,          /* N_inner floats for storing z during resample */
-    float* s_mu,         /* N_inner floats for storing mu_h during resample */
-    float* s_var,        /* N_inner floats for storing var_h during resample */
-    float* s_cdf,        /* N_inner floats for weights/CDF */
-    float* s_log_max_ptr,
-    float* s_sum_w_ptr,
-    float* s_u0_ptr,
-    /* Outputs: final PF state (written by each thread) */
-    float* z_out,
-    float* mu_out,
-    float* var_out,
-    float* logw_out,
-    float* ess_out
+    float* s_reduction,
+    float* s_z, float* s_mu, float* s_var, float* s_cdf,
+    float* s_log_max_ptr, float* s_sum_w_ptr,
+    /* Outputs: final PF state */
+    float* z_out, float* mu_out, float* var_out, float* logw_out, float* ess_out
 ) {
     int inner_idx = threadIdx.x;
     
-    /* Initialize from stationary distribution */
+    /* Initialize from stationary using t=0 noise */
     float one_minus_rho_sq = fmaxf(1.0f - rho * rho, 1e-6f);
     float z_stat_std = sigma_z / sqrtf(one_minus_rho_sq);
     
-    float z = z_stat_std * curand_normal(rng);
+    float z_noise_init = z_noise_prop[inner_idx];  /* t=0 slot */
+    float z = z_stat_std * z_noise_init;
     z = clampf(z, 0.0f, 3.0f);
     
     float theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
@@ -618,44 +693,42 @@ __device__ float rbpf_replay_with_state(
         
         /* Resample if needed */
         if (ess < ess_threshold_inner * N_inner && t > 0) {
-            /* Store all state variables to shared memory */
             s_z[inner_idx] = z;
             s_mu[inner_idx] = mu_h;
             s_var[inner_idx] = var_h;
-            s_cdf[inner_idx] = w_norm;  /* Store weight in CDF buffer */
+            s_cdf[inner_idx] = w_norm;
             __syncthreads();
             
-            /* Thread 0: build CDF in-place in s_cdf */
             if (inner_idx == 0) {
                 for (int i = 1; i < N_inner; i++) {
                     s_cdf[i] += s_cdf[i-1];
                 }
-                s_cdf[N_inner - 1] = 1.0f;  /* Ensure ends at 1.0 */
-                *s_u0_ptr = curand_uniform(rng);
+                s_cdf[N_inner - 1] = 1.0f;
             }
             __syncthreads();
             
-            /* Systematic resampling: each thread picks its ancestor */
-            float u = (*s_u0_ptr + (float)inner_idx) / (float)N_inner;
+            /* Use stored correlated u0 */
+            float u0 = u0_prop[t];
+            u0 = fmaxf(1e-7f, fminf(1.0f - 1e-7f, u0));
+            
+            float u = (u0 + (float)inner_idx) / (float)N_inner;
             int lo = 0, hi = N_inner - 1;
             while (lo < hi) {
                 int mid = (lo + hi) / 2;
                 if (s_cdf[mid] < u) lo = mid + 1;
                 else hi = mid;
             }
-            int ancestor = lo;
             
-            /* Copy ALL state from ancestor */
-            z = s_z[ancestor];
-            mu_h = s_mu[ancestor];
-            var_h = s_var[ancestor];
+            z = s_z[lo];
+            mu_h = s_mu[lo];
+            var_h = s_var[lo];
             log_w = -__logf((float)N_inner);
-            
             __syncthreads();
         }
         
-        /* Propagate z */
-        float z_new = rho * z + sigma_z * curand_normal(rng);
+        /* Use stored correlated z-noise for propagation (t+1 slot) */
+        float z_noise = z_noise_prop[(t + 1) * N_inner + inner_idx];
+        float z_new = rho * z + sigma_z * z_noise;
         z_new = clampf(z_new, 0.0f, 3.0f);
         
         /* Kalman predict */
@@ -674,7 +747,7 @@ __device__ float rbpf_replay_with_state(
         
         log_w += log_lik;
         
-        /* Accumulate log-likelihood increment */
+        /* Accumulate log-likelihood */
         log_max = block_reduce_max(log_w, s_reduction);
         if (inner_idx == 0) *s_log_max_ptr = log_max;
         __syncthreads();
@@ -689,31 +762,109 @@ __device__ float rbpf_replay_with_state(
         float ll_incr = log_max + __logf(fmaxf(sum_w, 1e-30f)) - __logf((float)N_inner);
         ll_accum += ll_incr;
         
-        /* Update state */
         z = z_new;
         mu_h = mu_post;
         var_h = var_post;
     }
     
-    /* OUTPUT: Write final PF state for this particle */
+    /* Output final PF state */
     z_out[inner_idx] = z;
     mu_out[inner_idx] = mu_h;
     var_out[inner_idx] = var_h;
     logw_out[inner_idx] = log_w;
-    if (inner_idx == 0) {
-        *ess_out = ess;
-    }
+    if (inner_idx == 0) *ess_out = ess;
     
     return ll_accum;
 }
 
-__global__ void kernel_pmmh_rejuvenate(
+/* Kernel: Generate fresh noise for CPMMH proposals */
+__global__ void kernel_generate_fresh_noise(
+    float* d_z_noise_fresh,
+    float* d_u0_fresh,
+    curandState* rng_states,
+    int N_theta, int N_inner,
+    int t_current,
+    int noise_capacity
+) {
+    int theta_idx = blockIdx.x;
+    int inner_idx = threadIdx.x;
+    int global_idx = theta_idx * N_inner + inner_idx;
+    
+    if (theta_idx >= N_theta || inner_idx >= N_inner) return;
+    
+    curandState local_rng = rng_states[global_idx];
+    
+    int64_t z_base = (int64_t)theta_idx * N_inner * (noise_capacity + 1);
+    
+    /* Generate fresh z-noise for all timesteps */
+    for (int t = 0; t <= t_current + 1; t++) {
+        d_z_noise_fresh[z_base + t * N_inner + inner_idx] = curand_normal(&local_rng);
+    }
+    
+    /* Thread 0 generates fresh u0 for all timesteps */
+    if (inner_idx == 0) {
+        int64_t u0_base = (int64_t)theta_idx * noise_capacity;
+        for (int t = 0; t <= t_current; t++) {
+            d_u0_fresh[u0_base + t] = curand_uniform(&local_rng);
+        }
+    }
+    
+    rng_states[global_idx] = local_rng;
+}
+
+/* Kernel: Compute correlated noise: prop = rho * curr + scale * fresh */
+__global__ void kernel_compute_correlated_noise(
+    const float* d_z_noise_curr,
+    const float* d_z_noise_fresh,
+    float* d_z_noise_prop,
+    const float* d_u0_curr,
+    const float* d_u0_fresh,
+    float* d_u0_prop,
+    float cpmmh_rho,
+    int N_theta, int N_inner,
+    int t_current,
+    int noise_capacity
+) {
+    int theta_idx = blockIdx.x;
+    int inner_idx = threadIdx.x;
+    
+    if (theta_idx >= N_theta || inner_idx >= N_inner) return;
+    
+    float scale = sqrtf(1.0f - cpmmh_rho * cpmmh_rho);
+    
+    int64_t z_base = (int64_t)theta_idx * N_inner * (noise_capacity + 1);
+    
+    /* Correlate z-noise */
+    for (int t = 0; t <= t_current + 1; t++) {
+        int64_t idx = z_base + t * N_inner + inner_idx;
+        d_z_noise_prop[idx] = cpmmh_rho * d_z_noise_curr[idx] + scale * d_z_noise_fresh[idx];
+    }
+    
+    /* Thread 0: correlate u0 (wrap to [0,1]) */
+    if (inner_idx == 0) {
+        int64_t u0_base = (int64_t)theta_idx * noise_capacity;
+        for (int t = 0; t <= t_current; t++) {
+            float u = cpmmh_rho * d_u0_curr[u0_base + t] + scale * d_u0_fresh[u0_base + t];
+            u = u - floorf(u);  /* Wrap to [0,1] */
+            d_u0_prop[u0_base + t] = u;
+        }
+    }
+}
+
+/* Main CPMMH rejuvenation kernel */
+__global__ void kernel_cpmmh_rejuvenate(
     ThetaParticlesSoA particles,
-    ThetaParticlesSoA particles_scratch,  /* Scratch space for proposed PF state */
+    ThetaParticlesSoA particles_scratch,
     const float* y_history,
+    float* d_z_noise_curr,       /* Current stored noise */
+    const float* d_z_noise_prop, /* Correlated proposal noise */
+    float* d_u0_curr,
+    const float* d_u0_prop,
     int t_current,
     int N_theta, int N_inner,
     float ess_threshold_inner,
+    int noise_capacity,
+    float cpmmh_rho,
     int* d_accepts
 ) {
     int theta_idx = blockIdx.x;
@@ -722,14 +873,6 @@ __global__ void kernel_pmmh_rejuvenate(
     
     if (theta_idx >= N_theta || inner_idx >= N_inner) return;
     
-    /* Shared memory layout:
-     * [0..31]              : reduction scratch (32 floats)
-     * [32..32+N-1]         : s_z for resampling
-     * [32+N..32+2N-1]      : s_mu for resampling  
-     * [32+2N..32+3N-1]     : s_var for resampling
-     * [32+3N..32+4N-1]     : s_cdf for weights/CDF
-     * Plus scalars for log_max, sum_w, u0
-     */
     extern __shared__ float shared_mem[];
     float* s_reduction = shared_mem;
     float* s_z = &shared_mem[32];
@@ -737,8 +880,8 @@ __global__ void kernel_pmmh_rejuvenate(
     float* s_var = &shared_mem[32 + 2 * N_inner];
     float* s_cdf = &shared_mem[32 + 3 * N_inner];
     
-    __shared__ float s_log_max, s_sum_w, s_u0;
-    __shared__ float s_ess_prop, s_ess_curr;
+    __shared__ float s_log_max, s_sum_w;
+    __shared__ float s_ess_prop;
     
     __shared__ float s_rho_curr, s_sigma_z_curr;
     __shared__ float s_mu_base_curr, s_mu_scale_curr, s_mu_rate_curr;
@@ -749,11 +892,11 @@ __global__ void kernel_pmmh_rejuvenate(
     __shared__ float s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop;
     
     __shared__ float s_ll_curr, s_ll_prop;
-    __shared__ int s_accept;
+    __shared__ int s_accept, s_valid;
     
     curandState local_rng = particles.rng_states[global_idx];
     
-    /* Thread 0: Load current θ and propose θ' */
+    /* Thread 0: Load current θ, propose θ', get cached ll_curr */
     if (inner_idx == 0) {
         s_rho_curr = particles.rho[theta_idx];
         s_sigma_z_curr = particles.sigma_z[theta_idx];
@@ -764,8 +907,13 @@ __global__ void kernel_pmmh_rejuvenate(
         s_sigma_scale_curr = particles.sigma_scale[theta_idx];
         s_sigma_rate_curr = particles.sigma_rate[theta_idx];
         
+        /* CRITICAL: ll_curr comes from forward filter, NO replay needed! */
+        s_ll_curr = particles.log_likelihood[theta_idx];
+        
         /* Propose θ' with random walk */
-        int valid = 0, attempts = 0;
+        s_valid = 1;
+        int attempts = 0;
+        int valid = 0;
         while (!valid && attempts < 100) {
             s_rho_prop = s_rho_curr + d_proposal_std[0] * curand_normal(&local_rng);
             s_sigma_z_prop = s_sigma_z_curr + d_proposal_std[1] * curand_normal(&local_rng);
@@ -787,31 +935,36 @@ __global__ void kernel_pmmh_rejuvenate(
             attempts++;
         }
         if (!valid) {
-            s_rho_prop = s_rho_curr;
-            s_sigma_z_prop = s_sigma_z_curr;
-            s_mu_base_prop = s_mu_base_curr;
-            s_mu_scale_prop = s_mu_scale_curr;
-            s_mu_rate_prop = s_mu_rate_curr;
-            s_sigma_base_prop = s_sigma_base_curr;
-            s_sigma_scale_prop = s_sigma_scale_curr;
-            s_sigma_rate_prop = s_sigma_rate_curr;
+            s_valid = 0;  /* Invalid proposal - will reject */
         }
         s_accept = 0;
     }
     __syncthreads();
     
+    /* Early exit for invalid proposals */
+    if (s_valid == 0) {
+        particles.rng_states[global_idx] = local_rng;
+        return;
+    }
+    
+    /* Get pointers to this θ-particle's noise */
+    int64_t z_noise_base = (int64_t)theta_idx * N_inner * (noise_capacity + 1);
+    int64_t u0_base = (int64_t)theta_idx * noise_capacity;
+    
     /*═══════════════════════════════════════════════════════════════════════
-     * STEP 1: Replay with θ_proposed → ll_prop + PF_prop state
-     * Output goes to scratch buffers
+     * CPMMH: Only replay θ' (proposed) with correlated noise
+     * ll_curr is already cached from forward filter!
      *═══════════════════════════════════════════════════════════════════════*/
-    float ll_prop = rbpf_replay_with_state(
+    float ll_prop = rbpf_replay_with_correlated_noise(
         s_rho_prop, s_sigma_z_prop,
         s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop,
         s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop,
         y_history, t_current, N_inner, ess_threshold_inner,
-        &local_rng, s_reduction, s_z, s_mu, s_var, s_cdf,
-        &s_log_max, &s_sum_w, &s_u0,
-        /* Output: proposed PF state to scratch */
+        &d_z_noise_prop[z_noise_base],
+        &d_u0_prop[u0_base],
+        noise_capacity,
+        s_reduction, s_z, s_mu, s_var, s_cdf,
+        &s_log_max, &s_sum_w,
         &particles_scratch.inner_z[global_idx],
         &particles_scratch.inner_mu_h[global_idx],
         &particles_scratch.inner_var_h[global_idx],
@@ -823,31 +976,8 @@ __global__ void kernel_pmmh_rejuvenate(
     __syncthreads();
     
     /*═══════════════════════════════════════════════════════════════════════
-     * STEP 2: Replay with θ_current → ll_curr + PF_curr state
-     * Output goes directly to particles (will be used if reject OR accept)
-     *═══════════════════════════════════════════════════════════════════════*/
-    float ll_curr = rbpf_replay_with_state(
-        s_rho_curr, s_sigma_z_curr,
-        s_mu_base_curr, s_mu_scale_curr, s_mu_rate_curr,
-        s_sigma_base_curr, s_sigma_scale_curr, s_sigma_rate_curr,
-        y_history, t_current, N_inner, ess_threshold_inner,
-        &local_rng, s_reduction, s_z, s_mu, s_var, s_cdf,
-        &s_log_max, &s_sum_w, &s_u0,
-        /* Output: current PF state directly to particles */
-        &particles.inner_z[global_idx],
-        &particles.inner_mu_h[global_idx],
-        &particles.inner_var_h[global_idx],
-        &particles.inner_log_w[global_idx],
-        &s_ess_curr
-    );
-    
-    if (inner_idx == 0) s_ll_curr = ll_curr;
-    __syncthreads();
-    
-    /*═══════════════════════════════════════════════════════════════════════
-     * STEP 3: MH Accept/Reject
-     * On accept: copy PF_prop from scratch to particles, update θ
-     * On reject: particles already has PF_curr from step 2
+     * MH Accept/Reject using CORRELATED likelihoods
+     * Var(ll_prop - ll_curr) ≈ (1-rho²) * Var(ll) << 2*Var(ll)
      *═══════════════════════════════════════════════════════════════════════*/
     if (inner_idx == 0) {
         float log_alpha = s_ll_prop - s_ll_curr;
@@ -868,26 +998,34 @@ __global__ void kernel_pmmh_rejuvenate(
             particles.log_likelihood[theta_idx] = s_ll_prop;
             particles.ess_inner[theta_idx] = s_ess_prop;
             atomicAdd(d_accepts, 1);
-        } else {
-            /* θ stays current, PF_curr already written in step 2 */
-            particles.log_likelihood[theta_idx] = s_ll_curr;
-            particles.ess_inner[theta_idx] = s_ess_curr;
         }
     }
     __syncthreads();
     
     /*═══════════════════════════════════════════════════════════════════════
-     * STEP 4: On accept, copy PF state from scratch to particles
-     * This preserves the extended state (θ, u) correctly
+     * On accept: copy PF state AND update curr_noise ← prop_noise
      *═══════════════════════════════════════════════════════════════════════*/
     if (s_accept) {
+        /* Copy PF state from scratch */
         particles.inner_z[global_idx] = particles_scratch.inner_z[global_idx];
         particles.inner_mu_h[global_idx] = particles_scratch.inner_mu_h[global_idx];
         particles.inner_var_h[global_idx] = particles_scratch.inner_var_h[global_idx];
         particles.inner_log_w[global_idx] = particles_scratch.inner_log_w[global_idx];
+        
+        /* CRITICAL: Update curr_noise ← prop_noise */
+        for (int t = 0; t <= t_current + 1; t++) {
+            int64_t idx = z_noise_base + t * N_inner + inner_idx;
+            d_z_noise_curr[idx] = d_z_noise_prop[idx];
+        }
+        
+        /* Thread 0: update u0 */
+        if (inner_idx == 0) {
+            for (int t = 0; t <= t_current; t++) {
+                d_u0_curr[u0_base + t] = d_u0_prop[u0_base + t];
+            }
+        }
     }
     
-    /* Save RNG state */
     particles.rng_states[global_idx] = local_rng;
 }
 
@@ -903,7 +1041,7 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     state->N_inner = N_inner;
     state->ess_threshold_outer = 0.5f;
     state->ess_threshold_inner = 0.5f;
-    state->K_rejuv = 3;  /* 3 moves with 2x cost each = 6x base cost */
+    state->K_rejuv = 1;  /* One correct PMMH move per resample is sufficient */
     
     int N_total = N_theta * N_inner;
     
@@ -950,7 +1088,7 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     CUDA_CHECK(cudaDeviceSynchronize());
     
     /* Observation history */
-    state->y_history_capacity = 2000;
+    state->y_history_capacity = 8000;
     CUDA_CHECK(cudaMalloc(&state->d_y_history, state->y_history_capacity * sizeof(float)));
     state->y_history_len = 0;
     
@@ -959,6 +1097,27 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     CUDA_CHECK(cudaMalloc(&state->d_uniform, sizeof(float)));
     CUDA_CHECK(cudaMalloc(&state->d_ess, sizeof(float)));
     CUDA_CHECK(cudaMalloc(&state->d_accepts, sizeof(int)));
+    
+    /* CPMMH: Allocate noise storage for correlated proposals */
+    /* Initial capacity for T=2000 (will grow if needed) */
+    state->noise_capacity = 2048;
+    state->cpmmh_rho = 0.99f;  /* High correlation for variance reduction */
+    
+    int64_t z_noise_size = (int64_t)N_theta * N_inner * (state->noise_capacity + 1);
+    int64_t u0_size = (int64_t)N_theta * state->noise_capacity;
+    
+    CUDA_CHECK(cudaMalloc(&state->d_z_noise, z_noise_size * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&state->d_u0, u0_size * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&state->d_z_noise_fresh, z_noise_size * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&state->d_u0_fresh, u0_size * sizeof(float)));
+    
+    /* Initialize noise to N(0,1) */
+    curandGenerator_t gen;
+    curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
+    curandSetPseudoRandomGeneratorSeed(gen, 54321ULL);
+    curandGenerateNormal(gen, state->d_z_noise, z_noise_size, 0.0f, 1.0f);
+    curandGenerateUniform(gen, state->d_u0, u0_size);
+    curandDestroyGenerator(gen);
     
     /* Default prior */
     state->prior.rho_mean = 0.95f; state->prior.rho_std = 0.02f;
@@ -1043,6 +1202,12 @@ void smc2_cuda_free(SMC2StateCUDA* state) {
     cudaFree(state->d_ess);
     cudaFree(state->d_accepts);
     
+    /* CPMMH noise storage */
+    cudaFree(state->d_z_noise);
+    cudaFree(state->d_u0);
+    cudaFree(state->d_z_noise_fresh);
+    cudaFree(state->d_u0_fresh);
+    
     free(state);
 }
 
@@ -1053,7 +1218,8 @@ void smc2_cuda_init_from_prior(SMC2StateCUDA* state) {
     CUDA_CHECK(cudaMemcpyToSymbol(d_proposal_std, state->proposal_std, 8 * sizeof(float)));
     
     kernel_init_from_prior<<<state->N_theta, state->N_inner>>>(
-        state->d_particles, state->N_theta, state->N_inner
+        state->d_particles, state->N_theta, state->N_inner,
+        state->d_z_noise, state->noise_capacity
     );
     CUDA_CHECK(cudaDeviceSynchronize());
     
@@ -1081,12 +1247,44 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
     state->y_history_len++;
     state->t_current++;
     
+    /* Check if noise capacity needs to grow */
+    if (state->t_current >= state->noise_capacity) {
+        int new_cap = state->noise_capacity * 2;
+        int64_t new_z_size = (int64_t)state->N_theta * state->N_inner * (new_cap + 1);
+        int64_t new_u0_size = (int64_t)state->N_theta * new_cap;
+        
+        float *new_z_noise, *new_u0, *new_z_fresh, *new_u0_fresh;
+        CUDA_CHECK(cudaMalloc(&new_z_noise, new_z_size * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&new_u0, new_u0_size * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&new_z_fresh, new_z_size * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&new_u0_fresh, new_u0_size * sizeof(float)));
+        
+        /* Copy old data */
+        int64_t old_z_size = (int64_t)state->N_theta * state->N_inner * (state->noise_capacity + 1);
+        int64_t old_u0_size = (int64_t)state->N_theta * state->noise_capacity;
+        CUDA_CHECK(cudaMemcpy(new_z_noise, state->d_z_noise, old_z_size * sizeof(float), cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemcpy(new_u0, state->d_u0, old_u0_size * sizeof(float), cudaMemcpyDeviceToDevice));
+        
+        cudaFree(state->d_z_noise);
+        cudaFree(state->d_u0);
+        cudaFree(state->d_z_noise_fresh);
+        cudaFree(state->d_u0_fresh);
+        
+        state->d_z_noise = new_z_noise;
+        state->d_u0 = new_u0;
+        state->d_z_noise_fresh = new_z_fresh;
+        state->d_u0_fresh = new_u0_fresh;
+        state->noise_capacity = new_cap;
+    }
+    
     size_t shared_size = (32 + 2 * state->N_inner) * sizeof(float);
     
     kernel_rbpf_step<<<state->N_theta, state->N_inner, shared_size>>>(
         state->d_particles, y_obs,
         state->N_theta, state->N_inner,
-        state->ess_threshold_inner
+        state->ess_threshold_inner,
+        state->d_z_noise, state->d_u0,
+        state->t_current, state->noise_capacity
     );
     CUDA_CHECK(cudaDeviceSynchronize());
     
@@ -1122,12 +1320,30 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
         );
         CUDA_CHECK(cudaDeviceSynchronize());
         
-        /* Swap */
+        /* Copy noise arrays: use d_z_noise_fresh as temp buffer */
+        kernel_copy_noise_arrays<<<state->N_theta, state->N_inner>>>(
+            state->d_z_noise, state->d_z_noise_fresh,  /* src → fresh (temp) */
+            state->d_u0, state->d_u0_fresh,
+            state->d_ancestors,
+            state->N_theta, state->N_inner,
+            state->t_current, state->noise_capacity
+        );
+        CUDA_CHECK(cudaDeviceSynchronize());
+        
+        /* Copy back from temp to main noise arrays */
+        int64_t z_copy_size = (int64_t)state->N_theta * state->N_inner * (state->t_current + 2);
+        int64_t u0_copy_size = (int64_t)state->N_theta * (state->t_current + 1);
+        CUDA_CHECK(cudaMemcpy(state->d_z_noise, state->d_z_noise_fresh, 
+                              z_copy_size * sizeof(float), cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemcpy(state->d_u0, state->d_u0_fresh,
+                              u0_copy_size * sizeof(float), cudaMemcpyDeviceToDevice));
+        
+        /* Swap particle pointers */
         ThetaParticlesSoA tmp = state->d_particles;
         state->d_particles = state->d_particles_temp;
         state->d_particles_temp = tmp;
         
-        /* PMMH rejuvenation - uses particles_temp as scratch for proposed PF state */
+        /* CPMMH rejuvenation - uses correlated noise for variance reduction */
         /* Shared memory: 32 (reduction) + 4*N_inner (z,mu,var,cdf for resampling) */
         size_t pmmh_shared_size = (32 + 4 * state->N_inner) * sizeof(float);
         
@@ -1135,11 +1351,38 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
             int h_accepts = 0;
             CUDA_CHECK(cudaMemcpy(state->d_accepts, &h_accepts, sizeof(int), cudaMemcpyHostToDevice));
             
-            kernel_pmmh_rejuvenate<<<state->N_theta, state->N_inner, pmmh_shared_size>>>(
+            /* Step 1: Generate fresh noise */
+            kernel_generate_fresh_noise<<<state->N_theta, state->N_inner>>>(
+                state->d_z_noise_fresh, state->d_u0_fresh,
+                state->d_particles.rng_states,
+                state->N_theta, state->N_inner,
+                state->t_current, state->noise_capacity
+            );
+            CUDA_CHECK(cudaDeviceSynchronize());
+            
+            /* Step 2: Compute correlated noise: prop = rho * curr + scale * fresh */
+            kernel_compute_correlated_noise<<<state->N_theta, state->N_inner>>>(
+                state->d_z_noise, state->d_z_noise_fresh, state->d_z_noise_fresh,  /* Use fresh as prop buffer */
+                state->d_u0, state->d_u0_fresh, state->d_u0_fresh,
+                state->cpmmh_rho,
+                state->N_theta, state->N_inner,
+                state->t_current, state->noise_capacity
+            );
+            CUDA_CHECK(cudaDeviceSynchronize());
+            
+            /* Step 3: CPMMH rejuvenate - only replays θ', uses cached ll_curr */
+            kernel_cpmmh_rejuvenate<<<state->N_theta, state->N_inner, pmmh_shared_size>>>(
                 state->d_particles, 
                 state->d_particles_temp,  /* Scratch buffer for proposed PF state */
-                state->d_y_history, state->t_current,
+                state->d_y_history,
+                state->d_z_noise,         /* Current noise (updated on accept) */
+                state->d_z_noise_fresh,   /* Correlated proposal noise */
+                state->d_u0,
+                state->d_u0_fresh,
+                state->t_current,
                 state->N_theta, state->N_inner, state->ess_threshold_inner,
+                state->noise_capacity,
+                state->cpmmh_rho,
                 state->d_accepts
             );
             CUDA_CHECK(cudaDeviceSynchronize());
