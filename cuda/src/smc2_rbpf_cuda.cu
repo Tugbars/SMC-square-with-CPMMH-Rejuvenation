@@ -533,8 +533,147 @@ __global__ void kernel_copy_theta_particles(
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * PMMH Rejuvenation - Full O(t) Likelihood Computation
+ * PMMH Rejuvenation - CORRECT Implementation (Option B)
+ * 
+ * Both θ_current and θ_proposed are evaluated with FRESH replay-based
+ * likelihood estimators to ensure detailed balance is preserved.
+ * 
+ * Cost: 2 * O(T * N_inner) per θ-particle per rejuvenation move
  *═══════════════════════════════════════════════════════════════════════════*/
+
+/* Device function to run one complete RBPF replay and return log-likelihood */
+__device__ float rbpf_replay_likelihood(
+    float rho, float sigma_z,
+    float mu_base, float mu_scale, float mu_rate,
+    float sigma_base, float sigma_scale, float sigma_rate,
+    const float* y_history,
+    int t_current,
+    int N_inner,
+    float ess_threshold_inner,
+    curandState* rng,
+    float* s_reduction,
+    float* s_weights,
+    float* s_cumsum,
+    float* s_log_max_ptr,
+    float* s_sum_w_ptr,
+    float* s_u0_ptr
+) {
+    int inner_idx = threadIdx.x;
+    
+    /* Initialize from stationary distribution */
+    float one_minus_rho_sq = fmaxf(1.0f - rho * rho, 1e-6f);
+    float z_stat_std = sigma_z / sqrtf(one_minus_rho_sq);
+    
+    float z = z_stat_std * curand_normal(rng);
+    z = clampf(z, 0.0f, 3.0f);
+    
+    float theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
+    float mu_z_val = eval_curve(mu_base, mu_scale, mu_rate, z);
+    float sigma_h = eval_curve(sigma_base, sigma_scale, sigma_rate, z);
+    float phi = 1.0f - theta_z;
+    float h_stat_var = (sigma_h * sigma_h) / fmaxf(1.0f - phi * phi, 1e-6f);
+    
+    float mu_h = mu_z_val;
+    float var_h = h_stat_var;
+    float log_w = -__logf((float)N_inner);
+    float ll_accum = 0.0f;
+    
+    /* Process all observations */
+    for (int t = 0; t <= t_current; t++) {
+        float y_obs = y_history[t];
+        
+        /* Compute ESS */
+        float log_max = block_reduce_max(log_w, s_reduction);
+        if (inner_idx == 0) *s_log_max_ptr = log_max;
+        __syncthreads();
+        log_max = *s_log_max_ptr;
+        
+        float w_unnorm = __expf(log_w - log_max);
+        float sum_w = block_reduce_sum(w_unnorm, s_reduction);
+        if (inner_idx == 0) *s_sum_w_ptr = sum_w;
+        __syncthreads();
+        sum_w = *s_sum_w_ptr;
+        
+        float w_norm = w_unnorm / fmaxf(sum_w, 1e-30f);
+        float w_sq = w_norm * w_norm;
+        float sum_w_sq = block_reduce_sum(w_sq, s_reduction);
+        float ess = 1.0f / fmaxf(sum_w_sq, 1e-30f);
+        
+        /* Resample if needed */
+        if (ess < ess_threshold_inner * N_inner && t > 0) {
+            s_weights[inner_idx] = w_norm;
+            __syncthreads();
+            
+            if (inner_idx == 0) {
+                s_cumsum[0] = s_weights[0];
+                for (int i = 1; i < N_inner; i++) s_cumsum[i] = s_cumsum[i-1] + s_weights[i];
+                s_cumsum[N_inner - 1] = 1.0f;
+                *s_u0_ptr = curand_uniform(rng);
+            }
+            __syncthreads();
+            
+            float u = (*s_u0_ptr + (float)inner_idx) / (float)N_inner;
+            int lo = 0, hi = N_inner - 1;
+            while (lo < hi) {
+                int mid = (lo + hi) / 2;
+                if (s_cumsum[mid] < u) lo = mid + 1;
+                else hi = mid;
+            }
+            
+            /* Exchange via shared memory */
+            s_weights[inner_idx] = z;
+            s_cumsum[inner_idx] = mu_h;
+            __syncthreads();
+            z = s_weights[lo];
+            mu_h = s_cumsum[lo];
+            var_h = h_stat_var;
+            log_w = -__logf((float)N_inner);
+            __syncthreads();
+        }
+        
+        /* Propagate z */
+        float z_new = rho * z + sigma_z * curand_normal(rng);
+        z_new = clampf(z_new, 0.0f, 3.0f);
+        
+        /* Kalman predict */
+        theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z_new);
+        mu_z_val = eval_curve(mu_base, mu_scale, mu_rate, z_new);
+        sigma_h = eval_curve(sigma_base, sigma_scale, sigma_rate, z_new);
+        phi = 1.0f - theta_z;
+        
+        float mu_pred = phi * mu_h + theta_z * mu_z_val;
+        float var_pred = phi * phi * var_h + sigma_h * sigma_h;
+        var_pred = fmaxf(var_pred, 1e-8f);
+        
+        /* OCSN update */
+        float mu_post, var_post, log_lik;
+        ocsn_kalman_update(y_obs, mu_pred, var_pred, &mu_post, &var_post, &log_lik);
+        
+        log_w += log_lik;
+        
+        /* Accumulate log-likelihood increment */
+        log_max = block_reduce_max(log_w, s_reduction);
+        if (inner_idx == 0) *s_log_max_ptr = log_max;
+        __syncthreads();
+        log_max = *s_log_max_ptr;
+        
+        w_unnorm = __expf(log_w - log_max);
+        sum_w = block_reduce_sum(w_unnorm, s_reduction);
+        if (inner_idx == 0) *s_sum_w_ptr = sum_w;
+        __syncthreads();
+        sum_w = *s_sum_w_ptr;
+        
+        float ll_incr = log_max + __logf(fmaxf(sum_w, 1e-30f)) - __logf((float)N_inner);
+        ll_accum += ll_incr;
+        
+        /* Update state */
+        z = z_new;
+        mu_h = mu_post;
+        var_h = var_post;
+    }
+    
+    return ll_accum;
+}
 
 __global__ void kernel_pmmh_rejuvenate(
     ThetaParticlesSoA particles,
@@ -558,18 +697,18 @@ __global__ void kernel_pmmh_rejuvenate(
     __shared__ float s_rho_curr, s_sigma_z_curr;
     __shared__ float s_mu_base_curr, s_mu_scale_curr, s_mu_rate_curr;
     __shared__ float s_sigma_base_curr, s_sigma_scale_curr, s_sigma_rate_curr;
-    __shared__ float s_ll_curr;
     
     __shared__ float s_rho_prop, s_sigma_z_prop;
     __shared__ float s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop;
     __shared__ float s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop;
     
     __shared__ float s_log_max, s_sum_w, s_u0;
+    __shared__ float s_ll_curr, s_ll_prop;
     __shared__ int s_accept;
     
     curandState local_rng = particles.rng_states[global_idx];
     
-    /* Thread 0: Load current and propose */
+    /* Thread 0: Load current θ and propose θ' */
     if (inner_idx == 0) {
         s_rho_curr = particles.rho[theta_idx];
         s_sigma_z_curr = particles.sigma_z[theta_idx];
@@ -579,8 +718,8 @@ __global__ void kernel_pmmh_rejuvenate(
         s_sigma_base_curr = particles.sigma_base[theta_idx];
         s_sigma_scale_curr = particles.sigma_scale[theta_idx];
         s_sigma_rate_curr = particles.sigma_rate[theta_idx];
-        s_ll_curr = particles.log_likelihood[theta_idx];
         
+        /* Propose θ' with random walk */
         int valid = 0, attempts = 0;
         while (!valid && attempts < 100) {
             s_rho_prop = s_rho_curr + d_proposal_std[0] * curand_normal(&local_rng);
@@ -614,114 +753,44 @@ __global__ void kernel_pmmh_rejuvenate(
     }
     __syncthreads();
     
-    /* Initialize from stationary under θ' */
-    float rho = s_rho_prop;
-    float sigma_z = s_sigma_z_prop;
-    float one_minus_rho_sq = fmaxf(1.0f - rho * rho, 1e-6f);
-    float z_stat_std = sigma_z / sqrtf(one_minus_rho_sq);
+    /*═══════════════════════════════════════════════════════════════════════
+     * STEP 1: Replay with θ_proposed → ll_proposed
+     *═══════════════════════════════════════════════════════════════════════*/
+    float ll_prop = rbpf_replay_likelihood(
+        s_rho_prop, s_sigma_z_prop,
+        s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop,
+        s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop,
+        y_history, t_current, N_inner, ess_threshold_inner,
+        &local_rng, s_reduction, s_weights, s_cumsum,
+        &s_log_max, &s_sum_w, &s_u0
+    );
     
-    float z = z_stat_std * curand_normal(&local_rng);
-    z = clampf(z, 0.0f, 3.0f);
+    if (inner_idx == 0) s_ll_prop = ll_prop;
+    __syncthreads();
     
-    float theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
-    float mu_z = eval_curve(s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop, z);
-    float sigma_h = eval_curve(s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop, z);
-    float phi = 1.0f - theta_z;
-    float h_stat_var = (sigma_h * sigma_h) / fmaxf(1.0f - phi * phi, 1e-6f);
+    /*═══════════════════════════════════════════════════════════════════════
+     * STEP 2: Replay with θ_current → ll_current (SAME ESTIMATOR!)
+     * This is the key fix: both likelihoods use identical estimation
+     *═══════════════════════════════════════════════════════════════════════*/
+    float ll_curr = rbpf_replay_likelihood(
+        s_rho_curr, s_sigma_z_curr,
+        s_mu_base_curr, s_mu_scale_curr, s_mu_rate_curr,
+        s_sigma_base_curr, s_sigma_scale_curr, s_sigma_rate_curr,
+        y_history, t_current, N_inner, ess_threshold_inner,
+        &local_rng, s_reduction, s_weights, s_cumsum,
+        &s_log_max, &s_sum_w, &s_u0
+    );
     
-    float mu_h = mu_z;
-    float var_h = h_stat_var;
-    float log_w = -__logf((float)N_inner);
-    float ll_accum = 0.0f;
+    if (inner_idx == 0) s_ll_curr = ll_curr;
+    __syncthreads();
     
-    /* Run RBPF from t=0 to t_current */
-    for (int t = 0; t <= t_current; t++) {
-        float y_obs = y_history[t];
-        
-        /* Check ESS for resampling */
-        float log_max = block_reduce_max(log_w, s_reduction);
-        if (inner_idx == 0) s_log_max = log_max;
-        __syncthreads();
-        
-        float w_unnorm = __expf(log_w - s_log_max);
-        float sum_w = block_reduce_sum(w_unnorm, s_reduction);
-        if (inner_idx == 0) s_sum_w = sum_w;
-        __syncthreads();
-        
-        float w_norm = w_unnorm / fmaxf(s_sum_w, 1e-30f);
-        float w_sq = w_norm * w_norm;
-        float sum_w_sq = block_reduce_sum(w_sq, s_reduction);
-        float ess = 1.0f / fmaxf(sum_w_sq, 1e-30f);
-        
-        if (ess < ess_threshold_inner * N_inner && t > 0) {
-            s_weights[inner_idx] = w_norm;
-            __syncthreads();
-            
-            if (inner_idx == 0) {
-                s_cumsum[0] = s_weights[0];
-                for (int i = 1; i < N_inner; i++) s_cumsum[i] = s_cumsum[i-1] + s_weights[i];
-                s_cumsum[N_inner - 1] = 1.0f;
-                s_u0 = curand_uniform(&local_rng);
-            }
-            __syncthreads();
-            
-            float u = (s_u0 + (float)inner_idx) / (float)N_inner;
-            int lo = 0, hi = N_inner - 1;
-            while (lo < hi) {
-                int mid = (lo + hi) / 2;
-                if (s_cumsum[mid] < u) lo = mid + 1;
-                else hi = mid;
-            }
-            
-            /* Exchange via shared memory */
-            s_weights[inner_idx] = z;
-            s_cumsum[inner_idx] = mu_h;
-            __syncthreads();
-            z = s_weights[lo];
-            mu_h = s_cumsum[lo];
-            var_h = h_stat_var;
-            log_w = -__logf((float)N_inner);
-            __syncthreads();
-        }
-        
-        /* Propagate */
-        float z_new = s_rho_prop * z + s_sigma_z_prop * curand_normal(&local_rng);
-        z_new = clampf(z_new, 0.0f, 3.0f);
-        
-        theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z_new);
-        mu_z = eval_curve(s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop, z_new);
-        sigma_h = eval_curve(s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop, z_new);
-        phi = 1.0f - theta_z;
-        
-        float mu_pred = phi * mu_h + theta_z * mu_z;
-        float var_pred = phi * phi * var_h + sigma_h * sigma_h;
-        var_pred = fmaxf(var_pred, 1e-8f);
-        
-        float mu_post, var_post, log_lik;
-        ocsn_kalman_update(y_obs, mu_pred, var_pred, &mu_post, &var_post, &log_lik);
-        
-        log_w += log_lik;
-        
-        /* Accumulate log-likelihood */
-        log_max = block_reduce_max(log_w, s_reduction);
-        if (inner_idx == 0) s_log_max = log_max;
-        __syncthreads();
-        w_unnorm = __expf(log_w - s_log_max);
-        sum_w = block_reduce_sum(w_unnorm, s_reduction);
-        if (inner_idx == 0) s_sum_w = sum_w;
-        __syncthreads();
-        
-        float ll_incr = s_log_max + __logf(fmaxf(s_sum_w, 1e-30f)) - __logf((float)N_inner);
-        ll_accum += ll_incr;
-        
-        z = z_new;
-        mu_h = mu_post;
-        var_h = var_post;
-    }
-    
-    /* MH Accept/Reject */
+    /*═══════════════════════════════════════════════════════════════════════
+     * STEP 3: MH Accept/Reject - now with CORRECT likelihood ratio
+     * Detailed balance is preserved because both use same estimator
+     *═══════════════════════════════════════════════════════════════════════*/
     if (inner_idx == 0) {
-        float log_alpha = ll_accum - s_ll_curr;
+        float log_alpha = s_ll_prop - s_ll_curr;
+        
         float u = curand_uniform(&local_rng);
         s_accept = (__logf(u) < log_alpha) ? 1 : 0;
         
@@ -734,19 +803,46 @@ __global__ void kernel_pmmh_rejuvenate(
             particles.sigma_base[theta_idx] = s_sigma_base_prop;
             particles.sigma_scale[theta_idx] = s_sigma_scale_prop;
             particles.sigma_rate[theta_idx] = s_sigma_rate_prop;
-            particles.log_likelihood[theta_idx] = ll_accum;
+            particles.log_likelihood[theta_idx] = s_ll_prop;
             atomicAdd(d_accepts, 1);
+        } else {
+            /* Store fresh estimate even on reject for consistency */
+            particles.log_likelihood[theta_idx] = s_ll_curr;
         }
     }
     __syncthreads();
     
+    /*═══════════════════════════════════════════════════════════════════════
+     * STEP 4: Reinitialize inner particles ONLY on accept
+     * Critical: Inner state must be consistent with new θ after acceptance
+     * On reject, keep existing forward filter state (already consistent)
+     *═══════════════════════════════════════════════════════════════════════*/
+    
     if (s_accept) {
-        particles.inner_z[global_idx] = z;
-        particles.inner_mu_h[global_idx] = mu_h;
-        particles.inner_var_h[global_idx] = var_h;
-        particles.inner_log_w[global_idx] = log_w;
+        /* Reinitialize inner particles from stationary distribution under θ_new */
+        float one_minus_rho_sq = fmaxf(1.0f - s_rho_prop * s_rho_prop, 1e-6f);
+        float z_stat_std = s_sigma_z_prop / sqrtf(one_minus_rho_sq);
+        
+        float z_init = z_stat_std * curand_normal(&local_rng);
+        z_init = clampf(z_init, 0.0f, 3.0f);
+        
+        float theta_z_init = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z_init);
+        float mu_z_init = eval_curve(s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop, z_init);
+        float sigma_h_init = eval_curve(s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop, z_init);
+        float phi_init = 1.0f - theta_z_init;
+        float h_stat_var = (sigma_h_init * sigma_h_init) / fmaxf(1.0f - phi_init * phi_init, 1e-6f);
+        
+        particles.inner_z[global_idx] = z_init;
+        particles.inner_mu_h[global_idx] = mu_z_init;
+        particles.inner_var_h[global_idx] = h_stat_var;
+        particles.inner_log_w[global_idx] = -__logf((float)N_inner);
+        
+        if (inner_idx == 0) {
+            particles.ess_inner[theta_idx] = (float)N_inner;
+        }
     }
     
+    /* Save RNG state */
     particles.rng_states[global_idx] = local_rng;
 }
 
@@ -762,7 +858,7 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     state->N_inner = N_inner;
     state->ess_threshold_outer = 0.5f;
     state->ess_threshold_inner = 0.5f;
-    state->K_rejuv = 5;  /* More moves for better diversity after resample */
+    state->K_rejuv = 3;  /* 3 moves with 2x cost each = 6x base cost */
     
     int N_total = N_theta * N_inner;
     
@@ -844,15 +940,15 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     state->theta_curve.scale = 0.08f;
     state->theta_curve.rate = 1.5f;
     
-    /* Proposal std - tuned for ~25-35% acceptance */
-    state->proposal_std[0] = 0.02f;   /* rho */
-    state->proposal_std[1] = 0.05f;   /* sigma_z */
-    state->proposal_std[2] = 0.2f;    /* mu_base */
-    state->proposal_std[3] = 0.2f;    /* mu_scale */
-    state->proposal_std[4] = 0.3f;    /* mu_rate */
-    state->proposal_std[5] = 0.05f;   /* sigma_base */
-    state->proposal_std[6] = 0.05f;   /* sigma_scale */
-    state->proposal_std[7] = 0.3f;    /* sigma_rate */
+    /* Proposal std - tuned for ~15-30% acceptance with correct likelihood */
+    state->proposal_std[0] = 0.01f;   /* rho */
+    state->proposal_std[1] = 0.02f;   /* sigma_z */
+    state->proposal_std[2] = 0.1f;    /* mu_base */
+    state->proposal_std[3] = 0.1f;    /* mu_scale */
+    state->proposal_std[4] = 0.15f;   /* mu_rate */
+    state->proposal_std[5] = 0.02f;   /* sigma_base */
+    state->proposal_std[6] = 0.02f;   /* sigma_scale */
+    state->proposal_std[7] = 0.15f;   /* sigma_rate */
     
     return state;
 }

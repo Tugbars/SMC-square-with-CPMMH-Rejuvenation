@@ -17,7 +17,7 @@
 #define CUDA_N_INNER      256
 #define CUDA_WARP_SIZE    32
 #define OCSN_K            10
-#define OCSN_OFFSET       3.5f
+#define OCSN_OFFSET       0.0f  /* No offset needed for standard y = h + log(chi2_1) */
 
 /*═══════════════════════════════════════════════════════════════════════════
  * Parameter Structures
