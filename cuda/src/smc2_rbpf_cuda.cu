@@ -227,8 +227,10 @@ __global__ void kernel_init_from_prior(
             valid = (s_rho >= d_bounds.rho_min && s_rho <= d_bounds.rho_max &&
                      s_sigma_z >= d_bounds.sigma_z_min && s_sigma_z <= d_bounds.sigma_z_max &&
                      s_mu_base >= d_bounds.mu_base_min && s_mu_base <= d_bounds.mu_base_max &&
+                     s_mu_scale >= d_bounds.mu_scale_min && s_mu_scale <= d_bounds.mu_scale_max &&
                      s_mu_rate >= d_bounds.mu_rate_min && s_mu_rate <= d_bounds.mu_rate_max &&
                      s_sigma_base >= d_bounds.sigma_base_min && s_sigma_base <= d_bounds.sigma_base_max &&
+                     s_sigma_scale >= d_bounds.sigma_scale_min && s_sigma_scale <= d_bounds.sigma_scale_max &&
                      s_sigma_rate >= d_bounds.sigma_rate_min && s_sigma_rate <= d_bounds.sigma_rate_max);
             attempts++;
         }
@@ -533,30 +535,44 @@ __global__ void kernel_copy_theta_particles(
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * PMMH Rejuvenation - CORRECT Implementation (Option B)
+ * PMMH Rejuvenation - CORRECT Implementation
  * 
- * Both θ_current and θ_proposed are evaluated with FRESH replay-based
- * likelihood estimators to ensure detailed balance is preserved.
+ * Key requirements for pseudo-marginal correctness:
+ *   1. Both θ_curr and θ_prop evaluated with same estimator
+ *   2. Replay outputs full PF state (z, mu_h, var_h, log_w)
+ *   3. After accept/reject, PF state is copied (not reinitialized)
+ *   4. Resampling must handle ALL state variables (z, mu_h, var_h)
  * 
  * Cost: 2 * O(T * N_inner) per θ-particle per rejuvenation move
  *═══════════════════════════════════════════════════════════════════════════*/
 
-/* Device function to run one complete RBPF replay and return log-likelihood */
-__device__ float rbpf_replay_likelihood(
+/* Device function: RBPF replay that outputs both likelihood AND final PF state */
+__device__ float rbpf_replay_with_state(
+    /* θ parameters */
     float rho, float sigma_z,
     float mu_base, float mu_scale, float mu_rate,
     float sigma_base, float sigma_scale, float sigma_rate,
+    /* Inputs */
     const float* y_history,
     int t_current,
     int N_inner,
     float ess_threshold_inner,
     curandState* rng,
-    float* s_reduction,
-    float* s_weights,
-    float* s_cumsum,
+    /* Shared memory for reductions/resampling */
+    float* s_reduction,  /* 32 floats for warp reductions */
+    float* s_z,          /* N_inner floats for storing z during resample */
+    float* s_mu,         /* N_inner floats for storing mu_h during resample */
+    float* s_var,        /* N_inner floats for storing var_h during resample */
+    float* s_cdf,        /* N_inner floats for weights/CDF */
     float* s_log_max_ptr,
     float* s_sum_w_ptr,
-    float* s_u0_ptr
+    float* s_u0_ptr,
+    /* Outputs: final PF state (written by each thread) */
+    float* z_out,
+    float* mu_out,
+    float* var_out,
+    float* logw_out,
+    float* ess_out
 ) {
     int inner_idx = threadIdx.x;
     
@@ -577,6 +593,7 @@ __device__ float rbpf_replay_likelihood(
     float var_h = h_stat_var;
     float log_w = -__logf((float)N_inner);
     float ll_accum = 0.0f;
+    float ess = (float)N_inner;
     
     /* Process all observations */
     for (int t = 0; t <= t_current; t++) {
@@ -597,37 +614,43 @@ __device__ float rbpf_replay_likelihood(
         float w_norm = w_unnorm / fmaxf(sum_w, 1e-30f);
         float w_sq = w_norm * w_norm;
         float sum_w_sq = block_reduce_sum(w_sq, s_reduction);
-        float ess = 1.0f / fmaxf(sum_w_sq, 1e-30f);
+        ess = 1.0f / fmaxf(sum_w_sq, 1e-30f);
         
         /* Resample if needed */
         if (ess < ess_threshold_inner * N_inner && t > 0) {
-            s_weights[inner_idx] = w_norm;
+            /* Store all state variables to shared memory */
+            s_z[inner_idx] = z;
+            s_mu[inner_idx] = mu_h;
+            s_var[inner_idx] = var_h;
+            s_cdf[inner_idx] = w_norm;  /* Store weight in CDF buffer */
             __syncthreads();
             
+            /* Thread 0: build CDF in-place in s_cdf */
             if (inner_idx == 0) {
-                s_cumsum[0] = s_weights[0];
-                for (int i = 1; i < N_inner; i++) s_cumsum[i] = s_cumsum[i-1] + s_weights[i];
-                s_cumsum[N_inner - 1] = 1.0f;
+                for (int i = 1; i < N_inner; i++) {
+                    s_cdf[i] += s_cdf[i-1];
+                }
+                s_cdf[N_inner - 1] = 1.0f;  /* Ensure ends at 1.0 */
                 *s_u0_ptr = curand_uniform(rng);
             }
             __syncthreads();
             
+            /* Systematic resampling: each thread picks its ancestor */
             float u = (*s_u0_ptr + (float)inner_idx) / (float)N_inner;
             int lo = 0, hi = N_inner - 1;
             while (lo < hi) {
                 int mid = (lo + hi) / 2;
-                if (s_cumsum[mid] < u) lo = mid + 1;
+                if (s_cdf[mid] < u) lo = mid + 1;
                 else hi = mid;
             }
+            int ancestor = lo;
             
-            /* Exchange via shared memory */
-            s_weights[inner_idx] = z;
-            s_cumsum[inner_idx] = mu_h;
-            __syncthreads();
-            z = s_weights[lo];
-            mu_h = s_cumsum[lo];
-            var_h = h_stat_var;
+            /* Copy ALL state from ancestor */
+            z = s_z[ancestor];
+            mu_h = s_mu[ancestor];
+            var_h = s_var[ancestor];
             log_w = -__logf((float)N_inner);
+            
             __syncthreads();
         }
         
@@ -672,11 +695,21 @@ __device__ float rbpf_replay_likelihood(
         var_h = var_post;
     }
     
+    /* OUTPUT: Write final PF state for this particle */
+    z_out[inner_idx] = z;
+    mu_out[inner_idx] = mu_h;
+    var_out[inner_idx] = var_h;
+    logw_out[inner_idx] = log_w;
+    if (inner_idx == 0) {
+        *ess_out = ess;
+    }
+    
     return ll_accum;
 }
 
 __global__ void kernel_pmmh_rejuvenate(
     ThetaParticlesSoA particles,
+    ThetaParticlesSoA particles_scratch,  /* Scratch space for proposed PF state */
     const float* y_history,
     int t_current,
     int N_theta, int N_inner,
@@ -689,10 +722,23 @@ __global__ void kernel_pmmh_rejuvenate(
     
     if (theta_idx >= N_theta || inner_idx >= N_inner) return;
     
+    /* Shared memory layout:
+     * [0..31]              : reduction scratch (32 floats)
+     * [32..32+N-1]         : s_z for resampling
+     * [32+N..32+2N-1]      : s_mu for resampling  
+     * [32+2N..32+3N-1]     : s_var for resampling
+     * [32+3N..32+4N-1]     : s_cdf for weights/CDF
+     * Plus scalars for log_max, sum_w, u0
+     */
     extern __shared__ float shared_mem[];
     float* s_reduction = shared_mem;
-    float* s_weights = &shared_mem[32];
-    float* s_cumsum = &shared_mem[32 + N_inner];
+    float* s_z = &shared_mem[32];
+    float* s_mu = &shared_mem[32 + N_inner];
+    float* s_var = &shared_mem[32 + 2 * N_inner];
+    float* s_cdf = &shared_mem[32 + 3 * N_inner];
+    
+    __shared__ float s_log_max, s_sum_w, s_u0;
+    __shared__ float s_ess_prop, s_ess_curr;
     
     __shared__ float s_rho_curr, s_sigma_z_curr;
     __shared__ float s_mu_base_curr, s_mu_scale_curr, s_mu_rate_curr;
@@ -702,7 +748,6 @@ __global__ void kernel_pmmh_rejuvenate(
     __shared__ float s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop;
     __shared__ float s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop;
     
-    __shared__ float s_log_max, s_sum_w, s_u0;
     __shared__ float s_ll_curr, s_ll_prop;
     __shared__ int s_accept;
     
@@ -734,8 +779,10 @@ __global__ void kernel_pmmh_rejuvenate(
             valid = (s_rho_prop >= d_bounds.rho_min && s_rho_prop <= d_bounds.rho_max &&
                      s_sigma_z_prop >= d_bounds.sigma_z_min && s_sigma_z_prop <= d_bounds.sigma_z_max &&
                      s_mu_base_prop >= d_bounds.mu_base_min && s_mu_base_prop <= d_bounds.mu_base_max &&
+                     s_mu_scale_prop >= d_bounds.mu_scale_min && s_mu_scale_prop <= d_bounds.mu_scale_max &&
                      s_mu_rate_prop >= d_bounds.mu_rate_min && s_mu_rate_prop <= d_bounds.mu_rate_max &&
                      s_sigma_base_prop >= d_bounds.sigma_base_min && s_sigma_base_prop <= d_bounds.sigma_base_max &&
+                     s_sigma_scale_prop >= d_bounds.sigma_scale_min && s_sigma_scale_prop <= d_bounds.sigma_scale_max &&
                      s_sigma_rate_prop >= d_bounds.sigma_rate_min && s_sigma_rate_prop <= d_bounds.sigma_rate_max);
             attempts++;
         }
@@ -754,39 +801,53 @@ __global__ void kernel_pmmh_rejuvenate(
     __syncthreads();
     
     /*═══════════════════════════════════════════════════════════════════════
-     * STEP 1: Replay with θ_proposed → ll_proposed
+     * STEP 1: Replay with θ_proposed → ll_prop + PF_prop state
+     * Output goes to scratch buffers
      *═══════════════════════════════════════════════════════════════════════*/
-    float ll_prop = rbpf_replay_likelihood(
+    float ll_prop = rbpf_replay_with_state(
         s_rho_prop, s_sigma_z_prop,
         s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop,
         s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop,
         y_history, t_current, N_inner, ess_threshold_inner,
-        &local_rng, s_reduction, s_weights, s_cumsum,
-        &s_log_max, &s_sum_w, &s_u0
+        &local_rng, s_reduction, s_z, s_mu, s_var, s_cdf,
+        &s_log_max, &s_sum_w, &s_u0,
+        /* Output: proposed PF state to scratch */
+        &particles_scratch.inner_z[global_idx],
+        &particles_scratch.inner_mu_h[global_idx],
+        &particles_scratch.inner_var_h[global_idx],
+        &particles_scratch.inner_log_w[global_idx],
+        &s_ess_prop
     );
     
     if (inner_idx == 0) s_ll_prop = ll_prop;
     __syncthreads();
     
     /*═══════════════════════════════════════════════════════════════════════
-     * STEP 2: Replay with θ_current → ll_current (SAME ESTIMATOR!)
-     * This is the key fix: both likelihoods use identical estimation
+     * STEP 2: Replay with θ_current → ll_curr + PF_curr state
+     * Output goes directly to particles (will be used if reject OR accept)
      *═══════════════════════════════════════════════════════════════════════*/
-    float ll_curr = rbpf_replay_likelihood(
+    float ll_curr = rbpf_replay_with_state(
         s_rho_curr, s_sigma_z_curr,
         s_mu_base_curr, s_mu_scale_curr, s_mu_rate_curr,
         s_sigma_base_curr, s_sigma_scale_curr, s_sigma_rate_curr,
         y_history, t_current, N_inner, ess_threshold_inner,
-        &local_rng, s_reduction, s_weights, s_cumsum,
-        &s_log_max, &s_sum_w, &s_u0
+        &local_rng, s_reduction, s_z, s_mu, s_var, s_cdf,
+        &s_log_max, &s_sum_w, &s_u0,
+        /* Output: current PF state directly to particles */
+        &particles.inner_z[global_idx],
+        &particles.inner_mu_h[global_idx],
+        &particles.inner_var_h[global_idx],
+        &particles.inner_log_w[global_idx],
+        &s_ess_curr
     );
     
     if (inner_idx == 0) s_ll_curr = ll_curr;
     __syncthreads();
     
     /*═══════════════════════════════════════════════════════════════════════
-     * STEP 3: MH Accept/Reject - now with CORRECT likelihood ratio
-     * Detailed balance is preserved because both use same estimator
+     * STEP 3: MH Accept/Reject
+     * On accept: copy PF_prop from scratch to particles, update θ
+     * On reject: particles already has PF_curr from step 2
      *═══════════════════════════════════════════════════════════════════════*/
     if (inner_idx == 0) {
         float log_alpha = s_ll_prop - s_ll_curr;
@@ -795,6 +856,7 @@ __global__ void kernel_pmmh_rejuvenate(
         s_accept = (__logf(u) < log_alpha) ? 1 : 0;
         
         if (s_accept) {
+            /* Update θ to proposed */
             particles.rho[theta_idx] = s_rho_prop;
             particles.sigma_z[theta_idx] = s_sigma_z_prop;
             particles.mu_base[theta_idx] = s_mu_base_prop;
@@ -804,42 +866,25 @@ __global__ void kernel_pmmh_rejuvenate(
             particles.sigma_scale[theta_idx] = s_sigma_scale_prop;
             particles.sigma_rate[theta_idx] = s_sigma_rate_prop;
             particles.log_likelihood[theta_idx] = s_ll_prop;
+            particles.ess_inner[theta_idx] = s_ess_prop;
             atomicAdd(d_accepts, 1);
         } else {
-            /* Store fresh estimate even on reject for consistency */
+            /* θ stays current, PF_curr already written in step 2 */
             particles.log_likelihood[theta_idx] = s_ll_curr;
+            particles.ess_inner[theta_idx] = s_ess_curr;
         }
     }
     __syncthreads();
     
     /*═══════════════════════════════════════════════════════════════════════
-     * STEP 4: Reinitialize inner particles ONLY on accept
-     * Critical: Inner state must be consistent with new θ after acceptance
-     * On reject, keep existing forward filter state (already consistent)
+     * STEP 4: On accept, copy PF state from scratch to particles
+     * This preserves the extended state (θ, u) correctly
      *═══════════════════════════════════════════════════════════════════════*/
-    
     if (s_accept) {
-        /* Reinitialize inner particles from stationary distribution under θ_new */
-        float one_minus_rho_sq = fmaxf(1.0f - s_rho_prop * s_rho_prop, 1e-6f);
-        float z_stat_std = s_sigma_z_prop / sqrtf(one_minus_rho_sq);
-        
-        float z_init = z_stat_std * curand_normal(&local_rng);
-        z_init = clampf(z_init, 0.0f, 3.0f);
-        
-        float theta_z_init = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z_init);
-        float mu_z_init = eval_curve(s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop, z_init);
-        float sigma_h_init = eval_curve(s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop, z_init);
-        float phi_init = 1.0f - theta_z_init;
-        float h_stat_var = (sigma_h_init * sigma_h_init) / fmaxf(1.0f - phi_init * phi_init, 1e-6f);
-        
-        particles.inner_z[global_idx] = z_init;
-        particles.inner_mu_h[global_idx] = mu_z_init;
-        particles.inner_var_h[global_idx] = h_stat_var;
-        particles.inner_log_w[global_idx] = -__logf((float)N_inner);
-        
-        if (inner_idx == 0) {
-            particles.ess_inner[theta_idx] = (float)N_inner;
-        }
+        particles.inner_z[global_idx] = particles_scratch.inner_z[global_idx];
+        particles.inner_mu_h[global_idx] = particles_scratch.inner_mu_h[global_idx];
+        particles.inner_var_h[global_idx] = particles_scratch.inner_var_h[global_idx];
+        particles.inner_log_w[global_idx] = particles_scratch.inner_log_w[global_idx];
     }
     
     /* Save RNG state */
@@ -927,13 +972,13 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     
     /* Default bounds */
     state->bounds.rho_min = 0.8f; state->bounds.rho_max = 0.999f;
-    state->bounds.sigma_z_min = 0.01f; state->bounds.sigma_z_max = 0.5f;
-    state->bounds.mu_base_min = -5.0f; state->bounds.mu_base_max = 2.0f;
-    state->bounds.mu_scale_min = -1.0f; state->bounds.mu_scale_max = 2.0f;
-    state->bounds.mu_rate_min = 0.1f; state->bounds.mu_rate_max = 5.0f;
-    state->bounds.sigma_base_min = 0.01f; state->bounds.sigma_base_max = 0.5f;
-    state->bounds.sigma_scale_min = -0.2f; state->bounds.sigma_scale_max = 0.5f;
-    state->bounds.sigma_rate_min = 0.1f; state->bounds.sigma_rate_max = 5.0f;
+    state->bounds.sigma_z_min = 0.01f; state->bounds.sigma_z_max = 1.0f;
+    state->bounds.mu_base_min = -10.0f; state->bounds.mu_base_max = 5.0f;
+    state->bounds.mu_scale_min = -2.0f; state->bounds.mu_scale_max = 10.0f;
+    state->bounds.mu_rate_min = 0.1f; state->bounds.mu_rate_max = 10.0f;
+    state->bounds.sigma_base_min = 0.01f; state->bounds.sigma_base_max = 1.0f;
+    state->bounds.sigma_scale_min = -0.5f; state->bounds.sigma_scale_max = 1.0f;
+    state->bounds.sigma_rate_min = 0.1f; state->bounds.sigma_rate_max = 10.0f;
     
     /* Default theta curve */
     state->theta_curve.base = 0.02f;
@@ -1082,13 +1127,18 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
         state->d_particles = state->d_particles_temp;
         state->d_particles_temp = tmp;
         
-        /* PMMH rejuvenation */
+        /* PMMH rejuvenation - uses particles_temp as scratch for proposed PF state */
+        /* Shared memory: 32 (reduction) + 4*N_inner (z,mu,var,cdf for resampling) */
+        size_t pmmh_shared_size = (32 + 4 * state->N_inner) * sizeof(float);
+        
         for (int k = 0; k < state->K_rejuv; k++) {
             int h_accepts = 0;
             CUDA_CHECK(cudaMemcpy(state->d_accepts, &h_accepts, sizeof(int), cudaMemcpyHostToDevice));
             
-            kernel_pmmh_rejuvenate<<<state->N_theta, state->N_inner, shared_size>>>(
-                state->d_particles, state->d_y_history, state->t_current,
+            kernel_pmmh_rejuvenate<<<state->N_theta, state->N_inner, pmmh_shared_size>>>(
+                state->d_particles, 
+                state->d_particles_temp,  /* Scratch buffer for proposed PF state */
+                state->d_y_history, state->t_current,
                 state->N_theta, state->N_inner, state->ess_threshold_inner,
                 state->d_accepts
             );
