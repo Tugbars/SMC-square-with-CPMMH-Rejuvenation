@@ -130,8 +130,13 @@ struct SMC2StateCUDA {
     
     /* CPMMH: Ping-pong noise buffers for zero-copy swaps
      * FP16 storage for bandwidth reduction
-     * u0 derived from z_noise via Φ(z) (no separate storage) */
-    half* d_z_noise[2];     /* Ping-pong: [N_theta * N_inner * (T+1)] each */
+     * 
+     * CRITICAL: u0 noise is SEPARATE from propagation noise.
+     * Standard PF assumes resampling uniforms are independent of propagation noise.
+     * Coupling them biases diffusion parameter estimates (sigma_z, sigma_base, sigma_scale).
+     */
+    half* d_z_noise[2];     /* Propagation: [N_theta * N_inner * (T+1)] each */
+    half* d_u0_noise[2];    /* Resampling:  [N_theta * (T+1)] each — ONE per (theta,t) */
     int noise_buf;          /* Current buffer index: 0 or 1 */
     int noise_capacity;     /* Max T for noise arrays */
     float cpmmh_rho;        /* Correlation: 0.99 typical */

@@ -372,6 +372,7 @@ __global__ void kernel_init_from_prior(
     ThetaParticlesSoA particles,
     int N_theta, int N_inner,
     half* d_z_noise,    /* Store t=0 z-noise for CPMMH (FP16) */
+    half* d_u0_noise,   /* Store t=0 u0-noise for CPMMH (FP16) - SEPARATE */
     int noise_capacity
 ) {
     int theta_idx = blockIdx.x;
@@ -442,6 +443,14 @@ __global__ void kernel_init_from_prior(
     d_z_noise[z_noise_idx] = h_z_noise;
     float z_noise_init = __half2float(h_z_noise);  /* Use truncated value */
     
+    /* Generate t=0 u0-noise (thread 0 only) - SEPARATE from propagation noise */
+    if (inner_idx == 0) {
+        float u0_noise_raw = curand_normal(rng);
+        int64_t u0_noise_idx = (int64_t)theta_idx * (noise_capacity + 1);  /* t=0 slot */
+        half h_u0_noise = __float2half(u0_noise_raw);
+        d_u0_noise[u0_noise_idx] = h_u0_noise;
+    }
+    
     /* z̃ in unconstrained space (exact Gaussian), z in bounded (0,3) for curves */
     float z_tilde = z_tilde_stat_std * z_noise_init;
     float z = z_tilde_to_z(z_tilde);  /* Transform to (0,3) for curve evaluation */
@@ -481,7 +490,8 @@ __global__ void kernel_rbpf_step(
     ThetaParticlesSoA particles,
     float y_obs,
     int N_theta, int N_inner,
-    half* d_z_noise,   /* [N_theta * N_inner * (T+1)] - FP16 z-innovations */
+    half* d_z_noise,   /* [N_theta * N_inner * (T+1)] - FP16 propagation noise */
+    half* d_u0_noise,  /* [N_theta * (T+1)] - FP16 resampling noise (SEPARATE) */
     int t_current,     /* Current timestep (0-indexed) */
     int noise_capacity /* Max T for noise arrays */
 ) {
@@ -500,7 +510,6 @@ __global__ void kernel_rbpf_step(
     __shared__ float s_mu_base, s_mu_scale, s_mu_rate;
     __shared__ float s_sigma_base, s_sigma_scale, s_sigma_rate;
     __shared__ float s_log_max, s_sum_w, s_u0;
-    __shared__ float s_z_noise_0;  /* Thread 0's noise for u0 derivation */
     
     if (inner_idx == 0) {
         s_rho = particles.rho[theta_idx];
@@ -522,25 +531,29 @@ __global__ void kernel_rbpf_step(
     float var_h = particles.inner_var_h[global_idx];
     float log_w = particles.inner_log_w[global_idx];
     
-    /* Noise index: slot t+1 for propagation (slot 0 is init) */
+    /* Noise indices */
     int64_t z_noise_base = (int64_t)theta_idx * N_inner * (noise_capacity + 1);
     int64_t z_noise_idx = z_noise_base + (int64_t)(t_current + 1) * N_inner + inner_idx;
+    int64_t u0_noise_idx = (int64_t)theta_idx * (noise_capacity + 1) + (t_current + 1);
     
-    /* STEP 1: Generate z-noise, ROUND-TRIP through FP16 before use.
-     * Critical for PMMH: forward pass must see EXACTLY what replay sees.
-     * Without round-trip, float != half->float breaks pseudo-marginal property. */
+    /* STEP 1: Generate propagation z-noise, ROUND-TRIP through FP16 before use. */
     float z_noise_raw = curand_normal(&local_rng);
     half h_z_noise = __float2half(z_noise_raw);
     d_z_noise[z_noise_idx] = h_z_noise;
     float z_noise = __half2float(h_z_noise);  /* Use truncated value */
     
-    /* Share thread 0's noise for u0 derivation */
+    /* STEP 1b: Generate SEPARATE u0 noise for resampling (thread 0 only).
+     * CRITICAL: Resampling randomness must be independent of propagation noise.
+     * Coupling them biases diffusion parameter estimates (sigma_z, sigma_base, sigma_scale). */
     if (inner_idx == 0) {
-        s_z_noise_0 = z_noise;
+        float u0_noise_raw = curand_normal(&local_rng);
+        half h_u0 = __float2half(u0_noise_raw);
+        d_u0_noise[u0_noise_idx] = h_u0;
+        s_u0 = u0_from_noise(__half2float(h_u0));
     }
     __syncthreads();
     
-    /* STEP 2: ALWAYS RESAMPLE (R1) with u0 derived from z_noise */
+    /* STEP 2: ALWAYS RESAMPLE (R1) with u0 from SEPARATE noise stream */
     {
         float log_max = block_reduce_max(log_w, s_reduction);
         if (inner_idx == 0) s_log_max = log_max;
@@ -562,11 +575,6 @@ __global__ void kernel_rbpf_step(
         /* Fix rounding: ensure CDF ends at exactly 1.0 */
         if (inner_idx == N_inner - 1) {
             s_cumsum[N_inner - 1] = 1.0f;
-        }
-        
-        /* Derive u0 from thread 0's z_noise - NO SEPARATE STORAGE */
-        if (inner_idx == 0) {
-            s_u0 = u0_from_noise(s_z_noise_0);
         }
         __syncthreads();
         
@@ -762,44 +770,48 @@ __global__ void kernel_copy_theta_particles(
     }
 }
 
-/* Copy noise arrays after outer resampling - PING-PONG VERSION
- * Reads from src buffer, writes to dst buffer based on ancestors
- * No temp storage needed - just swap buffer index after */
-__global__ void kernel_copy_noise_arrays(
-    const half* src_z_noise,  /* Read from current buffer */
-    half* dst_z_noise,        /* Write to other buffer */
+/* Copy noise arrays after outer resampling - PING-PONG VERSION (z + u0)
+ * Reads from src buffers, writes to dst buffers based on ancestors.
+ *
+ * z_noise:  [N_theta * N_inner * (T+1)]
+ * u0_noise: [N_theta * (T+1)]
+ */
+__global__ void kernel_copy_noise_arrays_z_u0(
+    const half* src_z_noise,
+    half* dst_z_noise,
+    const half* src_u0_noise,
+    half* dst_u0_noise,
     const int* d_ancestors,
     int N_theta, int N_inner,
     int t_current, int noise_capacity
 ) {
     int theta_idx = blockIdx.x;
     int inner_idx = threadIdx.x;
-    
+
     if (theta_idx >= N_theta || inner_idx >= N_inner) return;
-    
+
     int ancestor = d_ancestors[theta_idx];
-    
+
     int64_t dst_z_base = (int64_t)theta_idx * N_inner * (noise_capacity + 1);
-    int64_t src_z_base = (int64_t)ancestor * N_inner * (noise_capacity + 1);
-    
+    int64_t src_z_base = (int64_t)ancestor  * N_inner * (noise_capacity + 1);
+
     /* Copy z-noise for all timesteps up to t_current+1 */
     for (int t = 0; t <= t_current + 1; t++) {
-        int64_t src_idx = src_z_base + t * N_inner + inner_idx;
-        int64_t dst_idx = dst_z_base + t * N_inner + inner_idx;
+        int64_t src_idx = src_z_base + (int64_t)t * N_inner + inner_idx;
+        int64_t dst_idx = dst_z_base + (int64_t)t * N_inner + inner_idx;
         dst_z_noise[dst_idx] = src_z_noise[src_idx];
     }
-    /* u0 derived from z_noise - no separate copy needed */
+
+    /* Copy u0-noise (only thread 0 per theta block) */
+    if (inner_idx == 0) {
+        int64_t dst_u0_base = (int64_t)theta_idx * (noise_capacity + 1);
+        int64_t src_u0_base = (int64_t)ancestor  * (noise_capacity + 1);
+
+        for (int t = 0; t <= t_current + 1; t++) {
+            dst_u0_noise[dst_u0_base + t] = src_u0_noise[src_u0_base + t];
+        }
+    }
 }
-
-/*═══════════════════════════════════════════════════════════════════════════
- * CPMMH Rejuvenation Kernel
- * 
- * Two implementations controlled by SMC2_BLOCKED_PMMH:
- *   0 = Joint 8-parameter proposal (default)
- *   1 = Blocked proposals (3 blocks: dynamics, mu_curve, sigma_curve)
- *═══════════════════════════════════════════════════════════════════════════*/
-
-#if !SMC2_BLOCKED_PMMH
 
 /*═══════════════════════════════════════════════════════════════════════════
  * JOINT CPMMH Rejuvenation Kernel
@@ -818,8 +830,10 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
     ThetaParticlesSoA particles,
     ThetaParticlesSoA particles_scratch,
     const float* y_history,
-    half* d_z_noise_curr,      /* Current noise buffer (FP16) */
+    half* d_z_noise_curr,      /* Current propagation noise (FP16) */
     half* d_z_noise_other,     /* Other ping-pong buffer (FP16) */
+    half* d_u0_noise_curr,     /* Current resampling noise (FP16) - SEPARATE */
+    half* d_u0_noise_other,    /* Other ping-pong buffer (FP16) */
     int t_current,
     int N_theta, int N_inner,
     int noise_capacity,
@@ -827,10 +841,12 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
     int* d_accepts,
     int* d_swap_flags,         /* Per-particle: 1 if accepted (needs buffer swap) */
     unsigned long long seed,   /* Unused in joint mode, kept for API consistency */
-    int move_id                /* Unused in joint mode, kept for API consistency */
+    int move_id,               /* Unused in joint mode, kept for API consistency */
+    int block_id               /* Unused in joint mode, kept for API consistency */
 ) {
-    (void)seed;    /* Suppress unused warning */
-    (void)move_id; /* Suppress unused warning */
+    (void)seed;     /* Suppress unused warning */
+    (void)move_id;  /* Suppress unused warning */
+    (void)block_id; /* Suppress unused warning */
     
     int theta_idx = blockIdx.x;
     int inner_idx = threadIdx.x;
@@ -990,7 +1006,7 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
         }
         __syncthreads();
         
-        /* FUSED: Generate fresh noise for timestep t+1, correlate, derive u0 */
+        /* FUSED: Generate fresh noise for timestep t+1, correlate */
         int64_t z_idx_t1 = z_noise_base + (int64_t)(t + 1) * N_inner + inner_idx;
         float z_noise_curr_t1 = __half2float(d_z_noise_curr[z_idx_t1]);
         float z_noise_fresh_t1 = curand_normal(&local_rng);
@@ -1001,11 +1017,17 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
         d_z_noise_other[z_idx_t1] = h_prop_t1;
         float z_noise_prop_t1 = __half2float(h_prop_t1);
         
-        /* Derive u0 from thread 0's correlated noise (shared) */
+        /* SEPARATE u0 noise for resampling (thread 0 only)
+         * CRITICAL: Must be independent of propagation noise to avoid biasing
+         * diffusion parameters (sigma_z, sigma_base, sigma_scale) */
         if (inner_idx == 0) {
-            /* Use the first element's noise to derive u0 */
-            float z0_for_u0 = z_noise_prop_t1;
-            s_u0_shared = u0_from_noise(z0_for_u0);
+            int64_t u0_idx_t1 = (int64_t)theta_idx * (noise_capacity + 1) + (t + 1);
+            float u0_noise_curr = __half2float(d_u0_noise_curr[u0_idx_t1]);
+            float u0_noise_fresh = curand_normal(&local_rng);
+            float u0_noise_prop_raw = cpmmh_rho * u0_noise_curr + scale * u0_noise_fresh;
+            half h_u0_prop = __float2half(u0_noise_prop_raw);
+            d_u0_noise_other[u0_idx_t1] = h_u0_prop;
+            s_u0_shared = u0_from_noise(__half2float(h_u0_prop));
         }
         __syncthreads();
         
@@ -1125,622 +1147,14 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
     particles.rng_states[global_idx] = local_rng;
 }
 
-#else /* SMC2_BLOCKED_PMMH == 1 */
-
-/*═══════════════════════════════════════════════════════════════════════════
- * BLOCKED CPMMH Rejuvenation — FULL PHILOX (Stateless RNG)
- * 
- * Proposes parameters in 3 blocks with separate MH accept/reject:
- *   Block 1: (ρ, σ_z)                    — dynamics
- *   Block 2: (μ_base, μ_scale, μ_rate)   — mean curve
- *   Block 3: (σ_base, σ_scale, σ_rate)   — vol curve
- * 
- * Each block does full replay → higher acceptance per block → better mixing.
- * All blocks share same correlated noise (generated once at start).
- * 
- * Philox indexing scheme (all deterministic, no mutable RNG state):
- *   - Fresh noise ξ[t]:  (seed, theta*N_inner+inner, move_id*MAX_T + t)
- *   - Proposal noise:    (seed+0xPROP, theta, move_id*8 + param_idx)
- *   - MH uniform:        (seed+0xMH, theta, move_id*3 + block_id)
- * 
- * INVARIANT: For unchanged θ and unchanged u, likelihood is identical.
- *═══════════════════════════════════════════════════════════════════════════*/
-
-#define PHILOX_SEED_OFFSET_PROPOSAL  0x50524F50ULL  /* "PROP" */
-#define PHILOX_SEED_OFFSET_MH        0x4D484143ULL  /* "MHAC" */
-#define PHILOX_MAX_T                 16384          /* Max timesteps for indexing */
-
-__global__ void kernel_cpmmh_rejuvenate_fused(
-    ThetaParticlesSoA particles,
-    ThetaParticlesSoA particles_scratch,
-    const float* y_history,
-    half* d_z_noise_curr,
-    half* d_z_noise_other,
-    int t_current,
-    int N_theta, int N_inner,
-    int noise_capacity,
-    float cpmmh_rho,
-    int* d_accepts,
-    int* d_swap_flags,
-    unsigned long long seed,    /* Base seed for Philox */
-    int move_id                 /* PMMH move index (for unique noise per attempt) */
-) {
-    int theta_idx = blockIdx.x;
-    int inner_idx = threadIdx.x;
-    int global_idx = theta_idx * N_inner + inner_idx;
-    
-    if (theta_idx >= N_theta || inner_idx >= N_inner) return;
-    
-    extern __shared__ float shared_mem[];
-    float* s_reduction = shared_mem;
-    float* s_z = &shared_mem[32];
-    float* s_mu = &shared_mem[32 + N_inner];
-    float* s_var = &shared_mem[32 + 2 * N_inner];
-    float* s_cdf = &shared_mem[32 + 3 * N_inner];
-    
-    __shared__ float s_log_max, s_sum_w;
-    __shared__ float s_u0_shared;
-    
-    /* Current parameters (updated as blocks accept) */
-    __shared__ float s_rho, s_sigma_z;
-    __shared__ float s_mu_base, s_mu_scale, s_mu_rate;
-    __shared__ float s_sigma_base, s_sigma_scale, s_sigma_rate;
-    __shared__ float s_ll_curr;
-    
-    /* Proposed parameters for current block */
-    __shared__ float s_rho_prop, s_sigma_z_prop;
-    __shared__ float s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop;
-    __shared__ float s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop;
-    
-    __shared__ float s_ll_prop, s_lp_curr, s_lp_prop;
-    __shared__ int s_accept, s_valid, s_any_accept;
-    
-    /* Load current parameters */
-    if (inner_idx == 0) {
-        s_rho = particles.rho[theta_idx];
-        s_sigma_z = particles.sigma_z[theta_idx];
-        s_mu_base = particles.mu_base[theta_idx];
-        s_mu_scale = particles.mu_scale[theta_idx];
-        s_mu_rate = particles.mu_rate[theta_idx];
-        s_sigma_base = particles.sigma_base[theta_idx];
-        s_sigma_scale = particles.sigma_scale[theta_idx];
-        s_sigma_rate = particles.sigma_rate[theta_idx];
-        s_ll_curr = particles.log_likelihood[theta_idx];
-        s_any_accept = 0;
-    }
-    __syncthreads();
-    
-    int64_t z_noise_base = (int64_t)theta_idx * N_inner * (noise_capacity + 1);
-    float scale = sqrtf(1.0f - cpmmh_rho * cpmmh_rho);
-    
-    /* Generate correlated noise ONCE for all blocks using Philox
-     * Index: (seed, global_idx, move_id * MAX_T + time) */
-    curandStatePhilox4_32_10_t noise_rng;
-    
-    /* t=0 noise */
-    curand_init(seed, global_idx, (unsigned long long)move_id * PHILOX_MAX_T, &noise_rng);
-    float z_noise_curr_0 = __half2float(d_z_noise_curr[z_noise_base + inner_idx]);
-    float z_noise_fresh_0 = curand_normal(&noise_rng);
-    float z_noise_prop_0_raw = cpmmh_rho * z_noise_curr_0 + scale * z_noise_fresh_0;
-    half h_prop_0 = __float2half(z_noise_prop_0_raw);
-    d_z_noise_other[z_noise_base + inner_idx] = h_prop_0;
-    float z_noise_prop_0 = __half2float(h_prop_0);
-    
-    /* Per-timestep correlated noise for replay */
-    for (int t = 0; t <= t_current; t++) {
-        curand_init(seed, global_idx, (unsigned long long)move_id * PHILOX_MAX_T + t + 1, &noise_rng);
-        int64_t z_idx_t1 = z_noise_base + (int64_t)(t + 1) * N_inner + inner_idx;
-        float z_curr_t1 = __half2float(d_z_noise_curr[z_idx_t1]);
-        float z_fresh_t1 = curand_normal(&noise_rng);
-        float z_prop_t1_raw = cpmmh_rho * z_curr_t1 + scale * z_fresh_t1;
-        half h_prop_t1 = __float2half(z_prop_t1_raw);
-        d_z_noise_other[z_idx_t1] = h_prop_t1;
-    }
-    __syncthreads();
-    
-    /*═══════════════════════════════════════════════════════════════════════
-     * BLOCK 1: Dynamics (ρ, σ_z)
-     *═══════════════════════════════════════════════════════════════════════*/
-    if (inner_idx == 0) {
-        s_lp_curr = log_prior_theta(s_rho, s_sigma_z,
-                                     s_mu_base, s_mu_scale, s_mu_rate,
-                                     s_sigma_base, s_sigma_scale, s_sigma_rate);
-        
-        /* Philox for proposal noise: (seed+PROP_OFFSET, theta, move*8 + param) */
-        curandStatePhilox4_32_10_t prop_rng;
-        curand_init(seed + PHILOX_SEED_OFFSET_PROPOSAL, theta_idx, 
-                    (unsigned long long)move_id * 8 + 0, &prop_rng);
-        s_rho_prop = s_rho + d_proposal_std[0] * curand_normal(&prop_rng);
-        
-        curand_init(seed + PHILOX_SEED_OFFSET_PROPOSAL, theta_idx,
-                    (unsigned long long)move_id * 8 + 1, &prop_rng);
-        s_sigma_z_prop = s_sigma_z + d_proposal_std[1] * curand_normal(&prop_rng);
-        
-        /* Keep other params at current */
-        s_mu_base_prop = s_mu_base;
-        s_mu_scale_prop = s_mu_scale;
-        s_mu_rate_prop = s_mu_rate;
-        s_sigma_base_prop = s_sigma_base;
-        s_sigma_scale_prop = s_sigma_scale;
-        s_sigma_rate_prop = s_sigma_rate;
-        
-        s_lp_prop = log_prior_theta(s_rho_prop, s_sigma_z_prop,
-                                     s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop,
-                                     s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop);
-        s_valid = isfinite(s_lp_prop) ? 1 : 0;
-    }
-    __syncthreads();
-    
-    if (s_valid) {
-        /* Run replay with proposed params */
-        float one_minus_rho_sq = fmaxf(1.0f - s_rho_prop * s_rho_prop, 1e-6f);
-        float z_tilde_stat_std = s_sigma_z_prop / sqrtf(one_minus_rho_sq);
-        float z_tilde = z_tilde_stat_std * z_noise_prop_0;
-        float z = z_tilde_to_z(z_tilde);
-        
-        float theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
-        float mu_z = eval_curve(s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop, z);
-        float sigma_h = eval_curve(s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop, z);
-        float phi = 1.0f - theta_z;
-        
-        float mu_h = mu_z;
-        float var_h = (sigma_h * sigma_h) / fmaxf(1.0f - phi * phi, 1e-6f);
-        float log_w = -__logf((float)N_inner);
-        float ll_accum = 0.0f;
-        
-        for (int t = 0; t <= t_current; t++) {
-            float y_obs = y_history[t];
-            
-            /* Weight normalization */
-            float log_max = block_reduce_max(log_w, s_reduction);
-            if (inner_idx == 0) s_log_max = log_max;
-            __syncthreads();
-            
-            float w_unnorm = __expf(log_w - s_log_max);
-            float sum_w = block_reduce_sum(w_unnorm, s_reduction);
-            if (inner_idx == 0) s_sum_w = sum_w;
-            __syncthreads();
-            
-            float w_norm = w_unnorm / fmaxf(s_sum_w, 1e-30f);
-            
-            /* Store for resampling */
-            s_z[inner_idx] = z_tilde;
-            s_mu[inner_idx] = mu_h;
-            s_var[inner_idx] = var_h;
-            s_cdf[inner_idx] = w_norm;
-            __syncthreads();
-            
-            /* Prefix sum */
-            for (int offset = 1; offset < N_inner; offset *= 2) {
-                float val = 0.0f;
-                if (inner_idx >= offset) val = s_cdf[inner_idx - offset];
-                __syncthreads();
-                if (inner_idx >= offset) s_cdf[inner_idx] += val;
-                __syncthreads();
-            }
-            if (inner_idx == N_inner - 1) s_cdf[inner_idx] = 1.0f;
-            __syncthreads();
-            
-            /* Get noise for this timestep */
-            int64_t z_idx_t1 = z_noise_base + (int64_t)(t + 1) * N_inner + inner_idx;
-            float z_noise_t1 = __half2float(d_z_noise_other[z_idx_t1]);
-            
-            if (inner_idx == 0) s_u0_shared = u0_from_noise(__half2float(d_z_noise_other[z_noise_base + (int64_t)(t + 1) * N_inner]));
-            __syncthreads();
-            
-            /* Resample */
-            float u = (s_u0_shared + (float)inner_idx) / (float)N_inner;
-            int lo = 0, hi = N_inner - 1;
-            while (lo < hi) {
-                int mid = (lo + hi) / 2;
-                if (s_cdf[mid] < u) lo = mid + 1;
-                else hi = mid;
-            }
-            
-            z_tilde = s_z[lo];
-            mu_h = s_mu[lo];
-            var_h = s_var[lo];
-            log_w = -__logf((float)N_inner);
-            __syncthreads();
-            
-            /* Propagate */
-            float z_tilde_new = s_rho_prop * z_tilde + s_sigma_z_prop * z_noise_t1;
-            z = z_tilde_to_z(z_tilde_new);
-            
-            theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
-            mu_z = eval_curve(s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop, z);
-            sigma_h = eval_curve(s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop, z);
-            
-            phi = 1.0f - theta_z;
-            float mu_pred = phi * mu_h + theta_z * mu_z;
-            float var_pred = phi * phi * var_h + sigma_h * sigma_h;
-            var_pred = fmaxf(var_pred, 1e-8f);
-            
-            float mu_post, var_post, log_lik;
-            ocsn_kalman_update(y_obs, mu_pred, var_pred, &mu_post, &var_post, &log_lik);
-            
-            log_w += log_lik;
-            
-            /* Accumulate likelihood */
-            log_max = block_reduce_max(log_w, s_reduction);
-            if (inner_idx == 0) s_log_max = log_max;
-            __syncthreads();
-            
-            sum_w = block_reduce_sum(__expf(log_w - s_log_max), s_reduction);
-            if (inner_idx == 0) {
-                ll_accum += s_log_max + __logf(fmaxf(sum_w, 1e-30f)) - __logf((float)N_inner);
-            }
-            __syncthreads();
-            
-            z_tilde = z_tilde_new;
-            mu_h = mu_post;
-            var_h = var_post;
-        }
-        
-        /* MH accept/reject for Block 1 — Philox: (seed+MH_OFFSET, theta, move*3 + block) */
-        if (inner_idx == 0) {
-            s_ll_prop = ll_accum;
-            float log_alpha = (s_ll_prop + s_lp_prop) - (s_ll_curr + s_lp_curr);
-            
-            curandStatePhilox4_32_10_t mh_rng;
-            curand_init(seed + PHILOX_SEED_OFFSET_MH, theta_idx,
-                        (unsigned long long)move_id * 3 + 0, &mh_rng);
-            float u = curand_uniform(&mh_rng);
-            s_accept = (__logf(u) < log_alpha) ? 1 : 0;
-            
-            if (s_accept) {
-                s_rho = s_rho_prop;
-                s_sigma_z = s_sigma_z_prop;
-                s_ll_curr = s_ll_prop;
-                s_any_accept = 1;
-                atomicAdd(d_accepts, 1);
-            }
-        }
-        __syncthreads();
-    }
-    
-    /*═══════════════════════════════════════════════════════════════════════
-     * BLOCK 2: Mean curve (μ_base, μ_scale, μ_rate)
-     *═══════════════════════════════════════════════════════════════════════*/
-    if (inner_idx == 0) {
-        s_lp_curr = log_prior_theta(s_rho, s_sigma_z,
-                                     s_mu_base, s_mu_scale, s_mu_rate,
-                                     s_sigma_base, s_sigma_scale, s_sigma_rate);
-        
-        s_rho_prop = s_rho;
-        s_sigma_z_prop = s_sigma_z;
-        
-        /* Philox for proposal noise */
-        curandStatePhilox4_32_10_t prop_rng;
-        curand_init(seed + PHILOX_SEED_OFFSET_PROPOSAL, theta_idx,
-                    (unsigned long long)move_id * 8 + 2, &prop_rng);
-        s_mu_base_prop = s_mu_base + d_proposal_std[2] * curand_normal(&prop_rng);
-        
-        curand_init(seed + PHILOX_SEED_OFFSET_PROPOSAL, theta_idx,
-                    (unsigned long long)move_id * 8 + 3, &prop_rng);
-        s_mu_scale_prop = s_mu_scale + d_proposal_std[3] * curand_normal(&prop_rng);
-        
-        curand_init(seed + PHILOX_SEED_OFFSET_PROPOSAL, theta_idx,
-                    (unsigned long long)move_id * 8 + 4, &prop_rng);
-        s_mu_rate_prop = s_mu_rate + d_proposal_std[4] * curand_normal(&prop_rng);
-        
-        s_sigma_base_prop = s_sigma_base;
-        s_sigma_scale_prop = s_sigma_scale;
-        s_sigma_rate_prop = s_sigma_rate;
-        
-        s_lp_prop = log_prior_theta(s_rho_prop, s_sigma_z_prop,
-                                     s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop,
-                                     s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop);
-        s_valid = isfinite(s_lp_prop) ? 1 : 0;
-    }
-    __syncthreads();
-    
-    if (s_valid) {
-        /* Replay for Block 2 (same structure, using updated params) */
-        float one_minus_rho_sq = fmaxf(1.0f - s_rho_prop * s_rho_prop, 1e-6f);
-        float z_tilde_stat_std = s_sigma_z_prop / sqrtf(one_minus_rho_sq);
-        float z_tilde = z_tilde_stat_std * z_noise_prop_0;
-        float z = z_tilde_to_z(z_tilde);
-        
-        float theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
-        float mu_z = eval_curve(s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop, z);
-        float sigma_h = eval_curve(s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop, z);
-        float phi = 1.0f - theta_z;
-        
-        float mu_h = mu_z;
-        float var_h = (sigma_h * sigma_h) / fmaxf(1.0f - phi * phi, 1e-6f);
-        float log_w = -__logf((float)N_inner);
-        float ll_accum = 0.0f;
-        
-        for (int t = 0; t <= t_current; t++) {
-            float y_obs = y_history[t];
-            
-            float log_max = block_reduce_max(log_w, s_reduction);
-            if (inner_idx == 0) s_log_max = log_max;
-            __syncthreads();
-            
-            float w_unnorm = __expf(log_w - s_log_max);
-            float sum_w = block_reduce_sum(w_unnorm, s_reduction);
-            if (inner_idx == 0) s_sum_w = sum_w;
-            __syncthreads();
-            
-            float w_norm = w_unnorm / fmaxf(s_sum_w, 1e-30f);
-            
-            s_z[inner_idx] = z_tilde;
-            s_mu[inner_idx] = mu_h;
-            s_var[inner_idx] = var_h;
-            s_cdf[inner_idx] = w_norm;
-            __syncthreads();
-            
-            for (int offset = 1; offset < N_inner; offset *= 2) {
-                float val = 0.0f;
-                if (inner_idx >= offset) val = s_cdf[inner_idx - offset];
-                __syncthreads();
-                if (inner_idx >= offset) s_cdf[inner_idx] += val;
-                __syncthreads();
-            }
-            if (inner_idx == N_inner - 1) s_cdf[inner_idx] = 1.0f;
-            __syncthreads();
-            
-            int64_t z_idx_t1 = z_noise_base + (int64_t)(t + 1) * N_inner + inner_idx;
-            float z_noise_t1 = __half2float(d_z_noise_other[z_idx_t1]);
-            
-            if (inner_idx == 0) s_u0_shared = u0_from_noise(__half2float(d_z_noise_other[z_noise_base + (int64_t)(t + 1) * N_inner]));
-            __syncthreads();
-            
-            float u = (s_u0_shared + (float)inner_idx) / (float)N_inner;
-            int lo = 0, hi = N_inner - 1;
-            while (lo < hi) {
-                int mid = (lo + hi) / 2;
-                if (s_cdf[mid] < u) lo = mid + 1;
-                else hi = mid;
-            }
-            
-            z_tilde = s_z[lo];
-            mu_h = s_mu[lo];
-            var_h = s_var[lo];
-            log_w = -__logf((float)N_inner);
-            __syncthreads();
-            
-            float z_tilde_new = s_rho_prop * z_tilde + s_sigma_z_prop * z_noise_t1;
-            z = z_tilde_to_z(z_tilde_new);
-            
-            theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
-            mu_z = eval_curve(s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop, z);
-            sigma_h = eval_curve(s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop, z);
-            
-            phi = 1.0f - theta_z;
-            float mu_pred = phi * mu_h + theta_z * mu_z;
-            float var_pred = phi * phi * var_h + sigma_h * sigma_h;
-            var_pred = fmaxf(var_pred, 1e-8f);
-            
-            float mu_post, var_post, log_lik;
-            ocsn_kalman_update(y_obs, mu_pred, var_pred, &mu_post, &var_post, &log_lik);
-            
-            log_w += log_lik;
-            
-            log_max = block_reduce_max(log_w, s_reduction);
-            if (inner_idx == 0) s_log_max = log_max;
-            __syncthreads();
-            
-            sum_w = block_reduce_sum(__expf(log_w - s_log_max), s_reduction);
-            if (inner_idx == 0) {
-                ll_accum += s_log_max + __logf(fmaxf(sum_w, 1e-30f)) - __logf((float)N_inner);
-            }
-            __syncthreads();
-            
-            z_tilde = z_tilde_new;
-            mu_h = mu_post;
-            var_h = var_post;
-        }
-        
-        /* MH accept/reject for Block 2 — Philox */
-        if (inner_idx == 0) {
-            s_ll_prop = ll_accum;
-            float log_alpha = (s_ll_prop + s_lp_prop) - (s_ll_curr + s_lp_curr);
-            
-            curandStatePhilox4_32_10_t mh_rng;
-            curand_init(seed + PHILOX_SEED_OFFSET_MH, theta_idx,
-                        (unsigned long long)move_id * 3 + 1, &mh_rng);
-            float u = curand_uniform(&mh_rng);
-            s_accept = (__logf(u) < log_alpha) ? 1 : 0;
-            
-            if (s_accept) {
-                s_mu_base = s_mu_base_prop;
-                s_mu_scale = s_mu_scale_prop;
-                s_mu_rate = s_mu_rate_prop;
-                s_ll_curr = s_ll_prop;
-                s_any_accept = 1;
-                atomicAdd(d_accepts, 1);
-            }
-        }
-        __syncthreads();
-    }
-    
-    /*═══════════════════════════════════════════════════════════════════════
-     * BLOCK 3: Vol curve (σ_base, σ_scale, σ_rate)
-     *═══════════════════════════════════════════════════════════════════════*/
-    if (inner_idx == 0) {
-        s_lp_curr = log_prior_theta(s_rho, s_sigma_z,
-                                     s_mu_base, s_mu_scale, s_mu_rate,
-                                     s_sigma_base, s_sigma_scale, s_sigma_rate);
-        
-        s_rho_prop = s_rho;
-        s_sigma_z_prop = s_sigma_z;
-        s_mu_base_prop = s_mu_base;
-        s_mu_scale_prop = s_mu_scale;
-        s_mu_rate_prop = s_mu_rate;
-        
-        /* Philox for proposal noise */
-        curandStatePhilox4_32_10_t prop_rng;
-        curand_init(seed + PHILOX_SEED_OFFSET_PROPOSAL, theta_idx,
-                    (unsigned long long)move_id * 8 + 5, &prop_rng);
-        s_sigma_base_prop = s_sigma_base + d_proposal_std[5] * curand_normal(&prop_rng);
-        
-        curand_init(seed + PHILOX_SEED_OFFSET_PROPOSAL, theta_idx,
-                    (unsigned long long)move_id * 8 + 6, &prop_rng);
-        s_sigma_scale_prop = s_sigma_scale + d_proposal_std[6] * curand_normal(&prop_rng);
-        
-        curand_init(seed + PHILOX_SEED_OFFSET_PROPOSAL, theta_idx,
-                    (unsigned long long)move_id * 8 + 7, &prop_rng);
-        s_sigma_rate_prop = s_sigma_rate + d_proposal_std[7] * curand_normal(&prop_rng);
-        
-        s_lp_prop = log_prior_theta(s_rho_prop, s_sigma_z_prop,
-                                     s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop,
-                                     s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop);
-        s_valid = isfinite(s_lp_prop) ? 1 : 0;
-    }
-    __syncthreads();
-    
-    if (s_valid) {
-        /* Replay for Block 3 */
-        float one_minus_rho_sq = fmaxf(1.0f - s_rho_prop * s_rho_prop, 1e-6f);
-        float z_tilde_stat_std = s_sigma_z_prop / sqrtf(one_minus_rho_sq);
-        float z_tilde = z_tilde_stat_std * z_noise_prop_0;
-        float z = z_tilde_to_z(z_tilde);
-        
-        float theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
-        float mu_z = eval_curve(s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop, z);
-        float sigma_h = eval_curve(s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop, z);
-        float phi = 1.0f - theta_z;
-        
-        float mu_h = mu_z;
-        float var_h = (sigma_h * sigma_h) / fmaxf(1.0f - phi * phi, 1e-6f);
-        float log_w = -__logf((float)N_inner);
-        float ll_accum = 0.0f;
-        
-        for (int t = 0; t <= t_current; t++) {
-            float y_obs = y_history[t];
-            
-            float log_max = block_reduce_max(log_w, s_reduction);
-            if (inner_idx == 0) s_log_max = log_max;
-            __syncthreads();
-            
-            float w_unnorm = __expf(log_w - s_log_max);
-            float sum_w = block_reduce_sum(w_unnorm, s_reduction);
-            if (inner_idx == 0) s_sum_w = sum_w;
-            __syncthreads();
-            
-            float w_norm = w_unnorm / fmaxf(s_sum_w, 1e-30f);
-            
-            s_z[inner_idx] = z_tilde;
-            s_mu[inner_idx] = mu_h;
-            s_var[inner_idx] = var_h;
-            s_cdf[inner_idx] = w_norm;
-            __syncthreads();
-            
-            for (int offset = 1; offset < N_inner; offset *= 2) {
-                float val = 0.0f;
-                if (inner_idx >= offset) val = s_cdf[inner_idx - offset];
-                __syncthreads();
-                if (inner_idx >= offset) s_cdf[inner_idx] += val;
-                __syncthreads();
-            }
-            if (inner_idx == N_inner - 1) s_cdf[inner_idx] = 1.0f;
-            __syncthreads();
-            
-            int64_t z_idx_t1 = z_noise_base + (int64_t)(t + 1) * N_inner + inner_idx;
-            float z_noise_t1 = __half2float(d_z_noise_other[z_idx_t1]);
-            
-            if (inner_idx == 0) s_u0_shared = u0_from_noise(__half2float(d_z_noise_other[z_noise_base + (int64_t)(t + 1) * N_inner]));
-            __syncthreads();
-            
-            float u = (s_u0_shared + (float)inner_idx) / (float)N_inner;
-            int lo = 0, hi = N_inner - 1;
-            while (lo < hi) {
-                int mid = (lo + hi) / 2;
-                if (s_cdf[mid] < u) lo = mid + 1;
-                else hi = mid;
-            }
-            
-            z_tilde = s_z[lo];
-            mu_h = s_mu[lo];
-            var_h = s_var[lo];
-            log_w = -__logf((float)N_inner);
-            __syncthreads();
-            
-            float z_tilde_new = s_rho_prop * z_tilde + s_sigma_z_prop * z_noise_t1;
-            z = z_tilde_to_z(z_tilde_new);
-            
-            theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
-            mu_z = eval_curve(s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop, z);
-            sigma_h = eval_curve(s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop, z);
-            
-            phi = 1.0f - theta_z;
-            float mu_pred = phi * mu_h + theta_z * mu_z;
-            float var_pred = phi * phi * var_h + sigma_h * sigma_h;
-            var_pred = fmaxf(var_pred, 1e-8f);
-            
-            float mu_post, var_post, log_lik;
-            ocsn_kalman_update(y_obs, mu_pred, var_pred, &mu_post, &var_post, &log_lik);
-            
-            log_w += log_lik;
-            
-            log_max = block_reduce_max(log_w, s_reduction);
-            if (inner_idx == 0) s_log_max = log_max;
-            __syncthreads();
-            
-            sum_w = block_reduce_sum(__expf(log_w - s_log_max), s_reduction);
-            if (inner_idx == 0) {
-                ll_accum += s_log_max + __logf(fmaxf(sum_w, 1e-30f)) - __logf((float)N_inner);
-            }
-            __syncthreads();
-            
-            z_tilde = z_tilde_new;
-            mu_h = mu_post;
-            var_h = var_post;
-        }
-        
-        /* MH accept/reject for Block 3 — Philox */
-        if (inner_idx == 0) {
-            s_ll_prop = ll_accum;
-            float log_alpha = (s_ll_prop + s_lp_prop) - (s_ll_curr + s_lp_curr);
-            
-            curandStatePhilox4_32_10_t mh_rng;
-            curand_init(seed + PHILOX_SEED_OFFSET_MH, theta_idx,
-                        (unsigned long long)move_id * 3 + 2, &mh_rng);
-            float u = curand_uniform(&mh_rng);
-            s_accept = (__logf(u) < log_alpha) ? 1 : 0;
-            
-            if (s_accept) {
-                s_sigma_base = s_sigma_base_prop;
-                s_sigma_scale = s_sigma_scale_prop;
-                s_sigma_rate = s_sigma_rate_prop;
-                s_ll_curr = s_ll_prop;
-                s_any_accept = 1;
-                atomicAdd(d_accepts, 1);
-            }
-        }
-        __syncthreads();
-    }
-    
-    /*═══════════════════════════════════════════════════════════════════════
-     * Commit updated parameters and set swap flag
-     *═══════════════════════════════════════════════════════════════════════*/
-    if (inner_idx == 0) {
-        particles.rho[theta_idx] = s_rho;
-        particles.sigma_z[theta_idx] = s_sigma_z;
-        particles.mu_base[theta_idx] = s_mu_base;
-        particles.mu_scale[theta_idx] = s_mu_scale;
-        particles.mu_rate[theta_idx] = s_mu_rate;
-        particles.sigma_base[theta_idx] = s_sigma_base;
-        particles.sigma_scale[theta_idx] = s_sigma_scale;
-        particles.sigma_rate[theta_idx] = s_sigma_rate;
-        particles.log_likelihood[theta_idx] = s_ll_curr;
-        
-        d_swap_flags[theta_idx] = s_any_accept;
-    }
-    /* No RNG state to save — fully stateless Philox */
-}
-
-#endif /* SMC2_BLOCKED_PMMH */
-
 /* Commit proposed noise to current buffer for accepted CPMMH particles.
  * For accepted particles, copies noise from proposal buffer (d_z_noise_1) 
  * to current buffer (d_z_noise_0). Rejected particles keep their original noise. */
 __global__ void kernel_commit_accepted_noise(
     half* d_z_noise_0,
     half* d_z_noise_1,
+    half* d_u0_noise_0,
+    half* d_u0_noise_1,
     const int* d_swap_flags,
     int N_theta, int N_inner,
     int t_current, int noise_capacity
@@ -1753,10 +1167,18 @@ __global__ void kernel_commit_accepted_noise(
     
     int64_t z_base = (int64_t)theta_idx * N_inner * (noise_capacity + 1);
     
-    /* Copy proposed noise to current buffer */
+    /* Copy proposed z_noise to current buffer */
     for (int t = 0; t <= t_current + 1; t++) {
         int64_t idx = z_base + t * N_inner + inner_idx;
         d_z_noise_0[idx] = d_z_noise_1[idx];
+    }
+    
+    /* Copy proposed u0_noise to current buffer (thread 0 only) */
+    if (inner_idx == 0) {
+        int64_t u0_base = (int64_t)theta_idx * (noise_capacity + 1);
+        for (int t = 0; t <= t_current + 1; t++) {
+            d_u0_noise_0[u0_base + t] = d_u0_noise_1[u0_base + t];
+        }
     }
 }
 
@@ -1859,10 +1281,15 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     state->host_rng_state = 0x853C49E6748FEA9BULL ^ (uint64_t)time(NULL);
     
     int64_t z_noise_size = (int64_t)N_theta * N_inner * (state->noise_capacity + 1);
+    int64_t u0_noise_size = (int64_t)N_theta * (state->noise_capacity + 1);
     
-    /* Two ping-pong buffers for z_noise (FP16) */
+    /* Two ping-pong buffers for z_noise (FP16) — propagation noise */
     CUDA_CHECK(cudaMalloc(&state->d_z_noise[0], z_noise_size * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&state->d_z_noise[1], z_noise_size * sizeof(half)));
+    
+    /* Two ping-pong buffers for u0_noise (FP16) — resampling noise (SEPARATE from propagation) */
+    CUDA_CHECK(cudaMalloc(&state->d_u0_noise[0], u0_noise_size * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&state->d_u0_noise[1], u0_noise_size * sizeof(half)));
     
     /* Initialize buffer 0 with N(0,1) noise - need to generate FP32 then convert */
     float* temp_noise;
@@ -1992,6 +1419,8 @@ void smc2_cuda_free(SMC2StateCUDA* state) {
     /* CPMMH ping-pong noise buffers (FP16) */
     cudaFree(state->d_z_noise[0]);
     cudaFree(state->d_z_noise[1]);
+    cudaFree(state->d_u0_noise[0]);
+    cudaFree(state->d_u0_noise[1]);
     
     free(state);
 }
@@ -2005,27 +1434,90 @@ void smc2_cuda_set_seed(SMC2StateCUDA* state, uint64_t seed) {
     }
 }
 
+/* Grow both z_noise and u0_noise buffers, preserving the CURRENT active buffer content.
+ * After the grow, we store the preserved content into buffer 0 and set noise_buf=0.
+ */
+static void smc2_cuda_grow_noise_capacity_preserve_curr(SMC2StateCUDA* state, int new_capacity) {
+    if (new_capacity <= state->noise_capacity) return;
+
+    int old_capacity = state->noise_capacity;
+
+    int64_t old_z_size = (int64_t)state->N_theta * state->N_inner * (old_capacity + 1);
+    int64_t new_z_size = (int64_t)state->N_theta * state->N_inner * (new_capacity + 1);
+
+    int64_t old_u0_size = (int64_t)state->N_theta * (old_capacity + 1);
+    int64_t new_u0_size = (int64_t)state->N_theta * (new_capacity + 1);
+
+    half *new_z_0, *new_z_1;
+    half *new_u0_0, *new_u0_1;
+
+    CUDA_CHECK(cudaMalloc(&new_z_0,  new_z_size  * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&new_z_1,  new_z_size  * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&new_u0_0, new_u0_size * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&new_u0_1, new_u0_size * sizeof(half)));
+
+    /* Preserve CURRENT buffer content into new buffer 0 */
+    int curr = state->noise_buf;
+
+    CUDA_CHECK(cudaMemcpy(new_z_0,
+                          state->d_z_noise[curr],
+                          old_z_size * sizeof(half),
+                          cudaMemcpyDeviceToDevice));
+
+    CUDA_CHECK(cudaMemcpy(new_u0_0,
+                          state->d_u0_noise[curr],
+                          old_u0_size * sizeof(half),
+                          cudaMemcpyDeviceToDevice));
+
+    /* Free old */
+    cudaFree(state->d_z_noise[0]);
+    cudaFree(state->d_z_noise[1]);
+    cudaFree(state->d_u0_noise[0]);
+    cudaFree(state->d_u0_noise[1]);
+
+    /* Install new */
+    state->d_z_noise[0]  = new_z_0;
+    state->d_z_noise[1]  = new_z_1;
+    state->d_u0_noise[0] = new_u0_0;
+    state->d_u0_noise[1] = new_u0_1;
+
+    state->noise_capacity = new_capacity;
+    state->noise_buf = 0;
+}
+
 void smc2_cuda_set_noise_capacity(SMC2StateCUDA* state, int capacity) {
     if (capacity <= state->noise_capacity) return;  /* Already big enough */
     
     int64_t new_z_size = (int64_t)state->N_theta * state->N_inner * (capacity + 1);
     int64_t old_z_size = (int64_t)state->N_theta * state->N_inner * (state->noise_capacity + 1);
+    int64_t new_u0_size = (int64_t)state->N_theta * (capacity + 1);
+    int64_t old_u0_size = (int64_t)state->N_theta * (state->noise_capacity + 1);
     
-    half *new_z_0, *new_z_1;
+    half *new_z_0, *new_z_1, *new_u0_0, *new_u0_1;
     CUDA_CHECK(cudaMalloc(&new_z_0, new_z_size * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&new_z_1, new_z_size * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&new_u0_0, new_u0_size * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&new_u0_1, new_u0_size * sizeof(half)));
     
     /* Copy existing data if any */
     if (state->d_z_noise[0] && old_z_size > 0) {
         CUDA_CHECK(cudaMemcpy(new_z_0, state->d_z_noise[0], 
                               old_z_size * sizeof(half), cudaMemcpyDeviceToDevice));
     }
+    if (state->d_u0_noise[0] && old_u0_size > 0) {
+        CUDA_CHECK(cudaMemcpy(new_u0_0, state->d_u0_noise[0],
+                              old_u0_size * sizeof(half), cudaMemcpyDeviceToDevice));
+    }
     
     cudaFree(state->d_z_noise[0]);
     cudaFree(state->d_z_noise[1]);
+    cudaFree(state->d_u0_noise[0]);
+    cudaFree(state->d_u0_noise[1]);
     
     state->d_z_noise[0] = new_z_0;
     state->d_z_noise[1] = new_z_1;
+    state->d_u0_noise[0] = new_u0_0;
+    state->d_u0_noise[1] = new_u0_1;
     state->noise_buf = 0;
     state->noise_capacity = capacity;
 }
@@ -2044,7 +1536,9 @@ void smc2_cuda_init_from_prior(SMC2StateCUDA* state) {
     
     kernel_init_from_prior<<<state->N_theta, state->N_inner>>>(
         state->d_particles, state->N_theta, state->N_inner,
-        state->d_z_noise[state->noise_buf], state->noise_capacity
+        state->d_z_noise[state->noise_buf], 
+        state->d_u0_noise[state->noise_buf],
+        state->noise_capacity
     );
     CUDA_CHECK(cudaDeviceSynchronize());
     
@@ -2071,30 +1565,14 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
                           sizeof(float), cudaMemcpyHostToDevice));
     state->y_history_len++;
     state->t_current++;
-    
+
     /* Check if noise capacity needs to grow */
-    if (state->t_current >= state->noise_capacity) {
+    if (state->t_current >= state->noise_capacity)
+    {
         int new_cap = state->noise_capacity * 2;
-        int64_t new_z_size = (int64_t)state->N_theta * state->N_inner * (new_cap + 1);
-        int64_t old_z_size = (int64_t)state->N_theta * state->N_inner * (state->noise_capacity + 1);
-        
-        half *new_z_0, *new_z_1;
-        CUDA_CHECK(cudaMalloc(&new_z_0, new_z_size * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&new_z_1, new_z_size * sizeof(half)));
-        
-        /* Copy old data from current buffer */
-        CUDA_CHECK(cudaMemcpy(new_z_0, state->d_z_noise[state->noise_buf], 
-                              old_z_size * sizeof(half), cudaMemcpyDeviceToDevice));
-        
-        cudaFree(state->d_z_noise[0]);
-        cudaFree(state->d_z_noise[1]);
-        
-        state->d_z_noise[0] = new_z_0;
-        state->d_z_noise[1] = new_z_1;
-        state->noise_buf = 0;  /* Reset to buffer 0 */
-        state->noise_capacity = new_cap;
+        smc2_cuda_grow_noise_capacity_preserve_curr(state, new_cap);
     }
-    
+
     size_t shared_size = (32 + 2 * state->N_inner) * sizeof(float);
     
     /* Forward filter step - uses current noise buffer */
@@ -2102,6 +1580,7 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
         state->d_particles, y_obs,
         state->N_theta, state->N_inner,
         state->d_z_noise[state->noise_buf],
+        state->d_u0_noise[state->noise_buf],
         state->t_current, state->noise_capacity
     );
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -2138,13 +1617,14 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
         
         /* Copy noise arrays using ping-pong: curr → other buffer */
         int other_buf = 1 - state->noise_buf;
-        kernel_copy_noise_arrays<<<state->N_theta, state->N_inner>>>(
-            state->d_z_noise[state->noise_buf],  /* Source */
-            state->d_z_noise[other_buf],          /* Destination */
+        kernel_copy_noise_arrays_z_u0<<<state->N_theta, state->N_inner>>>(
+            state->d_z_noise[state->noise_buf],
+            state->d_z_noise[other_buf],
+            state->d_u0_noise[state->noise_buf],
+            state->d_u0_noise[other_buf],
             state->d_ancestors,
             state->N_theta, state->N_inner,
-            state->t_current, state->noise_capacity
-        );
+            state->t_current, state->noise_capacity);
         CUDA_CHECK(cudaDeviceSynchronize());
         
         /* Swap to the new buffer (noise is now in other_buf) */
@@ -2168,13 +1648,17 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
             /* Current buffer and other buffer for ping-pong during CPMMH */
             half* curr_noise = state->d_z_noise[state->noise_buf];
             half* other_noise = state->d_z_noise[1 - state->noise_buf];
+            half* curr_u0_noise = state->d_u0_noise[state->noise_buf];
+            half* other_u0_noise = state->d_u0_noise[1 - state->noise_buf];
             
             kernel_cpmmh_rejuvenate_fused<<<state->N_theta, state->N_inner, pmmh_shared_size>>>(
                 state->d_particles, 
                 state->d_particles_temp,  /* Scratch for proposed PF state */
                 state->d_y_history,
-                curr_noise,               /* Current noise buffer */
-                other_noise,              /* Other buffer for writing proposals */
+                curr_noise,               /* Current z_noise buffer */
+                other_noise,              /* Other z_noise buffer for proposals */
+                curr_u0_noise,            /* Current u0_noise buffer (SEPARATE) */
+                other_u0_noise,           /* Other u0_noise buffer for proposals */
                 state->t_current,
                 state->N_theta, state->N_inner,
                 state->noise_capacity,
@@ -2182,14 +1666,15 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
                 state->d_accepts,
                 state->d_swap_flags,      /* Per-particle accept flags */
                 state->user_seed,         /* Philox base seed */
-                base_move_id + k          /* Unique move index for Philox */
+                base_move_id + k,         /* Unique move index for Philox */
+                k % 3                     /* Block id: cycle 0,1,2 (ignored in joint mode) */
             );
             CUDA_CHECK(cudaDeviceSynchronize());
             
-            /* For accepted particles, copy noise from other → curr 
-             * (Alternative: could swap buffer indices per-particle but that's complex) */
+            /* For accepted particles, copy noise from other → curr */
             kernel_commit_accepted_noise<<<state->N_theta, state->N_inner>>>(
                 curr_noise, other_noise,
+                curr_u0_noise, other_u0_noise,
                 state->d_swap_flags,
                 state->N_theta, state->N_inner,
                 state->t_current, state->noise_capacity
