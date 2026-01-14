@@ -20,18 +20,34 @@
 #define CUDA_WARP_SIZE    32
 #define OCSN_K            10
 
-/* OCSN mixture approximation for log χ²(1)
+/* PMMH Proposal Strategy (compile-time)
  * 
- * The stored d_OCSN_MEANS are from Kim-Shephard-Chib (1998) Table 4,
- * which directly approximates the RAW log χ²(1) distribution (mean ≈ -1.27).
+ * SMC2_BLOCKED_PMMH=0: Joint 8-parameter proposal (default)
+ *   - 1 replay per rejuvenation
+ *   - Lower acceptance (~10-20% for 8D)
  * 
- * Observation model: y = h + log(ε²) where ε ~ N(0,1), so log(ε²) ~ log χ²(1)
+ * SMC2_BLOCKED_PMMH=1: Blocked proposals
+ *   - Block 1: (ρ, σ_z)                    — dynamics
+ *   - Block 2: (μ_base, μ_scale, μ_rate)   — mean curve
+ *   - Block 3: (σ_base, σ_scale, σ_rate)   — vol curve
+ *   - 3 replays per rejuvenation
+ *   - Higher acceptance per block (~60-70%)
+ *   - Better mixing for strongly correlated posteriors
  * 
- * Innovation for component k: innov = y - h_pred - m_k
- * No offset needed since means are already for raw distribution.
+ * Build: nvcc -DSMC2_BLOCKED_PMMH=1 ... 
+ */
+#ifndef SMC2_BLOCKED_PMMH
+#define SMC2_BLOCKED_PMMH 0
+#endif
+
+/* OCSN 10-component Gaussian mixture approximation to log χ²(1)
  * 
- * NOTE: Omori et al. (2007) gives CENTERED means (mean = 0), which would
- * require OCSN_OFFSET = 1.27036. But we use KSC 1998 raw means, so offset = 0.
+ * Source: Omori, Chib, Shephard & Nakajima (2007), Table 1
+ * 
+ * Weights, means, and variances are matched pairs approximating
+ * RAW log χ²(1) (E ≈ -1.2704, Var ≈ π²/2 ≈ 4.93).
+ * 
+ * With OCSN_OFFSET = 0: innov = y - h_pred - m_k
  */
 #define OCSN_OFFSET       0.0f
 
@@ -83,7 +99,7 @@ struct ThetaParticlesSoA {
     float* sigma_rate;
     
     /* Inner particles [N_theta * N_inner] */
-    float* inner_z;
+    float* inner_z;      /* z̃ (unconstrained) - AR(1) state, transform via z = 1.5*(1+tanh(z̃)) */
     float* inner_mu_h;
     float* inner_var_h;
     float* inner_log_w;  /* Log weights for numerical stability */
@@ -147,6 +163,9 @@ struct SMC2StateCUDA {
     int n_resamples;
     int n_rejuv_accepts;
     int n_rejuv_total;
+    
+    /* Reproducibility: user-provided seed (0 = use time-based seed) */
+    uint64_t user_seed;
 };
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -159,6 +178,7 @@ extern "C" {
 
 SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner);
 void smc2_cuda_free(SMC2StateCUDA* state);
+void smc2_cuda_set_seed(SMC2StateCUDA* state, uint64_t seed);  /* For reproducibility */
 void smc2_cuda_set_noise_capacity(SMC2StateCUDA* state, int capacity);
 void smc2_cuda_init_from_prior(SMC2StateCUDA* state);
 float smc2_cuda_update(SMC2StateCUDA* state, float y_obs);

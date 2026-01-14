@@ -24,12 +24,17 @@
 /*═══════════════════════════════════════════════════════════════════════════
  * OCSN Constants in Constant Memory
  * 
- * These are from Kim-Shephard-Chib (1998) Table 4, a 10-component Gaussian
- * mixture approximation to the RAW log χ²(1) distribution (mean ≈ -1.27).
+ * 10-component Gaussian mixture approximation to log χ²(1).
  * 
- * With observation model y = h + log(ε²), the innovation is simply:
+ * Source: Omori, Chib, Shephard & Nakajima (2007), Table 1
+ *         "Stochastic Volatility with Leverage: Fast and Efficient 
+ *          Likelihood Inference", Journal of Econometrics
+ * 
+ * These weights, means, and variances are matched pairs approximating
+ * the RAW log χ²(1) distribution (E[log χ²(1)] ≈ -1.2704, Var ≈ π²/2).
+ * 
+ * With OCSN_OFFSET = 0, the innovation formula is simply:
  *   innov = y - h_pred - m_k
- * No offset adjustment needed (OCSN_OFFSET = 0).
  *═══════════════════════════════════════════════════════════════════════════*/
 
 __constant__ float d_OCSN_WEIGHTS[OCSN_K] = {
@@ -38,18 +43,30 @@ __constant__ float d_OCSN_WEIGHTS[OCSN_K] = {
 };
 
 __constant__ float d_OCSN_MEANS[OCSN_K] = {
-    -10.12999f, -3.97281f, -8.56686f, 2.77786f, 0.61942f,
-    1.79518f, -1.08819f, -5.21004f, 2.89816f, 1.55000f
+    1.92677f,  1.34744f,  0.73504f,  0.02266f, -0.85173f,
+   -1.97278f, -3.46788f, -5.55246f, -8.68384f, -14.65000f
 };
 
 __constant__ float d_OCSN_VARS[OCSN_K] = {
-    5.79596f, 2.61369f, 5.17950f, 0.16735f, 0.64009f,
-    0.34023f, 1.26261f, 2.61290f, 0.26460f, 0.17788f
+    0.11265f, 0.17788f, 0.26768f, 0.40611f, 0.62699f,
+    0.98583f, 1.57469f, 2.54498f, 4.16591f, 7.33342f
 };
 
 __constant__ float d_OCSN_LOG_WEIGHTS[OCSN_K] = {
-    -5.10100f, -3.04200f, -2.03500f, -1.57700f, -1.48200f,
-    -1.66900f, -2.11600f, -2.88400f, -4.15100f, -6.76800f
+    -5.1011072f, -3.0417762f, -2.0358458f, -1.5762933f, -1.4821447f,
+    -1.6690818f, -2.1163545f, -2.8840120f, -4.1509149f, -6.7679933f
+};
+
+/* Precomputed: 1.0 / v_k — eliminates divisions in hot path */
+__constant__ float d_OCSN_INV_VARS[OCSN_K] = {
+    8.87705282f, 5.62176748f, 3.73580395f, 2.46238704f, 1.59492177f,
+    1.01437367f, 0.63504563f, 0.39293040f, 0.24004359f, 0.13636202f
+};
+
+/* Precomputed: log(v_k) — used with log1pf for log(S) */
+__constant__ float d_OCSN_LOG_VARS[OCSN_K] = {
+    -2.18346961f, -1.72664611f, -1.31796304f, -0.90113122f, -0.46682469f,
+    -0.01427135f,  0.45405843f,  0.93412279f,  1.42693474f,  1.99244198f
 };
 
 __constant__ SVPrior d_prior;
@@ -91,13 +108,14 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
 __device__ float block_reduce_sum(float val, volatile float* shared) {
     int lane = threadIdx.x % 32;
     int wid = threadIdx.x / 32;
+    int numWarps = (blockDim.x + 31) >> 5;  /* Ceiling division */
     
     val = warp_reduce_sum(val);
     
     if (lane == 0) shared[wid] = val;
     __syncthreads();
     
-    val = (threadIdx.x < blockDim.x / 32) ? shared[lane] : 0.0f;
+    val = (threadIdx.x < numWarps) ? shared[threadIdx.x] : 0.0f;
     if (wid == 0) val = warp_reduce_sum(val);
     
     if (threadIdx.x == 0) shared[0] = val;
@@ -109,19 +127,48 @@ __device__ float block_reduce_sum(float val, volatile float* shared) {
 __device__ float block_reduce_max(float val, volatile float* shared) {
     int lane = threadIdx.x % 32;
     int wid = threadIdx.x / 32;
+    int numWarps = (blockDim.x + 31) >> 5;  /* Ceiling division */
     
     val = warp_reduce_max(val);
     
     if (lane == 0) shared[wid] = val;
     __syncthreads();
     
-    val = (threadIdx.x < blockDim.x / 32) ? shared[lane] : -1e30f;
+    val = (threadIdx.x < numWarps) ? shared[threadIdx.x] : -1e30f;
     if (wid == 0) val = warp_reduce_max(val);
     
     if (threadIdx.x == 0) shared[0] = val;
     __syncthreads();
     
     return shared[0];
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * Parallel Inclusive Prefix Sum (Hillis-Steele scan)
+ * 
+ * Input:  data[0..n-1] in shared memory
+ * Output: data[i] = sum(data[0..i]) (inclusive scan)
+ * 
+ * O(n log n) work, O(log n) depth — much better latency than serial O(n)
+ * Requires n <= blockDim.x
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+__device__ void block_inclusive_scan(volatile float* data, int n) {
+    int tid = threadIdx.x;
+    
+    /* Hillis-Steele: each step doubles the offset */
+    for (int offset = 1; offset < n; offset *= 2) {
+        float temp = 0.0f;
+        if (tid >= offset && tid < n) {
+            temp = data[tid - offset];
+        }
+        __syncthreads();
+        
+        if (tid >= offset && tid < n) {
+            data[tid] += temp;
+        }
+        __syncthreads();
+    }
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -134,6 +181,42 @@ __device__ __forceinline__ float eval_curve(float base, float scale, float rate,
 
 __device__ __forceinline__ float clampf(float x, float lo, float hi) {
     return fminf(fmaxf(x, lo), hi);
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * Z-space Transform: Unconstrained z̃ ↔ Bounded z ∈ (0, 3)
+ * 
+ * The regime variable z must be in (0, 3) for the curve functions.
+ * Instead of clamping (which breaks the likelihood), we reparameterize:
+ * 
+ *   z̃ ∈ ℝ           (unconstrained, follows exact Gaussian AR(1))
+ *   z = 1.5·(1 + tanh(z̃)) ∈ (0, 3)   (bounded, used for curve evaluation)
+ * 
+ * Benefits:
+ *   - AR(1) on z̃ has exact Gaussian transition density (no truncation)
+ *   - z is always in valid range by construction
+ *   - Smooth transform → no gradient discontinuities
+ *   - No probability mass accumulation at boundaries
+ * 
+ * The z̃ dynamics: z̃_t = ρ·z̃_{t-1} + σ_z·ε_t
+ * Stationary distribution: z̃ ~ N(0, σ_z²/(1-ρ²))
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+#define Z_CENTER 1.5f    /* Center of z range */
+#define Z_SCALE  1.5f    /* Half-width of z range */
+
+__device__ __forceinline__ float z_tilde_to_z(float z_tilde) {
+    /* z = 1.5 * (1 + tanh(z̃)) maps ℝ → (0, 3) */
+    return Z_CENTER * (1.0f + tanhf(z_tilde));
+}
+
+__device__ __forceinline__ float z_to_z_tilde(float z) {
+    /* z̃ = atanh((z - 1.5) / 1.5) maps (0, 3) → ℝ 
+     * Used only for initialization from prior samples */
+    float normalized = (z - Z_CENTER) / Z_SCALE;
+    /* Clamp to avoid atanh(±1) = ±∞ */
+    normalized = fmaxf(-0.999f, fminf(0.999f, normalized));
+    return atanhf(normalized);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -196,6 +279,12 @@ __device__ __forceinline__ float u0_from_noise(float z_noise) {
  * 
  * Implements the 10-component Gaussian mixture approximation to log χ²(1)
  * from Omori et al. (2007) for the stochastic volatility observation equation.
+ * 
+ * NOTE: We omit the -0.5*log(2π) constant from Gaussian log-density.
+ * This does not affect MH acceptance ratios (cancels) or relative weights,
+ * but the returned log_lik values are shifted by +0.5*log(2π) ≈ +0.919.
+ * If absolute log-likelihood values are needed for model comparison,
+ * subtract 0.5*log(2π) per observation externally.
  *═══════════════════════════════════════════════════════════════════════════*/
 
 __device__ void ocsn_kalman_update(
@@ -203,22 +292,32 @@ __device__ void ocsn_kalman_update(
     float* mu_post_out, float* var_post_out, float* log_lik_out
 ) {
     float log_alpha_tilde[OCSN_K];
-    float innov[OCSN_K];  /* Cache innovations to avoid recomputation */
-    float S[OCSN_K], K[OCSN_K], mu_k[OCSN_K], var_k[OCSN_K];
     float log_max = -1e30f;
     
-    /* First pass: compute innovations, prediction variances, and unnormalized log weights */
+    /* Pass 1: Compute unnormalized log mixture weights
+     * Optimization: Use precomputed inv_vars and log_vars to reduce divisions */
     #pragma unroll
     for (int k = 0; k < OCSN_K; k++) {
-        S[k] = var_pred + d_OCSN_VARS[k];
-        innov[k] = y - mu_pred - d_OCSN_MEANS[k] + OCSN_OFFSET;
-        log_alpha_tilde[k] = d_OCSN_LOG_WEIGHTS[k] 
-                           - 0.5f * __logf(S[k])
-                           - 0.5f * innov[k] * innov[k] / S[k];
-        log_max = fmaxf(log_max, log_alpha_tilde[k]);
+        float v_k = d_OCSN_VARS[k];
+        float inv_v_k = d_OCSN_INV_VARS[k];
+        float log_v_k = d_OCSN_LOG_VARS[k];
+        
+        float S = var_pred + v_k;
+        float inv_S = 1.0f / S;  /* ONE division per component */
+        
+        float innov = y - mu_pred - d_OCSN_MEANS[k];
+        
+        /* log(S) = log(v_k * (1 + var_pred/v_k)) = log_v_k + log1p(var_pred * inv_v_k) */
+        float log_S = log_v_k + log1pf(var_pred * inv_v_k);
+        
+        /* log α̃_k = log(q_k) - 0.5*log(S) - 0.5*innov²/S */
+        float val = d_OCSN_LOG_WEIGHTS[k] - 0.5f * (log_S + innov * innov * inv_S);
+        
+        log_alpha_tilde[k] = val;
+        log_max = fmaxf(log_max, val);
     }
     
-    /* Normalize mixture weights using log-sum-exp */
+    /* Normalize: log(Σ exp(log_α̃_k)) */
     float sum_exp = 0.0f;
     #pragma unroll
     for (int k = 0; k < OCSN_K; k++) {
@@ -226,32 +325,31 @@ __device__ void ocsn_kalman_update(
     }
     float log_norm = log_max + __logf(sum_exp);
     
-    float alpha[OCSN_K];
+    /* Pass 2: Compute posterior mean/variance
+     * Recompute S, innov to save registers (occupancy > caching) */
+    float mu_post = 0.0f;
+    float E_h_sq = 0.0f;
+    
     #pragma unroll
     for (int k = 0; k < OCSN_K; k++) {
-        alpha[k] = __expf(log_alpha_tilde[k] - log_norm);
+        float w = __expf(log_alpha_tilde[k] - log_norm);
+        
+        /* Recompute (cheaper than register pressure) */
+        float S = var_pred + d_OCSN_VARS[k];
+        float inv_S = 1.0f / S;
+        float innov = y - mu_pred - d_OCSN_MEANS[k];
+        
+        /* Kalman gain: K = var_pred / S = var_pred * inv_S */
+        float K = var_pred * inv_S;
+        float mu_k = mu_pred + K * innov;
+        float var_k = (1.0f - K) * var_pred;
+        
+        mu_post += w * mu_k;
+        E_h_sq += w * (var_k + mu_k * mu_k);
     }
-    
-    /* Compute per-component Kalman updates (reuse cached innovations) */
-    #pragma unroll
-    for (int k = 0; k < OCSN_K; k++) {
-        K[k] = var_pred / S[k];
-        mu_k[k] = mu_pred + K[k] * innov[k];
-        var_k[k] = (1.0f - K[k]) * var_pred;
-    }
-    
-    /* Collapse mixture: compute posterior mean and variance */
-    float mu_post = 0.0f, E_h_sq = 0.0f;
-    #pragma unroll
-    for (int k = 0; k < OCSN_K; k++) {
-        mu_post += alpha[k] * mu_k[k];
-        E_h_sq += alpha[k] * (var_k[k] + mu_k[k] * mu_k[k]);
-    }
-    
-    float var_post = fmaxf(E_h_sq - mu_post * mu_post, 1e-6f);
     
     *mu_post_out = mu_post;
-    *var_post_out = var_post;
+    *var_post_out = fmaxf(E_h_sq - mu_post * mu_post, 1e-6f);
     *log_lik_out = log_norm;
 }
 
@@ -332,16 +430,21 @@ __global__ void kernel_init_from_prior(
     float rho = s_rho;
     float sigma_z = s_sigma_z;
     
+    /* Stationary distribution for z̃: N(0, σ_z²/(1-ρ²)) */
     float one_minus_rho_sq = fmaxf(1.0f - rho * rho, 1e-6f);
-    float z_stat_std = sigma_z / sqrtf(one_minus_rho_sq);
+    float z_tilde_stat_std = sigma_z / sqrtf(one_minus_rho_sq);
     
-    /* Generate and STORE t=0 z-noise (FP16) */
-    float z_noise_init = curand_normal(rng);
+    /* Generate t=0 z-noise, ROUND-TRIP through FP16 before use.
+     * Critical for PMMH: ensures replay sees exact same value. */
+    float z_noise_raw = curand_normal(rng);
     int64_t z_noise_idx = (int64_t)theta_idx * N_inner * (noise_capacity + 1) + inner_idx;  /* t=0 slot */
-    d_z_noise[z_noise_idx] = __float2half(z_noise_init);
+    half h_z_noise = __float2half(z_noise_raw);
+    d_z_noise[z_noise_idx] = h_z_noise;
+    float z_noise_init = __half2float(h_z_noise);  /* Use truncated value */
     
-    float z = z_stat_std * z_noise_init;
-    z = clampf(z, 0.0f, 3.0f);
+    /* z̃ in unconstrained space (exact Gaussian), z in bounded (0,3) for curves */
+    float z_tilde = z_tilde_stat_std * z_noise_init;
+    float z = z_tilde_to_z(z_tilde);  /* Transform to (0,3) for curve evaluation */
     
     float theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
     float mu_z = eval_curve(s_mu_base, s_mu_scale, s_mu_rate, z);
@@ -351,7 +454,8 @@ __global__ void kernel_init_from_prior(
     float one_minus_phi_sq = fmaxf(1.0f - phi * phi, 1e-6f);
     float h_stat_var = (sigma_h * sigma_h) / one_minus_phi_sq;
     
-    particles.inner_z[global_idx] = z;
+    /* Store z̃ (unconstrained) - the AR(1) state variable */
+    particles.inner_z[global_idx] = z_tilde;
     particles.inner_mu_h[global_idx] = mu_z;
     particles.inner_var_h[global_idx] = h_stat_var;
     particles.inner_log_w[global_idx] = -__logf((float)N_inner);
@@ -360,10 +464,17 @@ __global__ void kernel_init_from_prior(
 /*═══════════════════════════════════════════════════════════════════════════
  * Inner RBPF Step - OPTIMIZED for CPMMH
  * 
- * Optimizations:
+ * Design choices:
  *   1. FP16 noise storage (half bandwidth)
- *   2. u0 derived from z_noise (no separate storage)
- *   3. Always resample (R1) for deterministic replay coupling
+ *   2. u0 derived from z_noise via Φ(z) (no separate storage)
+ *   3. ALWAYS RESAMPLE (R1): Every step resamples before propagation.
+ *      This is NOT standard adaptive resampling but is required for
+ *      deterministic CPMMH replay coupling. The coupling ensures that
+ *      given the same noise sequence, the filter produces identical
+ *      trajectories regardless of θ proposal.
+ * 
+ * Note: If adaptive resampling is desired in the forward pass, the
+ * resampling decision and dedicated uniform must be stored separately.
  *═══════════════════════════════════════════════════════════════════════════*/
 
 __global__ void kernel_rbpf_step(
@@ -405,7 +516,8 @@ __global__ void kernel_rbpf_step(
     
     curandState local_rng = particles.rng_states[global_idx];
     
-    float z = particles.inner_z[global_idx];
+    /* inner_z stores z̃ (unconstrained AR(1) state) */
+    float z_tilde = particles.inner_z[global_idx];
     float mu_h = particles.inner_mu_h[global_idx];
     float var_h = particles.inner_var_h[global_idx];
     float log_w = particles.inner_log_w[global_idx];
@@ -414,9 +526,13 @@ __global__ void kernel_rbpf_step(
     int64_t z_noise_base = (int64_t)theta_idx * N_inner * (noise_capacity + 1);
     int64_t z_noise_idx = z_noise_base + (int64_t)(t_current + 1) * N_inner + inner_idx;
     
-    /* STEP 1: Generate z-noise FIRST, store it, derive u0 from thread 0's noise */
-    float z_noise = curand_normal(&local_rng);
-    d_z_noise[z_noise_idx] = __float2half(z_noise);
+    /* STEP 1: Generate z-noise, ROUND-TRIP through FP16 before use.
+     * Critical for PMMH: forward pass must see EXACTLY what replay sees.
+     * Without round-trip, float != half->float breaks pseudo-marginal property. */
+    float z_noise_raw = curand_normal(&local_rng);
+    half h_z_noise = __float2half(z_noise_raw);
+    d_z_noise[z_noise_idx] = h_z_noise;
+    float z_noise = __half2float(h_z_noise);  /* Use truncated value */
     
     /* Share thread 0's noise for u0 derivation */
     if (inner_idx == 0) {
@@ -438,14 +554,18 @@ __global__ void kernel_rbpf_step(
         s_weights[inner_idx] = w_unnorm / s_sum_w;
         __syncthreads();
         
-        if (inner_idx == 0) {
-            s_cumsum[0] = s_weights[0];
-            for (int i = 1; i < N_inner; i++) {
-                s_cumsum[i] = s_cumsum[i-1] + s_weights[i];
-            }
+        /* Parallel inclusive prefix sum for CDF */
+        s_cumsum[inner_idx] = s_weights[inner_idx];
+        __syncthreads();
+        block_inclusive_scan(s_cumsum, N_inner);
+        
+        /* Fix rounding: ensure CDF ends at exactly 1.0 */
+        if (inner_idx == N_inner - 1) {
             s_cumsum[N_inner - 1] = 1.0f;
-            
-            /* Derive u0 from thread 0's z_noise - NO SEPARATE STORAGE */
+        }
+        
+        /* Derive u0 from thread 0's z_noise - NO SEPARATE STORAGE */
+        if (inner_idx == 0) {
             s_u0 = u0_from_noise(s_z_noise_0);
         }
         __syncthreads();
@@ -459,7 +579,8 @@ __global__ void kernel_rbpf_step(
         }
         int ancestor = lo;
         
-        z = particles.inner_z[theta_idx * N_inner + ancestor];
+        /* Load ancestor's z̃ (unconstrained state) */
+        z_tilde = particles.inner_z[theta_idx * N_inner + ancestor];
         mu_h = particles.inner_mu_h[theta_idx * N_inner + ancestor];
         var_h = particles.inner_var_h[theta_idx * N_inner + ancestor];
         log_w = -__logf((float)N_inner);
@@ -467,14 +588,16 @@ __global__ void kernel_rbpf_step(
         __syncthreads();
     }
     
-    /* STEP 3: Propagate z using the already-generated noise */
-    float z_new = s_rho * z + s_sigma_z * z_noise;
-    z_new = clampf(z_new, 0.0f, 3.0f);
+    /* STEP 3: Propagate z̃ using exact Gaussian AR(1) - NO CLAMPING */
+    float z_tilde_new = s_rho * z_tilde + s_sigma_z * z_noise;
+    
+    /* Transform to bounded z ∈ (0,3) for curve evaluation */
+    float z = z_tilde_to_z(z_tilde_new);
     
     /* Kalman predict */
-    float theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z_new);
-    float mu_z = eval_curve(s_mu_base, s_mu_scale, s_mu_rate, z_new);
-    float sigma_h = eval_curve(s_sigma_base, s_sigma_scale, s_sigma_rate, z_new);
+    float theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
+    float mu_z = eval_curve(s_mu_base, s_mu_scale, s_mu_rate, z);
+    float sigma_h = eval_curve(s_sigma_base, s_sigma_scale, s_sigma_rate, z);
     
     float phi = 1.0f - theta_z;
     float mu_pred = phi * mu_h + theta_z * mu_z;
@@ -504,8 +627,8 @@ __global__ void kernel_rbpf_step(
     
     float ll_incr = s_log_max + __logf(fmaxf(s_sum_w, 1e-30f)) - __logf((float)N_inner);
     
-    /* Store */
-    particles.inner_z[global_idx] = z_new;
+    /* Store z̃ (unconstrained) - this is the AR(1) state variable */
+    particles.inner_z[global_idx] = z_tilde_new;
     particles.inner_mu_h[global_idx] = mu_post;
     particles.inner_var_h[global_idx] = var_post;
     particles.inner_log_w[global_idx] = log_w;
@@ -669,7 +792,19 @@ __global__ void kernel_copy_noise_arrays(
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
- * FUSED CPMMH Rejuvenation Kernel - ALL OPTIMIZATIONS
+ * CPMMH Rejuvenation Kernel
+ * 
+ * Two implementations controlled by SMC2_BLOCKED_PMMH:
+ *   0 = Joint 8-parameter proposal (default)
+ *   1 = Blocked proposals (3 blocks: dynamics, mu_curve, sigma_curve)
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+#if !SMC2_BLOCKED_PMMH
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * JOINT CPMMH Rejuvenation Kernel
+ * 
+ * Proposes all 8 parameters jointly. Lower acceptance but 1 replay.
  * 
  * Optimizations applied:
  *   1. FUSED: Generate fresh noise + correlate + replay + MH in one kernel
@@ -677,8 +812,6 @@ __global__ void kernel_copy_noise_arrays(
  *   3. NO u0 ARRAYS: u0 derived from z_noise (zero extra storage)
  *   4. NO ESS in replay: Always resample (R1)
  *   5. PING-PONG: On accept, swap buffer index instead of copying
- * 
- * Cost: 1 kernel launch, 1 global memory pass for noise
  *═══════════════════════════════════════════════════════════════════════════*/
 
 __global__ void kernel_cpmmh_rejuvenate_fused(
@@ -692,8 +825,13 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
     int noise_capacity,
     float cpmmh_rho,
     int* d_accepts,
-    int* d_swap_flags          /* Per-particle: 1 if accepted (needs buffer swap) */
+    int* d_swap_flags,         /* Per-particle: 1 if accepted (needs buffer swap) */
+    unsigned long long seed,   /* Unused in joint mode, kept for API consistency */
+    int move_id                /* Unused in joint mode, kept for API consistency */
 ) {
+    (void)seed;    /* Suppress unused warning */
+    (void)move_id; /* Suppress unused warning */
+    
     int theta_idx = blockIdx.x;
     int inner_idx = threadIdx.x;
     int global_idx = theta_idx * N_inner + inner_idx;
@@ -790,17 +928,22 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
     
     /* Initialize from stationary using t=0 noise (FUSED: generate + correlate) */
     float one_minus_rho_sq = fmaxf(1.0f - rho * rho, 1e-6f);
-    float z_stat_std = sigma_z / sqrtf(one_minus_rho_sq);
+    float z_tilde_stat_std = sigma_z / sqrtf(one_minus_rho_sq);
     
     float z_noise_curr_0 = __half2float(d_z_noise_curr[z_noise_base + inner_idx]);
     float z_noise_fresh_0 = curand_normal(&local_rng);
-    float z_noise_prop_0 = cpmmh_rho * z_noise_curr_0 + scale * z_noise_fresh_0;
+    float z_noise_prop_0_raw = cpmmh_rho * z_noise_curr_0 + scale * z_noise_fresh_0;
     
-    /* Store correlated noise to other buffer for potential swap */
-    d_z_noise_other[z_noise_base + inner_idx] = __float2half(z_noise_prop_0);
+    /* ROUND-TRIP: Store as FP16, load back for use.
+     * Ensures stored value matches what we compute with. */
+    half h_prop_0 = __float2half(z_noise_prop_0_raw);
+    d_z_noise_other[z_noise_base + inner_idx] = h_prop_0;
+    float z_noise_prop_0 = __half2float(h_prop_0);
     
-    float z = z_stat_std * z_noise_prop_0;
-    z = clampf(z, 0.0f, 3.0f);
+    /* z̃ in unconstrained space (exact Gaussian AR(1) stationary dist) */
+    float z_tilde = z_tilde_stat_std * z_noise_prop_0;
+    /* Transform to bounded z ∈ (0,3) for curve evaluation */
+    float z = z_tilde_to_z(z_tilde);
     
     float theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
     float mu_z_val = eval_curve(mu_base, mu_scale, mu_rate, z);
@@ -831,17 +974,18 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
         
         float w_norm = w_unnorm / fmaxf(sum_w, 1e-30f);
         
-        /* ALWAYS RESAMPLE (R1) */
-        s_z[inner_idx] = z;
+        /* ALWAYS RESAMPLE (R1) - store z̃ (unconstrained) for resampling */
+        s_z[inner_idx] = z_tilde;
         s_mu[inner_idx] = mu_h;
         s_var[inner_idx] = var_h;
         s_cdf[inner_idx] = w_norm;
         __syncthreads();
         
-        if (inner_idx == 0) {
-            for (int i = 1; i < N_inner; i++) {
-                s_cdf[i] += s_cdf[i-1];
-            }
+        /* Parallel inclusive prefix sum for CDF */
+        block_inclusive_scan(s_cdf, N_inner);
+        
+        /* Fix rounding: ensure CDF ends at exactly 1.0 */
+        if (inner_idx == N_inner - 1) {
             s_cdf[N_inner - 1] = 1.0f;
         }
         __syncthreads();
@@ -850,10 +994,12 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
         int64_t z_idx_t1 = z_noise_base + (int64_t)(t + 1) * N_inner + inner_idx;
         float z_noise_curr_t1 = __half2float(d_z_noise_curr[z_idx_t1]);
         float z_noise_fresh_t1 = curand_normal(&local_rng);
-        float z_noise_prop_t1 = cpmmh_rho * z_noise_curr_t1 + scale * z_noise_fresh_t1;
+        float z_noise_prop_t1_raw = cpmmh_rho * z_noise_curr_t1 + scale * z_noise_fresh_t1;
         
-        /* Store to other buffer */
-        d_z_noise_other[z_idx_t1] = __float2half(z_noise_prop_t1);
+        /* ROUND-TRIP: Store as FP16, load back for use */
+        half h_prop_t1 = __float2half(z_noise_prop_t1_raw);
+        d_z_noise_other[z_idx_t1] = h_prop_t1;
+        float z_noise_prop_t1 = __half2float(h_prop_t1);
         
         /* Derive u0 from thread 0's correlated noise (shared) */
         if (inner_idx == 0) {
@@ -871,20 +1017,23 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
             else hi = mid;
         }
         
-        z = s_z[lo];
+        /* Load ancestor's z̃ (unconstrained state) */
+        z_tilde = s_z[lo];
         mu_h = s_mu[lo];
         var_h = s_var[lo];
         log_w = -__logf((float)N_inner);
         __syncthreads();
         
-        /* Propagate z using correlated noise */
-        float z_new = rho * z + sigma_z * z_noise_prop_t1;
-        z_new = clampf(z_new, 0.0f, 3.0f);
+        /* Propagate z̃ using exact Gaussian AR(1) - NO CLAMPING */
+        float z_tilde_new = rho * z_tilde + sigma_z * z_noise_prop_t1;
+        
+        /* Transform to bounded z ∈ (0,3) for curve evaluation */
+        z = z_tilde_to_z(z_tilde_new);
         
         /* Kalman predict */
-        theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z_new);
-        mu_z_val = eval_curve(mu_base, mu_scale, mu_rate, z_new);
-        sigma_h = eval_curve(sigma_base, sigma_scale, sigma_rate, z_new);
+        theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
+        mu_z_val = eval_curve(mu_base, mu_scale, mu_rate, z);
+        sigma_h = eval_curve(sigma_base, sigma_scale, sigma_rate, z);
         phi = 1.0f - theta_z;
         
         float mu_pred = phi * mu_h + theta_z * mu_z_val;
@@ -912,7 +1061,8 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
         float ll_incr = log_max + __logf(fmaxf(sum_w, 1e-30f)) - __logf((float)N_inner);
         ll_accum += ll_incr;
         
-        z = z_new;
+        /* Update state for next iteration (z̃ is the AR(1) state) */
+        z_tilde = z_tilde_new;
         mu_h = mu_post;
         var_h = var_post;
     }
@@ -923,8 +1073,8 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
     float sum_w_sq = block_reduce_sum(w_sq, s_reduction);
     float ess = 1.0f / fmaxf(sum_w_sq, 1e-30f);
     
-    /* Store proposed PF state to scratch */
-    particles_scratch.inner_z[global_idx] = z;
+    /* Store proposed PF state to scratch (z̃ is the state variable) */
+    particles_scratch.inner_z[global_idx] = z_tilde;
     particles_scratch.inner_mu_h[global_idx] = mu_h;
     particles_scratch.inner_var_h[global_idx] = var_h;
     particles_scratch.inner_log_w[global_idx] = log_w;
@@ -975,8 +1125,620 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
     particles.rng_states[global_idx] = local_rng;
 }
 
-/* Kernel to selectively swap noise buffers for accepted particles */
-__global__ void kernel_swap_noise_for_accepted(
+#else /* SMC2_BLOCKED_PMMH == 1 */
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * BLOCKED CPMMH Rejuvenation — FULL PHILOX (Stateless RNG)
+ * 
+ * Proposes parameters in 3 blocks with separate MH accept/reject:
+ *   Block 1: (ρ, σ_z)                    — dynamics
+ *   Block 2: (μ_base, μ_scale, μ_rate)   — mean curve
+ *   Block 3: (σ_base, σ_scale, σ_rate)   — vol curve
+ * 
+ * Each block does full replay → higher acceptance per block → better mixing.
+ * All blocks share same correlated noise (generated once at start).
+ * 
+ * Philox indexing scheme (all deterministic, no mutable RNG state):
+ *   - Fresh noise ξ[t]:  (seed, theta*N_inner+inner, move_id*MAX_T + t)
+ *   - Proposal noise:    (seed+0xPROP, theta, move_id*8 + param_idx)
+ *   - MH uniform:        (seed+0xMH, theta, move_id*3 + block_id)
+ * 
+ * INVARIANT: For unchanged θ and unchanged u, likelihood is identical.
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+#define PHILOX_SEED_OFFSET_PROPOSAL  0x50524F50ULL  /* "PROP" */
+#define PHILOX_SEED_OFFSET_MH        0x4D484143ULL  /* "MHAC" */
+#define PHILOX_MAX_T                 16384          /* Max timesteps for indexing */
+
+__global__ void kernel_cpmmh_rejuvenate_fused(
+    ThetaParticlesSoA particles,
+    ThetaParticlesSoA particles_scratch,
+    const float* y_history,
+    half* d_z_noise_curr,
+    half* d_z_noise_other,
+    int t_current,
+    int N_theta, int N_inner,
+    int noise_capacity,
+    float cpmmh_rho,
+    int* d_accepts,
+    int* d_swap_flags,
+    unsigned long long seed,    /* Base seed for Philox */
+    int move_id                 /* PMMH move index (for unique noise per attempt) */
+) {
+    int theta_idx = blockIdx.x;
+    int inner_idx = threadIdx.x;
+    int global_idx = theta_idx * N_inner + inner_idx;
+    
+    if (theta_idx >= N_theta || inner_idx >= N_inner) return;
+    
+    extern __shared__ float shared_mem[];
+    float* s_reduction = shared_mem;
+    float* s_z = &shared_mem[32];
+    float* s_mu = &shared_mem[32 + N_inner];
+    float* s_var = &shared_mem[32 + 2 * N_inner];
+    float* s_cdf = &shared_mem[32 + 3 * N_inner];
+    
+    __shared__ float s_log_max, s_sum_w;
+    __shared__ float s_u0_shared;
+    
+    /* Current parameters (updated as blocks accept) */
+    __shared__ float s_rho, s_sigma_z;
+    __shared__ float s_mu_base, s_mu_scale, s_mu_rate;
+    __shared__ float s_sigma_base, s_sigma_scale, s_sigma_rate;
+    __shared__ float s_ll_curr;
+    
+    /* Proposed parameters for current block */
+    __shared__ float s_rho_prop, s_sigma_z_prop;
+    __shared__ float s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop;
+    __shared__ float s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop;
+    
+    __shared__ float s_ll_prop, s_lp_curr, s_lp_prop;
+    __shared__ int s_accept, s_valid, s_any_accept;
+    
+    /* Load current parameters */
+    if (inner_idx == 0) {
+        s_rho = particles.rho[theta_idx];
+        s_sigma_z = particles.sigma_z[theta_idx];
+        s_mu_base = particles.mu_base[theta_idx];
+        s_mu_scale = particles.mu_scale[theta_idx];
+        s_mu_rate = particles.mu_rate[theta_idx];
+        s_sigma_base = particles.sigma_base[theta_idx];
+        s_sigma_scale = particles.sigma_scale[theta_idx];
+        s_sigma_rate = particles.sigma_rate[theta_idx];
+        s_ll_curr = particles.log_likelihood[theta_idx];
+        s_any_accept = 0;
+    }
+    __syncthreads();
+    
+    int64_t z_noise_base = (int64_t)theta_idx * N_inner * (noise_capacity + 1);
+    float scale = sqrtf(1.0f - cpmmh_rho * cpmmh_rho);
+    
+    /* Generate correlated noise ONCE for all blocks using Philox
+     * Index: (seed, global_idx, move_id * MAX_T + time) */
+    curandStatePhilox4_32_10_t noise_rng;
+    
+    /* t=0 noise */
+    curand_init(seed, global_idx, (unsigned long long)move_id * PHILOX_MAX_T, &noise_rng);
+    float z_noise_curr_0 = __half2float(d_z_noise_curr[z_noise_base + inner_idx]);
+    float z_noise_fresh_0 = curand_normal(&noise_rng);
+    float z_noise_prop_0_raw = cpmmh_rho * z_noise_curr_0 + scale * z_noise_fresh_0;
+    half h_prop_0 = __float2half(z_noise_prop_0_raw);
+    d_z_noise_other[z_noise_base + inner_idx] = h_prop_0;
+    float z_noise_prop_0 = __half2float(h_prop_0);
+    
+    /* Per-timestep correlated noise for replay */
+    for (int t = 0; t <= t_current; t++) {
+        curand_init(seed, global_idx, (unsigned long long)move_id * PHILOX_MAX_T + t + 1, &noise_rng);
+        int64_t z_idx_t1 = z_noise_base + (int64_t)(t + 1) * N_inner + inner_idx;
+        float z_curr_t1 = __half2float(d_z_noise_curr[z_idx_t1]);
+        float z_fresh_t1 = curand_normal(&noise_rng);
+        float z_prop_t1_raw = cpmmh_rho * z_curr_t1 + scale * z_fresh_t1;
+        half h_prop_t1 = __float2half(z_prop_t1_raw);
+        d_z_noise_other[z_idx_t1] = h_prop_t1;
+    }
+    __syncthreads();
+    
+    /*═══════════════════════════════════════════════════════════════════════
+     * BLOCK 1: Dynamics (ρ, σ_z)
+     *═══════════════════════════════════════════════════════════════════════*/
+    if (inner_idx == 0) {
+        s_lp_curr = log_prior_theta(s_rho, s_sigma_z,
+                                     s_mu_base, s_mu_scale, s_mu_rate,
+                                     s_sigma_base, s_sigma_scale, s_sigma_rate);
+        
+        /* Philox for proposal noise: (seed+PROP_OFFSET, theta, move*8 + param) */
+        curandStatePhilox4_32_10_t prop_rng;
+        curand_init(seed + PHILOX_SEED_OFFSET_PROPOSAL, theta_idx, 
+                    (unsigned long long)move_id * 8 + 0, &prop_rng);
+        s_rho_prop = s_rho + d_proposal_std[0] * curand_normal(&prop_rng);
+        
+        curand_init(seed + PHILOX_SEED_OFFSET_PROPOSAL, theta_idx,
+                    (unsigned long long)move_id * 8 + 1, &prop_rng);
+        s_sigma_z_prop = s_sigma_z + d_proposal_std[1] * curand_normal(&prop_rng);
+        
+        /* Keep other params at current */
+        s_mu_base_prop = s_mu_base;
+        s_mu_scale_prop = s_mu_scale;
+        s_mu_rate_prop = s_mu_rate;
+        s_sigma_base_prop = s_sigma_base;
+        s_sigma_scale_prop = s_sigma_scale;
+        s_sigma_rate_prop = s_sigma_rate;
+        
+        s_lp_prop = log_prior_theta(s_rho_prop, s_sigma_z_prop,
+                                     s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop,
+                                     s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop);
+        s_valid = isfinite(s_lp_prop) ? 1 : 0;
+    }
+    __syncthreads();
+    
+    if (s_valid) {
+        /* Run replay with proposed params */
+        float one_minus_rho_sq = fmaxf(1.0f - s_rho_prop * s_rho_prop, 1e-6f);
+        float z_tilde_stat_std = s_sigma_z_prop / sqrtf(one_minus_rho_sq);
+        float z_tilde = z_tilde_stat_std * z_noise_prop_0;
+        float z = z_tilde_to_z(z_tilde);
+        
+        float theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
+        float mu_z = eval_curve(s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop, z);
+        float sigma_h = eval_curve(s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop, z);
+        float phi = 1.0f - theta_z;
+        
+        float mu_h = mu_z;
+        float var_h = (sigma_h * sigma_h) / fmaxf(1.0f - phi * phi, 1e-6f);
+        float log_w = -__logf((float)N_inner);
+        float ll_accum = 0.0f;
+        
+        for (int t = 0; t <= t_current; t++) {
+            float y_obs = y_history[t];
+            
+            /* Weight normalization */
+            float log_max = block_reduce_max(log_w, s_reduction);
+            if (inner_idx == 0) s_log_max = log_max;
+            __syncthreads();
+            
+            float w_unnorm = __expf(log_w - s_log_max);
+            float sum_w = block_reduce_sum(w_unnorm, s_reduction);
+            if (inner_idx == 0) s_sum_w = sum_w;
+            __syncthreads();
+            
+            float w_norm = w_unnorm / fmaxf(s_sum_w, 1e-30f);
+            
+            /* Store for resampling */
+            s_z[inner_idx] = z_tilde;
+            s_mu[inner_idx] = mu_h;
+            s_var[inner_idx] = var_h;
+            s_cdf[inner_idx] = w_norm;
+            __syncthreads();
+            
+            /* Prefix sum */
+            for (int offset = 1; offset < N_inner; offset *= 2) {
+                float val = 0.0f;
+                if (inner_idx >= offset) val = s_cdf[inner_idx - offset];
+                __syncthreads();
+                if (inner_idx >= offset) s_cdf[inner_idx] += val;
+                __syncthreads();
+            }
+            if (inner_idx == N_inner - 1) s_cdf[inner_idx] = 1.0f;
+            __syncthreads();
+            
+            /* Get noise for this timestep */
+            int64_t z_idx_t1 = z_noise_base + (int64_t)(t + 1) * N_inner + inner_idx;
+            float z_noise_t1 = __half2float(d_z_noise_other[z_idx_t1]);
+            
+            if (inner_idx == 0) s_u0_shared = u0_from_noise(__half2float(d_z_noise_other[z_noise_base + (int64_t)(t + 1) * N_inner]));
+            __syncthreads();
+            
+            /* Resample */
+            float u = (s_u0_shared + (float)inner_idx) / (float)N_inner;
+            int lo = 0, hi = N_inner - 1;
+            while (lo < hi) {
+                int mid = (lo + hi) / 2;
+                if (s_cdf[mid] < u) lo = mid + 1;
+                else hi = mid;
+            }
+            
+            z_tilde = s_z[lo];
+            mu_h = s_mu[lo];
+            var_h = s_var[lo];
+            log_w = -__logf((float)N_inner);
+            __syncthreads();
+            
+            /* Propagate */
+            float z_tilde_new = s_rho_prop * z_tilde + s_sigma_z_prop * z_noise_t1;
+            z = z_tilde_to_z(z_tilde_new);
+            
+            theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
+            mu_z = eval_curve(s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop, z);
+            sigma_h = eval_curve(s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop, z);
+            
+            phi = 1.0f - theta_z;
+            float mu_pred = phi * mu_h + theta_z * mu_z;
+            float var_pred = phi * phi * var_h + sigma_h * sigma_h;
+            var_pred = fmaxf(var_pred, 1e-8f);
+            
+            float mu_post, var_post, log_lik;
+            ocsn_kalman_update(y_obs, mu_pred, var_pred, &mu_post, &var_post, &log_lik);
+            
+            log_w += log_lik;
+            
+            /* Accumulate likelihood */
+            log_max = block_reduce_max(log_w, s_reduction);
+            if (inner_idx == 0) s_log_max = log_max;
+            __syncthreads();
+            
+            sum_w = block_reduce_sum(__expf(log_w - s_log_max), s_reduction);
+            if (inner_idx == 0) {
+                ll_accum += s_log_max + __logf(fmaxf(sum_w, 1e-30f)) - __logf((float)N_inner);
+            }
+            __syncthreads();
+            
+            z_tilde = z_tilde_new;
+            mu_h = mu_post;
+            var_h = var_post;
+        }
+        
+        /* MH accept/reject for Block 1 — Philox: (seed+MH_OFFSET, theta, move*3 + block) */
+        if (inner_idx == 0) {
+            s_ll_prop = ll_accum;
+            float log_alpha = (s_ll_prop + s_lp_prop) - (s_ll_curr + s_lp_curr);
+            
+            curandStatePhilox4_32_10_t mh_rng;
+            curand_init(seed + PHILOX_SEED_OFFSET_MH, theta_idx,
+                        (unsigned long long)move_id * 3 + 0, &mh_rng);
+            float u = curand_uniform(&mh_rng);
+            s_accept = (__logf(u) < log_alpha) ? 1 : 0;
+            
+            if (s_accept) {
+                s_rho = s_rho_prop;
+                s_sigma_z = s_sigma_z_prop;
+                s_ll_curr = s_ll_prop;
+                s_any_accept = 1;
+                atomicAdd(d_accepts, 1);
+            }
+        }
+        __syncthreads();
+    }
+    
+    /*═══════════════════════════════════════════════════════════════════════
+     * BLOCK 2: Mean curve (μ_base, μ_scale, μ_rate)
+     *═══════════════════════════════════════════════════════════════════════*/
+    if (inner_idx == 0) {
+        s_lp_curr = log_prior_theta(s_rho, s_sigma_z,
+                                     s_mu_base, s_mu_scale, s_mu_rate,
+                                     s_sigma_base, s_sigma_scale, s_sigma_rate);
+        
+        s_rho_prop = s_rho;
+        s_sigma_z_prop = s_sigma_z;
+        
+        /* Philox for proposal noise */
+        curandStatePhilox4_32_10_t prop_rng;
+        curand_init(seed + PHILOX_SEED_OFFSET_PROPOSAL, theta_idx,
+                    (unsigned long long)move_id * 8 + 2, &prop_rng);
+        s_mu_base_prop = s_mu_base + d_proposal_std[2] * curand_normal(&prop_rng);
+        
+        curand_init(seed + PHILOX_SEED_OFFSET_PROPOSAL, theta_idx,
+                    (unsigned long long)move_id * 8 + 3, &prop_rng);
+        s_mu_scale_prop = s_mu_scale + d_proposal_std[3] * curand_normal(&prop_rng);
+        
+        curand_init(seed + PHILOX_SEED_OFFSET_PROPOSAL, theta_idx,
+                    (unsigned long long)move_id * 8 + 4, &prop_rng);
+        s_mu_rate_prop = s_mu_rate + d_proposal_std[4] * curand_normal(&prop_rng);
+        
+        s_sigma_base_prop = s_sigma_base;
+        s_sigma_scale_prop = s_sigma_scale;
+        s_sigma_rate_prop = s_sigma_rate;
+        
+        s_lp_prop = log_prior_theta(s_rho_prop, s_sigma_z_prop,
+                                     s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop,
+                                     s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop);
+        s_valid = isfinite(s_lp_prop) ? 1 : 0;
+    }
+    __syncthreads();
+    
+    if (s_valid) {
+        /* Replay for Block 2 (same structure, using updated params) */
+        float one_minus_rho_sq = fmaxf(1.0f - s_rho_prop * s_rho_prop, 1e-6f);
+        float z_tilde_stat_std = s_sigma_z_prop / sqrtf(one_minus_rho_sq);
+        float z_tilde = z_tilde_stat_std * z_noise_prop_0;
+        float z = z_tilde_to_z(z_tilde);
+        
+        float theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
+        float mu_z = eval_curve(s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop, z);
+        float sigma_h = eval_curve(s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop, z);
+        float phi = 1.0f - theta_z;
+        
+        float mu_h = mu_z;
+        float var_h = (sigma_h * sigma_h) / fmaxf(1.0f - phi * phi, 1e-6f);
+        float log_w = -__logf((float)N_inner);
+        float ll_accum = 0.0f;
+        
+        for (int t = 0; t <= t_current; t++) {
+            float y_obs = y_history[t];
+            
+            float log_max = block_reduce_max(log_w, s_reduction);
+            if (inner_idx == 0) s_log_max = log_max;
+            __syncthreads();
+            
+            float w_unnorm = __expf(log_w - s_log_max);
+            float sum_w = block_reduce_sum(w_unnorm, s_reduction);
+            if (inner_idx == 0) s_sum_w = sum_w;
+            __syncthreads();
+            
+            float w_norm = w_unnorm / fmaxf(s_sum_w, 1e-30f);
+            
+            s_z[inner_idx] = z_tilde;
+            s_mu[inner_idx] = mu_h;
+            s_var[inner_idx] = var_h;
+            s_cdf[inner_idx] = w_norm;
+            __syncthreads();
+            
+            for (int offset = 1; offset < N_inner; offset *= 2) {
+                float val = 0.0f;
+                if (inner_idx >= offset) val = s_cdf[inner_idx - offset];
+                __syncthreads();
+                if (inner_idx >= offset) s_cdf[inner_idx] += val;
+                __syncthreads();
+            }
+            if (inner_idx == N_inner - 1) s_cdf[inner_idx] = 1.0f;
+            __syncthreads();
+            
+            int64_t z_idx_t1 = z_noise_base + (int64_t)(t + 1) * N_inner + inner_idx;
+            float z_noise_t1 = __half2float(d_z_noise_other[z_idx_t1]);
+            
+            if (inner_idx == 0) s_u0_shared = u0_from_noise(__half2float(d_z_noise_other[z_noise_base + (int64_t)(t + 1) * N_inner]));
+            __syncthreads();
+            
+            float u = (s_u0_shared + (float)inner_idx) / (float)N_inner;
+            int lo = 0, hi = N_inner - 1;
+            while (lo < hi) {
+                int mid = (lo + hi) / 2;
+                if (s_cdf[mid] < u) lo = mid + 1;
+                else hi = mid;
+            }
+            
+            z_tilde = s_z[lo];
+            mu_h = s_mu[lo];
+            var_h = s_var[lo];
+            log_w = -__logf((float)N_inner);
+            __syncthreads();
+            
+            float z_tilde_new = s_rho_prop * z_tilde + s_sigma_z_prop * z_noise_t1;
+            z = z_tilde_to_z(z_tilde_new);
+            
+            theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
+            mu_z = eval_curve(s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop, z);
+            sigma_h = eval_curve(s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop, z);
+            
+            phi = 1.0f - theta_z;
+            float mu_pred = phi * mu_h + theta_z * mu_z;
+            float var_pred = phi * phi * var_h + sigma_h * sigma_h;
+            var_pred = fmaxf(var_pred, 1e-8f);
+            
+            float mu_post, var_post, log_lik;
+            ocsn_kalman_update(y_obs, mu_pred, var_pred, &mu_post, &var_post, &log_lik);
+            
+            log_w += log_lik;
+            
+            log_max = block_reduce_max(log_w, s_reduction);
+            if (inner_idx == 0) s_log_max = log_max;
+            __syncthreads();
+            
+            sum_w = block_reduce_sum(__expf(log_w - s_log_max), s_reduction);
+            if (inner_idx == 0) {
+                ll_accum += s_log_max + __logf(fmaxf(sum_w, 1e-30f)) - __logf((float)N_inner);
+            }
+            __syncthreads();
+            
+            z_tilde = z_tilde_new;
+            mu_h = mu_post;
+            var_h = var_post;
+        }
+        
+        /* MH accept/reject for Block 2 — Philox */
+        if (inner_idx == 0) {
+            s_ll_prop = ll_accum;
+            float log_alpha = (s_ll_prop + s_lp_prop) - (s_ll_curr + s_lp_curr);
+            
+            curandStatePhilox4_32_10_t mh_rng;
+            curand_init(seed + PHILOX_SEED_OFFSET_MH, theta_idx,
+                        (unsigned long long)move_id * 3 + 1, &mh_rng);
+            float u = curand_uniform(&mh_rng);
+            s_accept = (__logf(u) < log_alpha) ? 1 : 0;
+            
+            if (s_accept) {
+                s_mu_base = s_mu_base_prop;
+                s_mu_scale = s_mu_scale_prop;
+                s_mu_rate = s_mu_rate_prop;
+                s_ll_curr = s_ll_prop;
+                s_any_accept = 1;
+                atomicAdd(d_accepts, 1);
+            }
+        }
+        __syncthreads();
+    }
+    
+    /*═══════════════════════════════════════════════════════════════════════
+     * BLOCK 3: Vol curve (σ_base, σ_scale, σ_rate)
+     *═══════════════════════════════════════════════════════════════════════*/
+    if (inner_idx == 0) {
+        s_lp_curr = log_prior_theta(s_rho, s_sigma_z,
+                                     s_mu_base, s_mu_scale, s_mu_rate,
+                                     s_sigma_base, s_sigma_scale, s_sigma_rate);
+        
+        s_rho_prop = s_rho;
+        s_sigma_z_prop = s_sigma_z;
+        s_mu_base_prop = s_mu_base;
+        s_mu_scale_prop = s_mu_scale;
+        s_mu_rate_prop = s_mu_rate;
+        
+        /* Philox for proposal noise */
+        curandStatePhilox4_32_10_t prop_rng;
+        curand_init(seed + PHILOX_SEED_OFFSET_PROPOSAL, theta_idx,
+                    (unsigned long long)move_id * 8 + 5, &prop_rng);
+        s_sigma_base_prop = s_sigma_base + d_proposal_std[5] * curand_normal(&prop_rng);
+        
+        curand_init(seed + PHILOX_SEED_OFFSET_PROPOSAL, theta_idx,
+                    (unsigned long long)move_id * 8 + 6, &prop_rng);
+        s_sigma_scale_prop = s_sigma_scale + d_proposal_std[6] * curand_normal(&prop_rng);
+        
+        curand_init(seed + PHILOX_SEED_OFFSET_PROPOSAL, theta_idx,
+                    (unsigned long long)move_id * 8 + 7, &prop_rng);
+        s_sigma_rate_prop = s_sigma_rate + d_proposal_std[7] * curand_normal(&prop_rng);
+        
+        s_lp_prop = log_prior_theta(s_rho_prop, s_sigma_z_prop,
+                                     s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop,
+                                     s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop);
+        s_valid = isfinite(s_lp_prop) ? 1 : 0;
+    }
+    __syncthreads();
+    
+    if (s_valid) {
+        /* Replay for Block 3 */
+        float one_minus_rho_sq = fmaxf(1.0f - s_rho_prop * s_rho_prop, 1e-6f);
+        float z_tilde_stat_std = s_sigma_z_prop / sqrtf(one_minus_rho_sq);
+        float z_tilde = z_tilde_stat_std * z_noise_prop_0;
+        float z = z_tilde_to_z(z_tilde);
+        
+        float theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
+        float mu_z = eval_curve(s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop, z);
+        float sigma_h = eval_curve(s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop, z);
+        float phi = 1.0f - theta_z;
+        
+        float mu_h = mu_z;
+        float var_h = (sigma_h * sigma_h) / fmaxf(1.0f - phi * phi, 1e-6f);
+        float log_w = -__logf((float)N_inner);
+        float ll_accum = 0.0f;
+        
+        for (int t = 0; t <= t_current; t++) {
+            float y_obs = y_history[t];
+            
+            float log_max = block_reduce_max(log_w, s_reduction);
+            if (inner_idx == 0) s_log_max = log_max;
+            __syncthreads();
+            
+            float w_unnorm = __expf(log_w - s_log_max);
+            float sum_w = block_reduce_sum(w_unnorm, s_reduction);
+            if (inner_idx == 0) s_sum_w = sum_w;
+            __syncthreads();
+            
+            float w_norm = w_unnorm / fmaxf(s_sum_w, 1e-30f);
+            
+            s_z[inner_idx] = z_tilde;
+            s_mu[inner_idx] = mu_h;
+            s_var[inner_idx] = var_h;
+            s_cdf[inner_idx] = w_norm;
+            __syncthreads();
+            
+            for (int offset = 1; offset < N_inner; offset *= 2) {
+                float val = 0.0f;
+                if (inner_idx >= offset) val = s_cdf[inner_idx - offset];
+                __syncthreads();
+                if (inner_idx >= offset) s_cdf[inner_idx] += val;
+                __syncthreads();
+            }
+            if (inner_idx == N_inner - 1) s_cdf[inner_idx] = 1.0f;
+            __syncthreads();
+            
+            int64_t z_idx_t1 = z_noise_base + (int64_t)(t + 1) * N_inner + inner_idx;
+            float z_noise_t1 = __half2float(d_z_noise_other[z_idx_t1]);
+            
+            if (inner_idx == 0) s_u0_shared = u0_from_noise(__half2float(d_z_noise_other[z_noise_base + (int64_t)(t + 1) * N_inner]));
+            __syncthreads();
+            
+            float u = (s_u0_shared + (float)inner_idx) / (float)N_inner;
+            int lo = 0, hi = N_inner - 1;
+            while (lo < hi) {
+                int mid = (lo + hi) / 2;
+                if (s_cdf[mid] < u) lo = mid + 1;
+                else hi = mid;
+            }
+            
+            z_tilde = s_z[lo];
+            mu_h = s_mu[lo];
+            var_h = s_var[lo];
+            log_w = -__logf((float)N_inner);
+            __syncthreads();
+            
+            float z_tilde_new = s_rho_prop * z_tilde + s_sigma_z_prop * z_noise_t1;
+            z = z_tilde_to_z(z_tilde_new);
+            
+            theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
+            mu_z = eval_curve(s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop, z);
+            sigma_h = eval_curve(s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop, z);
+            
+            phi = 1.0f - theta_z;
+            float mu_pred = phi * mu_h + theta_z * mu_z;
+            float var_pred = phi * phi * var_h + sigma_h * sigma_h;
+            var_pred = fmaxf(var_pred, 1e-8f);
+            
+            float mu_post, var_post, log_lik;
+            ocsn_kalman_update(y_obs, mu_pred, var_pred, &mu_post, &var_post, &log_lik);
+            
+            log_w += log_lik;
+            
+            log_max = block_reduce_max(log_w, s_reduction);
+            if (inner_idx == 0) s_log_max = log_max;
+            __syncthreads();
+            
+            sum_w = block_reduce_sum(__expf(log_w - s_log_max), s_reduction);
+            if (inner_idx == 0) {
+                ll_accum += s_log_max + __logf(fmaxf(sum_w, 1e-30f)) - __logf((float)N_inner);
+            }
+            __syncthreads();
+            
+            z_tilde = z_tilde_new;
+            mu_h = mu_post;
+            var_h = var_post;
+        }
+        
+        /* MH accept/reject for Block 3 — Philox */
+        if (inner_idx == 0) {
+            s_ll_prop = ll_accum;
+            float log_alpha = (s_ll_prop + s_lp_prop) - (s_ll_curr + s_lp_curr);
+            
+            curandStatePhilox4_32_10_t mh_rng;
+            curand_init(seed + PHILOX_SEED_OFFSET_MH, theta_idx,
+                        (unsigned long long)move_id * 3 + 2, &mh_rng);
+            float u = curand_uniform(&mh_rng);
+            s_accept = (__logf(u) < log_alpha) ? 1 : 0;
+            
+            if (s_accept) {
+                s_sigma_base = s_sigma_base_prop;
+                s_sigma_scale = s_sigma_scale_prop;
+                s_sigma_rate = s_sigma_rate_prop;
+                s_ll_curr = s_ll_prop;
+                s_any_accept = 1;
+                atomicAdd(d_accepts, 1);
+            }
+        }
+        __syncthreads();
+    }
+    
+    /*═══════════════════════════════════════════════════════════════════════
+     * Commit updated parameters and set swap flag
+     *═══════════════════════════════════════════════════════════════════════*/
+    if (inner_idx == 0) {
+        particles.rho[theta_idx] = s_rho;
+        particles.sigma_z[theta_idx] = s_sigma_z;
+        particles.mu_base[theta_idx] = s_mu_base;
+        particles.mu_scale[theta_idx] = s_mu_scale;
+        particles.mu_rate[theta_idx] = s_mu_rate;
+        particles.sigma_base[theta_idx] = s_sigma_base;
+        particles.sigma_scale[theta_idx] = s_sigma_scale;
+        particles.sigma_rate[theta_idx] = s_sigma_rate;
+        particles.log_likelihood[theta_idx] = s_ll_curr;
+        
+        d_swap_flags[theta_idx] = s_any_accept;
+    }
+    /* No RNG state to save — fully stateless Philox */
+}
+
+#endif /* SMC2_BLOCKED_PMMH */
+
+/* Commit proposed noise to current buffer for accepted CPMMH particles.
+ * For accepted particles, copies noise from proposal buffer (d_z_noise_1) 
+ * to current buffer (d_z_noise_0). Rejected particles keep their original noise. */
+__global__ void kernel_commit_accepted_noise(
     half* d_z_noise_0,
     half* d_z_noise_1,
     const int* d_swap_flags,
@@ -987,11 +1749,11 @@ __global__ void kernel_swap_noise_for_accepted(
     int inner_idx = threadIdx.x;
     
     if (theta_idx >= N_theta || inner_idx >= N_inner) return;
-    if (d_swap_flags[theta_idx] == 0) return;  /* Not accepted, no swap */
+    if (d_swap_flags[theta_idx] == 0) return;  /* Rejected: keep original noise */
     
     int64_t z_base = (int64_t)theta_idx * N_inner * (noise_capacity + 1);
     
-    /* Swap by copying from buffer 1 to buffer 0 (or vice versa handled by caller) */
+    /* Copy proposed noise to current buffer */
     for (int t = 0; t <= t_current + 1; t++) {
         int64_t idx = z_base + t * N_inner + inner_idx;
         d_z_noise_0[idx] = d_z_noise_1[idx];
@@ -1091,7 +1853,9 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     state->cpmmh_rho = 0.99f;  /* High correlation for variance reduction */
     state->noise_buf = 0;     /* Start with buffer 0 */
     
-    /* Initialize host-side RNG for fast outer resampling uniform generation */
+    /* Initialize host-side RNG for fast outer resampling uniform generation
+     * Default: time-based seed (non-reproducible). Use smc2_cuda_set_seed() for reproducibility. */
+    state->user_seed = 0;
     state->host_rng_state = 0x853C49E6748FEA9BULL ^ (uint64_t)time(NULL);
     
     int64_t z_noise_size = (int64_t)N_theta * N_inner * (state->noise_capacity + 1);
@@ -1232,6 +1996,15 @@ void smc2_cuda_free(SMC2StateCUDA* state) {
     free(state);
 }
 
+void smc2_cuda_set_seed(SMC2StateCUDA* state, uint64_t seed) {
+    /* Set user seed for reproducibility. Call before smc2_cuda_init_from_prior.
+     * If seed == 0, time-based seeding will be used (non-reproducible). */
+    state->user_seed = seed;
+    if (seed != 0) {
+        state->host_rng_state = 0x853C49E6748FEA9BULL ^ seed;
+    }
+}
+
 void smc2_cuda_set_noise_capacity(SMC2StateCUDA* state, int capacity) {
     if (capacity <= state->noise_capacity) return;  /* Already big enough */
     
@@ -1262,6 +2035,12 @@ void smc2_cuda_init_from_prior(SMC2StateCUDA* state) {
     CUDA_CHECK(cudaMemcpyToSymbol(d_bounds, &state->bounds, sizeof(SVBounds)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_theta_curve, &state->theta_curve, sizeof(SVCurve)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_proposal_std, state->proposal_std, 8 * sizeof(float)));
+    
+    /* Reinitialize RNG with user seed if set (for reproducibility) */
+    int N_total = state->N_theta * state->N_inner;
+    unsigned long long rng_seed = (state->user_seed != 0) ? state->user_seed : 12345ULL;
+    kernel_init_rng<<<(N_total + 255) / 256, 256>>>(state->d_particles.rng_states, rng_seed, N_total);
+    CUDA_CHECK(cudaDeviceSynchronize());
     
     kernel_init_from_prior<<<state->N_theta, state->N_inner>>>(
         state->d_particles, state->N_theta, state->N_inner,
@@ -1379,6 +2158,9 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
         /* FUSED CPMMH rejuvenation - ONE kernel does everything */
         size_t pmmh_shared_size = (32 + 4 * state->N_inner) * sizeof(float);
         
+        /* Base move_id for this resample event (ensures unique Philox sequences) */
+        int base_move_id = state->n_rejuv_total / state->N_theta;
+        
         for (int k = 0; k < state->K_rejuv; k++) {
             int h_accepts = 0;
             CUDA_CHECK(cudaMemcpy(state->d_accepts, &h_accepts, sizeof(int), cudaMemcpyHostToDevice));
@@ -1398,13 +2180,15 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
                 state->noise_capacity,
                 state->cpmmh_rho,
                 state->d_accepts,
-                state->d_swap_flags       /* Per-particle accept flags */
+                state->d_swap_flags,      /* Per-particle accept flags */
+                state->user_seed,         /* Philox base seed */
+                base_move_id + k          /* Unique move index for Philox */
             );
             CUDA_CHECK(cudaDeviceSynchronize());
             
             /* For accepted particles, copy noise from other → curr 
              * (Alternative: could swap buffer indices per-particle but that's complex) */
-            kernel_swap_noise_for_accepted<<<state->N_theta, state->N_inner>>>(
+            kernel_commit_accepted_noise<<<state->N_theta, state->N_inner>>>(
                 curr_noise, other_noise,
                 state->d_swap_flags,
                 state->N_theta, state->N_inner,

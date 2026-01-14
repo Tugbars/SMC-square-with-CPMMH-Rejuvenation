@@ -439,7 +439,7 @@ SMC2Config smc2_config_defaults(void) {
     cfg.N_inner = 256;
     cfg.ess_threshold_outer = 0.5f;  /* Resample θ when ESS < 0.5 * N_theta */
     cfg.ess_threshold_inner = 0.5f;  /* Resample inner when ESS < 0.5 * N_inner */
-    cfg.K_rejuv = 3;
+    cfg.K_rejuv = 5;
     cfg.seed = 12345678901234567ULL;
     return cfg;
 }
