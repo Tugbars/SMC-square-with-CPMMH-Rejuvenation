@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 #include <cuda_fp16.h>
+#include <stdint.h>      /* For uint64_t */
 
 /*═══════════════════════════════════════════════════════════════════════════
  * Configuration
@@ -18,7 +19,21 @@
 #define CUDA_N_INNER      256
 #define CUDA_WARP_SIZE    32
 #define OCSN_K            10
-#define OCSN_OFFSET       0.0f  /* No offset needed for standard y = h + log(chi2_1) */
+
+/* OCSN mixture approximation for log χ²(1)
+ * 
+ * The stored d_OCSN_MEANS are from Kim-Shephard-Chib (1998) Table 4,
+ * which directly approximates the RAW log χ²(1) distribution (mean ≈ -1.27).
+ * 
+ * Observation model: y = h + log(ε²) where ε ~ N(0,1), so log(ε²) ~ log χ²(1)
+ * 
+ * Innovation for component k: innov = y - h_pred - m_k
+ * No offset needed since means are already for raw distribution.
+ * 
+ * NOTE: Omori et al. (2007) gives CENTERED means (mean = 0), which would
+ * require OCSN_OFFSET = 1.27036. But we use KSC 1998 raw means, so offset = 0.
+ */
+#define OCSN_OFFSET       0.0f
 
 /*═══════════════════════════════════════════════════════════════════════════
  * Parameter Structures
@@ -99,11 +114,14 @@ struct SMC2StateCUDA {
     
     /* CPMMH: Ping-pong noise buffers for zero-copy swaps
      * FP16 storage for bandwidth reduction
-     * u0 derived from z_noise (no separate storage) */
+     * u0 derived from z_noise via Φ(z) (no separate storage) */
     half* d_z_noise[2];     /* Ping-pong: [N_theta * N_inner * (T+1)] each */
     int noise_buf;          /* Current buffer index: 0 or 1 */
     int noise_capacity;     /* Max T for noise arrays */
     float cpmmh_rho;        /* Correlation: 0.99 typical */
+    
+    /* Host-side fast RNG for outer resampling (avoids curandGenerator overhead) */
+    uint64_t host_rng_state;
     
     /* Scratch */
     int* d_ancestors;

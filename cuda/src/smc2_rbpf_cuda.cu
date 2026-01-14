@@ -7,11 +7,15 @@
  *   - Fixed ESS calculation
  *   - Outer systematic resampling
  *   - Log-weight reset after resampling
+ * 
+ * OCSN NOTE: d_OCSN_MEANS are from Kim-Shephard-Chib (1998) Table 4,
+ * which approximates RAW log χ²(1) directly. OCSN_OFFSET = 0.
  */
 
 #include "smc2_rbpf_cuda.cuh"
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>      /* For uint64_t */
 #include <math.h>
 #include <time.h>
 #include <curand.h>      /* For curandGenerator_t */
@@ -19,6 +23,13 @@
 
 /*═══════════════════════════════════════════════════════════════════════════
  * OCSN Constants in Constant Memory
+ * 
+ * These are from Kim-Shephard-Chib (1998) Table 4, a 10-component Gaussian
+ * mixture approximation to the RAW log χ²(1) distribution (mean ≈ -1.27).
+ * 
+ * With observation model y = h + log(ε²), the innovation is simply:
+ *   innov = y - h_pred - m_k
+ * No offset adjustment needed (OCSN_OFFSET = 0).
  *═══════════════════════════════════════════════════════════════════════════*/
 
 __constant__ float d_OCSN_WEIGHTS[OCSN_K] = {
@@ -167,19 +178,24 @@ __device__ float log_prior_theta(
 /*═══════════════════════════════════════════════════════════════════════════
  * Derive u0 from z_noise - eliminates separate u0 storage
  * Maps correlated Gaussian noise to [0,1) for systematic resampling
+ * 
+ * Uses probability integral transform: if Z ~ N(0,1), then Φ(Z) ~ Uniform(0,1)
+ * This is exact and preserves correlation structure for CPMMH coupling.
  *═══════════════════════════════════════════════════════════════════════════*/
 
 __device__ __forceinline__ float u0_from_noise(float z_noise) {
-    /* Use fractional part to map to [0,1) 
-     * The 0.5 offset centers the distribution
-     * The 0.1 scale ensures good spread */
-    float u = 0.5f + 0.1f * z_noise;
-    u = u - floorf(u);  /* fract() */
-    return fmaxf(1e-7f, fminf(1.0f - 1e-7f, u));  /* Clamp away from 0,1 */
+    /* Φ(z) = 0.5 * (1 + erf(z / sqrt(2))) 
+     * CUDA's normcdff() computes this directly */
+    float u = normcdff(z_noise);
+    /* Clamp away from exact 0 and 1 to avoid edge cases in resampling */
+    return fmaxf(1e-7f, fminf(1.0f - 1e-7f, u));
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
  * OCSN Kalman Update
+ * 
+ * Implements the 10-component Gaussian mixture approximation to log χ²(1)
+ * from Omori et al. (2007) for the stochastic volatility observation equation.
  *═══════════════════════════════════════════════════════════════════════════*/
 
 __device__ void ocsn_kalman_update(
@@ -187,19 +203,22 @@ __device__ void ocsn_kalman_update(
     float* mu_post_out, float* var_post_out, float* log_lik_out
 ) {
     float log_alpha_tilde[OCSN_K];
+    float innov[OCSN_K];  /* Cache innovations to avoid recomputation */
     float S[OCSN_K], K[OCSN_K], mu_k[OCSN_K], var_k[OCSN_K];
     float log_max = -1e30f;
     
+    /* First pass: compute innovations, prediction variances, and unnormalized log weights */
     #pragma unroll
     for (int k = 0; k < OCSN_K; k++) {
         S[k] = var_pred + d_OCSN_VARS[k];
-        float innov = y - mu_pred - d_OCSN_MEANS[k] + OCSN_OFFSET;
+        innov[k] = y - mu_pred - d_OCSN_MEANS[k] + OCSN_OFFSET;
         log_alpha_tilde[k] = d_OCSN_LOG_WEIGHTS[k] 
                            - 0.5f * __logf(S[k])
-                           - 0.5f * innov * innov / S[k];
+                           - 0.5f * innov[k] * innov[k] / S[k];
         log_max = fmaxf(log_max, log_alpha_tilde[k]);
     }
     
+    /* Normalize mixture weights using log-sum-exp */
     float sum_exp = 0.0f;
     #pragma unroll
     for (int k = 0; k < OCSN_K; k++) {
@@ -213,14 +232,15 @@ __device__ void ocsn_kalman_update(
         alpha[k] = __expf(log_alpha_tilde[k] - log_norm);
     }
     
+    /* Compute per-component Kalman updates (reuse cached innovations) */
     #pragma unroll
     for (int k = 0; k < OCSN_K; k++) {
         K[k] = var_pred / S[k];
-        float innov = y - mu_pred - d_OCSN_MEANS[k] + OCSN_OFFSET;
-        mu_k[k] = mu_pred + K[k] * innov;
+        mu_k[k] = mu_pred + K[k] * innov[k];
         var_k[k] = (1.0f - K[k]) * var_pred;
     }
     
+    /* Collapse mixture: compute posterior mean and variance */
     float mu_post = 0.0f, E_h_sq = 0.0f;
     #pragma unroll
     for (int k = 0; k < OCSN_K; k++) {
@@ -982,6 +1002,23 @@ __global__ void kernel_swap_noise_for_accepted(
  * Host API
  *═══════════════════════════════════════════════════════════════════════════*/
 
+/* Fast host-side xorshift64* for outer resampling uniform generation
+ * Avoids costly curandGenerator creation/destruction per resample */
+static inline uint64_t xorshift64star(uint64_t* state) {
+    uint64_t x = *state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    return x * 0x2545F4914F6CDD1DULL;
+}
+
+static inline float xorshift64star_uniform(uint64_t* state) {
+    /* Generate uniform in (0, 1) - avoid exact 0 and 1 */
+    uint64_t r = xorshift64star(state);
+    return (float)((r >> 11) + 1) * (1.0f / 9007199254740994.0f);  /* 2^53 + 2 */
+}
+
 SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     SMC2StateCUDA* state = (SMC2StateCUDA*)calloc(1, sizeof(SMC2StateCUDA));
     if (!state) return NULL;
@@ -1053,6 +1090,9 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     state->noise_capacity = 2048;
     state->cpmmh_rho = 0.99f;  /* High correlation for variance reduction */
     state->noise_buf = 0;     /* Start with buffer 0 */
+    
+    /* Initialize host-side RNG for fast outer resampling uniform generation */
+    state->host_rng_state = 0x853C49E6748FEA9BULL ^ (uint64_t)time(NULL);
     
     int64_t z_noise_size = (int64_t)N_theta * N_inner * (state->noise_capacity + 1);
     
@@ -1298,12 +1338,10 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
     if (h_ess < state->ess_threshold_outer * state->N_theta) {
         state->n_resamples++;
         
-        /* Generate uniform for outer resampling */
-        curandGenerator_t gen;
-        curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
-        curandSetPseudoRandomGeneratorSeed(gen, time(NULL) + state->n_resamples);
-        curandGenerateUniform(gen, state->d_uniform, 1);
-        curandDestroyGenerator(gen);
+        /* Generate uniform for outer resampling using fast host-side RNG
+         * (Avoids costly curandGenerator create/destroy overhead) */
+        float h_uniform = xorshift64star_uniform(&state->host_rng_state);
+        CUDA_CHECK(cudaMemcpy(state->d_uniform, &h_uniform, sizeof(float), cudaMemcpyHostToDevice));
         
         /* Resample θ-particles */
         kernel_outer_resample<<<1, state->N_theta, state->N_theta * sizeof(float)>>>(
