@@ -235,33 +235,42 @@ __global__ void kernel_init_from_prior(
  * KERNEL: RBPF Forward Step
  * 
  * Main filtering kernel. Fused: resample → sort → propagate → observe
+ * 
+ * Template parameter N_INNER must match blockDim.x for CUB sort.
  *═══════════════════════════════════════════════════════════════════════════════*/
 
-__global__ void kernel_rbpf_step(
+template<int N_INNER>
+__global__ 
+__launch_bounds__(N_INNER)
+void kernel_rbpf_step_impl(
     ThetaParticlesSoA particles,
     float y_obs,
-    int N_theta, int N_inner,
+    int N_theta,
     half* d_z_noise,
     half* d_u0_noise,
     int t_current,
     int noise_capacity
 ) {
+    static_assert(N_INNER <= 1024, "N_INNER must be <= 1024");
+    
     int theta_idx = blockIdx.x;
     int inner_idx = threadIdx.x;
-    int global_idx = theta_idx * N_inner + inner_idx;
+    int global_idx = theta_idx * N_INNER + inner_idx;
     
-    if (theta_idx >= N_theta || inner_idx >= N_inner) return;
+    if (theta_idx >= N_theta || inner_idx >= N_INNER) return;
     
-    /* Shared memory layout */
-    extern __shared__ float shared_mem[];
-    float* s_reduction = shared_mem;
-    float* s_weights = &shared_mem[32];
-    float* s_cumsum = &shared_mem[32 + N_inner];
-    float* s_var_sort = &shared_mem[32 + 2 * N_inner];
-    float* s_z_sort = s_weights;   /* Reused */
-    float* s_mu_sort = s_cumsum;   /* Reused */
-    int* s_bin_count = (int*)&shared_mem[32 + 3 * N_inner];
-    int* s_bin_offset = (int*)&shared_mem[32 + 3 * N_inner + SORT_BINS];
+    /* Shared memory layout for CUB sort */
+    extern __shared__ char shared_raw[];
+    float* s_reduction = reinterpret_cast<float*>(shared_raw);
+    float* s_z_sort = &s_reduction[32];
+    float* s_mu_sort = &s_z_sort[N_INNER];
+    float* s_var_sort = &s_mu_sort[N_INNER];
+    int* s_idx = reinterpret_cast<int*>(&s_var_sort[N_INNER]);
+    void* s_cub_temp = reinterpret_cast<void*>(&s_idx[N_INNER]);
+    
+    /* Alias for weights/cumsum (reuse s_z_sort, s_mu_sort before sort) */
+    float* s_weights = s_z_sort;
+    float* s_cumsum = s_mu_sort;
     
     /* Load θ parameters to shared memory */
     __shared__ float s_rho, s_sigma_z;
@@ -290,8 +299,8 @@ __global__ void kernel_rbpf_step(
     float log_w = particles.inner_log_w[global_idx];
     
     /* Noise indices */
-    int64_t z_noise_base = (int64_t)theta_idx * N_inner * (noise_capacity + 1);
-    int64_t z_noise_idx = z_noise_base + (int64_t)(t_current + 1) * N_inner + inner_idx;
+    int64_t z_noise_base = (int64_t)theta_idx * N_INNER * (noise_capacity + 1);
+    int64_t z_noise_idx = z_noise_base + (int64_t)(t_current + 1) * N_INNER + inner_idx;
     int64_t u0_noise_idx = (int64_t)theta_idx * (noise_capacity + 1) + (t_current + 1);
     
     /* Generate and store propagation noise (FP16 round-trip) */
@@ -328,13 +337,13 @@ __global__ void kernel_rbpf_step(
         /* Build CDF via parallel scan */
         s_cumsum[inner_idx] = s_weights[inner_idx];
         __syncthreads();
-        block_inclusive_scan(s_cumsum, N_inner);
-        if (inner_idx == N_inner - 1) s_cumsum[N_inner - 1] = 1.0f;
+        block_inclusive_scan(s_cumsum, N_INNER);
+        if (inner_idx == N_INNER - 1) s_cumsum[N_INNER - 1] = 1.0f;
         __syncthreads();
         
         /* Systematic resampling */
-        float u = (s_u0 + (float)inner_idx) / (float)N_inner;
-        int lo = 0, hi = N_inner - 1;
+        float u = (s_u0 + (float)inner_idx) / (float)N_INNER;
+        int lo = 0, hi = N_INNER - 1;
         while (lo < hi) {
             int mid = (lo + hi) / 2;
             if (s_cumsum[mid] < u) lo = mid + 1;
@@ -343,15 +352,15 @@ __global__ void kernel_rbpf_step(
         int ancestor = lo;
         
         /* Load ancestor state */
-        z_tilde = particles.inner_z[theta_idx * N_inner + ancestor];
-        mu_h = particles.inner_mu_h[theta_idx * N_inner + ancestor];
-        var_h = particles.inner_var_h[theta_idx * N_inner + ancestor];
-        log_w = -__logf((float)N_inner);
+        z_tilde = particles.inner_z[theta_idx * N_INNER + ancestor];
+        mu_h = particles.inner_mu_h[theta_idx * N_INNER + ancestor];
+        var_h = particles.inner_var_h[theta_idx * N_INNER + ancestor];
+        log_w = -__logf((float)N_INNER);
         
         __syncthreads();
         
         /*─────────────────────────────────────────────────────────────────────
-         * CPMMH BUCKET SORT by μ_h
+         * CPMMH CUB SORT by μ_h (deterministic, crash-safe)
          *─────────────────────────────────────────────────────────────────────*/
         if ((t_current % SORT_EVERY_K) == 0) {
             s_z_sort[inner_idx] = z_tilde;
@@ -359,8 +368,7 @@ __global__ void kernel_rbpf_step(
             s_var_sort[inner_idx] = var_h;
             __syncthreads();
             
-            cpmmh_bucket_sort(s_z_sort, s_mu_sort, s_var_sort, 
-                              s_bin_count, s_bin_offset, N_inner);
+            cpmmh_cub_sort<N_INNER>(s_z_sort, s_mu_sort, s_var_sort, s_idx, s_cub_temp);
             
             z_tilde = s_z_sort[inner_idx];
             mu_h = s_mu_sort[inner_idx];
@@ -412,7 +420,7 @@ __global__ void kernel_rbpf_step(
     float sum_w_sq = block_reduce_sum(w_sq, s_reduction);
     float ess = 1.0f / fmaxf(sum_w_sq, 1e-30f);
     
-    float ll_incr = s_log_max + __logf(fmaxf(s_sum_w, 1e-30f)) - __logf((float)N_inner);
+    float ll_incr = s_log_max + __logf(fmaxf(s_sum_w, 1e-30f)) - __logf((float)N_INNER);
     
     /*─────────────────────────────────────────────────────────────────────────
      * STORE RESULTS
@@ -428,6 +436,22 @@ __global__ void kernel_rbpf_step(
         particles.log_weight[theta_idx] += ll_incr;
         particles.log_likelihood[theta_idx] += ll_incr;
     }
+}
+
+/* Wrapper to dispatch based on N_inner at runtime */
+__global__ void kernel_rbpf_step(
+    ThetaParticlesSoA particles,
+    float y_obs,
+    int N_theta, int N_inner,
+    half* d_z_noise,
+    half* d_u0_noise,
+    int t_current,
+    int noise_capacity
+) {
+    /* This wrapper exists for API compatibility but shouldn't be used directly.
+     * The host code should call kernel_rbpf_step_impl<N_INNER> directly. */
+    (void)particles; (void)y_obs; (void)N_theta; (void)N_inner;
+    (void)d_z_noise; (void)d_u0_noise; (void)t_current; (void)noise_capacity;
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
@@ -588,9 +612,14 @@ __global__ void kernel_copy_noise_arrays(
  * KERNEL: CPMMH Fused Rejuvenation
  * 
  * The big one. See header for algorithm documentation.
+ * 
+ * Template parameter N_INNER must match blockDim.x for CUB sort.
  *═══════════════════════════════════════════════════════════════════════════════*/
 
-__global__ void kernel_cpmmh_rejuvenate_fused(
+template<int N_INNER>
+__global__
+__launch_bounds__(N_INNER)
+void kernel_cpmmh_rejuvenate_fused_impl(
     ThetaParticlesSoA particles,
     ThetaParticlesSoA particles_scratch,
     const float* y_history,
@@ -599,7 +628,7 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
     half* d_u0_noise_curr,
     half* d_u0_noise_other,
     int t_current,
-    int N_theta, int N_inner,
+    int N_theta,
     int noise_capacity,
     float cpmmh_rho,
     int* d_accepts,
@@ -608,23 +637,25 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
     int move_id,
     int block_id
 ) {
+    static_assert(N_INNER <= 1024, "N_INNER must be <= 1024");
+    
     (void)seed; (void)move_id; (void)block_id;  /* Unused in joint mode */
     
     int theta_idx = blockIdx.x;
     int inner_idx = threadIdx.x;
-    int global_idx = theta_idx * N_inner + inner_idx;
+    int global_idx = theta_idx * N_INNER + inner_idx;
     
-    if (theta_idx >= N_theta || inner_idx >= N_inner) return;
+    if (theta_idx >= N_theta || inner_idx >= N_INNER) return;
     
-    /* Shared memory */
-    extern __shared__ float shared_mem[];
-    float* s_reduction = shared_mem;
-    float* s_z = &shared_mem[32];
-    float* s_mu = &shared_mem[32 + N_inner];
-    float* s_var = &shared_mem[32 + 2 * N_inner];
-    float* s_cdf = &shared_mem[32 + 3 * N_inner];
-    int* s_bin_count = (int*)&shared_mem[32 + 4 * N_inner];
-    int* s_bin_offset = (int*)&shared_mem[32 + 4 * N_inner + SORT_BINS];
+    /* Shared memory layout for CUB sort */
+    extern __shared__ char shared_raw[];
+    float* s_reduction = reinterpret_cast<float*>(shared_raw);
+    float* s_z = &s_reduction[32];
+    float* s_mu = &s_z[N_INNER];
+    float* s_var = &s_mu[N_INNER];
+    float* s_cdf = &s_var[N_INNER];
+    int* s_idx = reinterpret_cast<int*>(&s_cdf[N_INNER]);
+    void* s_cub_temp = reinterpret_cast<void*>(&s_idx[N_INNER]);
     
     __shared__ float s_log_max, s_sum_w, s_ess_prop;
     __shared__ float s_rho_curr, s_sigma_z_curr;
@@ -683,7 +714,7 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
         return;
     }
     
-    int64_t z_noise_base = (int64_t)theta_idx * N_inner * (noise_capacity + 1);
+    int64_t z_noise_base = (int64_t)theta_idx * N_INNER * (noise_capacity + 1);
     float scale = sqrtf(1.0f - cpmmh_rho * cpmmh_rho);
     
     /*─────────────────────────────────────────────────────────────────────────
@@ -722,7 +753,7 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
     
     float mu_h = mu_z_val;
     float var_h = h_stat_var;
-    float log_w = -__logf((float)N_inner);
+    float log_w = -__logf((float)N_INNER);
     float ll_accum = 0.0f;
     
     /* Process all observations */
@@ -750,12 +781,12 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
         s_cdf[inner_idx] = w_norm;
         __syncthreads();
         
-        block_inclusive_scan(s_cdf, N_inner);
-        if (inner_idx == N_inner - 1) s_cdf[N_inner - 1] = 1.0f;
+        block_inclusive_scan(s_cdf, N_INNER);
+        if (inner_idx == N_INNER - 1) s_cdf[N_INNER - 1] = 1.0f;
         __syncthreads();
         
         /* Generate correlated noise for t+1 */
-        int64_t z_idx_t1 = z_noise_base + (int64_t)(t + 1) * N_inner + inner_idx;
+        int64_t z_idx_t1 = z_noise_base + (int64_t)(t + 1) * N_INNER + inner_idx;
         float z_noise_curr_t1 = __half2float(d_z_noise_curr[z_idx_t1]);
         float z_noise_fresh_t1 = curand_normal(&local_rng);
         float z_noise_prop_t1_raw = cpmmh_rho * z_noise_curr_t1 + scale * z_noise_fresh_t1;
@@ -776,8 +807,8 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
         __syncthreads();
         
         /* Systematic resampling */
-        float u = (s_u0_shared + (float)inner_idx) / (float)N_inner;
-        int lo = 0, hi = N_inner - 1;
+        float u = (s_u0_shared + (float)inner_idx) / (float)N_INNER;
+        int lo = 0, hi = N_INNER - 1;
         while (lo < hi) {
             int mid = (lo + hi) / 2;
             if (s_cdf[mid] < u) lo = mid + 1;
@@ -787,17 +818,17 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
         z_tilde = s_z[lo];
         mu_h = s_mu[lo];
         var_h = s_var[lo];
-        log_w = -__logf((float)N_inner);
+        log_w = -__logf((float)N_INNER);
         __syncthreads();
         
-        /* CPMMH bucket sort */
+        /* CPMMH CUB sort (deterministic) */
         if ((t % SORT_EVERY_K) == 0) {
             s_z[inner_idx] = z_tilde;
             s_mu[inner_idx] = mu_h;
             s_var[inner_idx] = var_h;
             __syncthreads();
             
-            cpmmh_bucket_sort(s_z, s_mu, s_var, s_bin_count, s_bin_offset, N_inner);
+            cpmmh_cub_sort<N_INNER>(s_z, s_mu, s_var, s_idx, s_cub_temp);
             
             z_tilde = s_z[inner_idx];
             mu_h = s_mu[inner_idx];
@@ -837,7 +868,7 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
         __syncthreads();
         sum_w = s_sum_w;
         
-        float ll_incr = log_max + __logf(fmaxf(sum_w, 1e-30f)) - __logf((float)N_inner);
+        float ll_incr = log_max + __logf(fmaxf(sum_w, 1e-30f)) - __logf((float)N_INNER);
         ll_accum += ll_incr;
         
         z_tilde = z_tilde_new;
@@ -899,6 +930,35 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
     }
     
     particles.rng_states[global_idx] = local_rng;
+}
+
+/* Wrapper for API compatibility */
+__global__ void kernel_cpmmh_rejuvenate_fused(
+    ThetaParticlesSoA particles,
+    ThetaParticlesSoA particles_scratch,
+    const float* y_history,
+    half* d_z_noise_curr,
+    half* d_z_noise_other,
+    half* d_u0_noise_curr,
+    half* d_u0_noise_other,
+    int t_current,
+    int N_theta, int N_inner,
+    int noise_capacity,
+    float cpmmh_rho,
+    int* d_accepts,
+    int* d_swap_flags,
+    unsigned long long seed,
+    int move_id,
+    int block_id
+) {
+    /* Wrapper exists for API compatibility; host should use template version */
+    (void)particles; (void)particles_scratch; (void)y_history;
+    (void)d_z_noise_curr; (void)d_z_noise_other;
+    (void)d_u0_noise_curr; (void)d_u0_noise_other;
+    (void)t_current; (void)N_theta; (void)N_inner;
+    (void)noise_capacity; (void)cpmmh_rho;
+    (void)d_accepts; (void)d_swap_flags;
+    (void)seed; (void)move_id; (void)block_id;
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
@@ -1220,16 +1280,26 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
         smc2_cuda_set_noise_capacity(state, state->noise_capacity * 2);
     }
     
-    size_t shared_size = rbpf_shared_mem_size(state->N_inner);
+    /* Dispatch based on N_inner - CUB requires compile-time block size */
+    #define DISPATCH_RBPF_STEP(N) \
+        kernel_rbpf_step_impl<N><<<state->N_theta, N, rbpf_shared_mem_size_cub<N>()>>>( \
+            state->d_particles, y_obs, \
+            state->N_theta, \
+            state->d_z_noise[state->noise_buf], \
+            state->d_u0_noise[state->noise_buf], \
+            state->t_current, state->noise_capacity)
     
-    /* Forward step */
-    kernel_rbpf_step<<<state->N_theta, state->N_inner, shared_size>>>(
-        state->d_particles, y_obs,
-        state->N_theta, state->N_inner,
-        state->d_z_noise[state->noise_buf],
-        state->d_u0_noise[state->noise_buf],
-        state->t_current, state->noise_capacity
-    );
+    switch (state->N_inner) {
+        case 64:  DISPATCH_RBPF_STEP(64);  break;
+        case 128: DISPATCH_RBPF_STEP(128); break;
+        case 256: DISPATCH_RBPF_STEP(256); break;
+        case 512: DISPATCH_RBPF_STEP(512); break;
+        default:
+            fprintf(stderr, "Unsupported N_inner=%d. Must be 64, 128, 256, or 512.\n", state->N_inner);
+            exit(EXIT_FAILURE);
+    }
+    #undef DISPATCH_RBPF_STEP
+    
     CUDA_CHECK(cudaDeviceSynchronize());
     
     kernel_compute_outer_ess<<<1, state->N_theta, 32 * sizeof(float)>>>(
@@ -1275,8 +1345,17 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
         state->d_particles = state->d_particles_temp;
         state->d_particles_temp = tmp;
         
-        /* CPMMH rejuvenation */
-        size_t cpmmh_shared = cpmmh_shared_mem_size(state->N_inner);
+        /* CPMMH rejuvenation - dispatch based on N_inner */
+        #define DISPATCH_CPMMH(N) \
+            kernel_cpmmh_rejuvenate_fused_impl<N><<<state->N_theta, N, cpmmh_shared_mem_size_cub<N>()>>>( \
+                state->d_particles, state->d_particles_temp, \
+                state->d_y_history, \
+                curr_noise, other_noise, curr_u0, other_u0, \
+                state->t_current, \
+                state->N_theta, \
+                state->noise_capacity, state->cpmmh_rho, \
+                state->d_accepts, state->d_swap_flags, \
+                state->user_seed, state->n_rejuv_total / state->N_theta, k % 3)
         
         for (int k = 0; k < state->K_rejuv; k++) {
             int h_accepts = 0;
@@ -1287,16 +1366,15 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
             half* curr_u0 = state->d_u0_noise[state->noise_buf];
             half* other_u0 = state->d_u0_noise[1 - state->noise_buf];
             
-            kernel_cpmmh_rejuvenate_fused<<<state->N_theta, state->N_inner, cpmmh_shared>>>(
-                state->d_particles, state->d_particles_temp,
-                state->d_y_history,
-                curr_noise, other_noise, curr_u0, other_u0,
-                state->t_current,
-                state->N_theta, state->N_inner,
-                state->noise_capacity, state->cpmmh_rho,
-                state->d_accepts, state->d_swap_flags,
-                state->user_seed, state->n_rejuv_total / state->N_theta, k % 3
-            );
+            switch (state->N_inner) {
+                case 64:  DISPATCH_CPMMH(64);  break;
+                case 128: DISPATCH_CPMMH(128); break;
+                case 256: DISPATCH_CPMMH(256); break;
+                case 512: DISPATCH_CPMMH(512); break;
+                default:
+                    fprintf(stderr, "Unsupported N_inner=%d\n", state->N_inner);
+                    exit(EXIT_FAILURE);
+            }
             CUDA_CHECK(cudaDeviceSynchronize());
             
             kernel_commit_accepted_noise<<<state->N_theta, state->N_inner>>>(
@@ -1311,6 +1389,7 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
             state->n_rejuv_accepts += h_accepts;
             state->n_rejuv_total += state->N_theta;
         }
+        #undef DISPATCH_CPMMH
         
         kernel_compute_outer_ess<<<1, state->N_theta, 32 * sizeof(float)>>>(
             state->d_particles, state->d_ess, state->N_theta
