@@ -20,26 +20,6 @@
 #define CUDA_WARP_SIZE    32
 #define OCSN_K            10
 
-/* PMMH Proposal Strategy (compile-time)
- * 
- * SMC2_BLOCKED_PMMH=0: Joint 8-parameter proposal (default)
- *   - 1 replay per rejuvenation
- *   - Lower acceptance (~10-20% for 8D)
- * 
- * SMC2_BLOCKED_PMMH=1: Blocked proposals
- *   - Block 1: (ρ, σ_z)                    — dynamics
- *   - Block 2: (μ_base, μ_scale, μ_rate)   — mean curve
- *   - Block 3: (σ_base, σ_scale, σ_rate)   — vol curve
- *   - 3 replays per rejuvenation
- *   - Higher acceptance per block (~60-70%)
- *   - Better mixing for strongly correlated posteriors
- * 
- * Build: nvcc -DSMC2_BLOCKED_PMMH=1 ... 
- */
-#ifndef SMC2_BLOCKED_PMMH
-#define SMC2_BLOCKED_PMMH 0
-#endif
-
 /* OCSN 10-component Gaussian mixture approximation to log χ²(1)
  * 
  * Source: Omori, Chib, Shephard & Nakajima (2007), Table 1

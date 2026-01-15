@@ -218,7 +218,7 @@ void test_parameter_learning(void) {
     
     /* Generate data */
     seed_host_rng(42);  /* Reproducible */
-    int T = 500;
+    int T = 2000;
     float* y = (float*)malloc(T * sizeof(float));
     float* h_true = (float*)malloc(T * sizeof(float));
     
