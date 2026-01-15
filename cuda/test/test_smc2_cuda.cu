@@ -251,13 +251,15 @@ void test_parameter_learning(void) {
     printf("  True h: mean=%.3f, std=%.3f\n", h_mean, h_std);
     
     /* Initialize SMC² */
-    SMC2StateCUDA* state = smc2_cuda_alloc(256, 256);
+    SMC2StateCUDA* state = smc2_cuda_alloc(128, 128);
     
     /* Set reproducible seed */
     smc2_cuda_set_seed(state, 12345);
     
     /* Pre-allocate noise capacity */
     smc2_cuda_set_noise_capacity(state, T + 128);
+
+    smc2_cuda_set_fixed_lag(state, 100); 
     
     smc2_cuda_init_from_prior(state);
     
@@ -353,6 +355,119 @@ void test_parameter_learning(void) {
     free(y);
     free(h_true);
     smc2_cuda_free(state);
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
+ * Test: Fixed-Lag PMMH for Long Sequences
+ * 
+ * Compares full-history replay (L=0) vs fixed-lag (L=100) at T=2000.
+ * Expected: Fixed-lag should be faster and maintain accuracy.
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+void test_fixed_lag(void) {
+    printf("\n═══════════════════════════════════════════════════════════════\n");
+    printf("Test: Fixed-Lag PMMH - Accuracy at Large T\n");
+    printf("═══════════════════════════════════════════════════════════════\n");
+    printf("\nGoal: Show that fixed-lag maintains accuracy at large T where\n");
+    printf("      full-history PMMH degrades due to O(T) variance growth.\n\n");
+    
+    /* True parameters */
+    float true_rho = 0.95f;
+    float true_sigma_z = 0.15f;
+    float true_mu_base = -1.0f;
+    float true_mu_scale = 0.5f;
+    float true_mu_rate = 1.0f;
+    float true_sigma_base = 0.15f;
+    float true_sigma_scale = 0.10f;
+    float true_sigma_rate = 1.0f;
+    float theta_base = 0.02f;
+    float theta_scale = 0.08f;
+    float theta_rate = 1.5f;
+    
+    /* Test at multiple T values to show variance growth effect */
+    int T_values[] = {1000, 2000, 5000};
+    int n_T = sizeof(T_values) / sizeof(T_values[0]);
+    
+    for (int ti = 0; ti < n_T; ti++) {
+        int T = T_values[ti];
+        
+        printf("─────────────────────────────────────────────────────────────────────────\n");
+        printf("T = %d\n", T);
+        printf("─────────────────────────────────────────────────────────────────────────\n");
+        
+        seed_host_rng(42);
+        float* y = (float*)malloc(T * sizeof(float));
+        
+        generate_sv_data(y, NULL, NULL, T,
+                         true_rho, true_sigma_z,
+                         true_mu_base, true_mu_scale, true_mu_rate,
+                         true_sigma_base, true_sigma_scale, true_sigma_rate,
+                         theta_base, theta_scale, theta_rate);
+        
+        printf("  %-6s  %8s  %10s  %10s  %8s  %8s\n", 
+               "Lag", "Time(ms)", "rho", "sigma_z", "Accept%", "Resamps");
+        
+        /* Test L=0 (full history) and L=100 (fixed-lag) */
+        int lag_values[] = {0, 100};
+        int n_lags = 2;
+        
+        for (int i = 0; i < n_lags; i++) {
+            int L = lag_values[i];
+            
+            SMC2StateCUDA* state = smc2_cuda_alloc(256, 256);
+            smc2_cuda_set_seed(state, 12345);
+            smc2_cuda_set_noise_capacity(state, T + 128);
+            smc2_cuda_set_fixed_lag(state, L);
+            smc2_cuda_init_from_prior(state);
+            
+            cudaEvent_t start, stop;
+            cudaEventCreate(&start);
+            cudaEventCreate(&stop);
+            
+            cudaEventRecord(start);
+            for (int t = 0; t < T; t++) {
+                smc2_cuda_update(state, y[t]);
+            }
+            cudaEventRecord(stop);
+            cudaEventSynchronize(stop);
+            
+            float ms;
+            cudaEventElapsedTime(&ms, start, stop);
+            
+            float theta_mean[8], theta_std[8];
+            smc2_cuda_get_theta_mean(state, theta_mean);
+            smc2_cuda_get_theta_std(state, theta_std);
+            
+            float accept_pct = state->n_rejuv_total > 0 ? 
+                100.0f * state->n_rejuv_accepts / state->n_rejuv_total : 0.0f;
+            
+            float rho_err = fabsf(theta_mean[0] - true_rho);
+            float rho_z = rho_err / fmaxf(theta_std[0], 1e-6f);
+            float sigma_z_err = fabsf(theta_mean[1] - true_sigma_z);
+            float sigma_z_z = sigma_z_err / fmaxf(theta_std[1], 1e-6f);
+            
+            const char* status = (rho_z < 2.0f && sigma_z_z < 2.0f) ? "OK" : "DEGRADED";
+            
+            printf("  L=%3d   %8.1f  %5.4f±%4.3f  %5.4f±%4.3f  %7.1f%%  %5d  [%s]\n",
+                   L, ms, 
+                   theta_mean[0], theta_std[0],
+                   theta_mean[1], theta_std[1],
+                   accept_pct, state->n_resamples, status);
+            
+            cudaEventDestroy(start);
+            cudaEventDestroy(stop);
+            smc2_cuda_free(state);
+        }
+        
+        free(y);
+        printf("\n");
+    }
+    
+    printf("─────────────────────────────────────────────────────────────────────────\n");
+    printf("Expected: At small T, both L=0 and L=100 work.\n");
+    printf("          At large T (5000+), L=0 may show degraded acceptance/accuracy\n");
+    printf("          while L=100 remains stable.\n");
+    printf("─────────────────────────────────────────────────────────────────────────\n");
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -472,8 +587,10 @@ int main(int argc, char** argv) {
             test_throughput();
         } else if (strcmp(argv[1], "prior") == 0) {
             test_prior_data_agreement();
+        } else if (strcmp(argv[1], "fixedlag") == 0) {
+            test_fixed_lag();
         } else {
-            printf("Usage: %s [basic|learn|throughput|prior]\n", argv[0]);
+            printf("Usage: %s [basic|learn|throughput|prior|fixedlag]\n", argv[0]);
             return 1;
         }
     } else {
@@ -481,6 +598,7 @@ int main(int argc, char** argv) {
         test_basic();
         test_prior_data_agreement();
         test_parameter_learning();
+        test_fixed_lag();
         test_throughput();
     }
     

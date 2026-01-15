@@ -609,6 +609,44 @@ __global__ void kernel_copy_noise_arrays(
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
+ * KERNEL: Copy Checkpoint Arrays (after outer resampling)
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+__global__ void kernel_copy_checkpoint(
+    const float* src_z,
+    const float* src_mu_h,
+    const float* src_var_h,
+    const float* src_log_w,
+    const float* src_ll,
+    float* dst_z,
+    float* dst_mu_h,
+    float* dst_var_h,
+    float* dst_log_w,
+    float* dst_ll,
+    const int* d_ancestors,
+    int N_theta, int N_inner
+) {
+    int theta_idx = blockIdx.x;
+    int inner_idx = threadIdx.x;
+    
+    if (theta_idx >= N_theta || inner_idx >= N_inner) return;
+    
+    int ancestor = d_ancestors[theta_idx];
+    
+    int src_global = ancestor * N_inner + inner_idx;
+    int dst_global = theta_idx * N_inner + inner_idx;
+    
+    dst_z[dst_global] = src_z[src_global];
+    dst_mu_h[dst_global] = src_mu_h[src_global];
+    dst_var_h[dst_global] = src_var_h[src_global];
+    dst_log_w[dst_global] = src_log_w[src_global];
+    
+    if (inner_idx == 0) {
+        dst_ll[theta_idx] = src_ll[ancestor];
+    }
+}
+
+/*═══════════════════════════════════════════════════════════════════════════════
  * KERNEL: CPMMH Fused Rejuvenation
  * 
  * The big one. See header for algorithm documentation.
@@ -635,7 +673,14 @@ void kernel_cpmmh_rejuvenate_fused_impl(
     int* d_swap_flags,
     unsigned long long seed,
     int move_id,
-    int block_id
+    int block_id,
+    /* Fixed-lag parameters */
+    int t_checkpoint,
+    const float* d_checkpoint_z,
+    const float* d_checkpoint_mu_h,
+    const float* d_checkpoint_var_h,
+    const float* d_checkpoint_log_w,
+    const float* d_checkpoint_ll
 ) {
     static_assert(N_INNER <= 1024, "N_INNER must be <= 1024");
     
@@ -718,7 +763,13 @@ void kernel_cpmmh_rejuvenate_fused_impl(
     float scale = sqrtf(1.0f - cpmmh_rho * cpmmh_rho);
     
     /*─────────────────────────────────────────────────────────────────────────
-     * FULL-HISTORY REPLAY with correlated noise
+     * INITIALIZATION
+     * 
+     * Full history (t_checkpoint < 0): Start from t=0, replay everything
+     * Fixed-lag (t_checkpoint >= 0): Load checkpoint state, replay L steps
+     * 
+     * For fixed-lag, we load θ_curr's checkpoint state and run with θ_prop.
+     * This creates small bias that decays as exp(-L/τ), but enables O(L) replay.
      *─────────────────────────────────────────────────────────────────────────*/
     
     float rho = s_rho_prop;
@@ -730,34 +781,53 @@ void kernel_cpmmh_rejuvenate_fused_impl(
     float sigma_scale = s_sigma_scale_prop;
     float sigma_rate = s_sigma_rate_prop;
     
-    /* Initialize from stationary */
-    float one_minus_rho_sq = fmaxf(1.0f - rho * rho, 1e-6f);
-    float z_tilde_stat_std = sigma_z / sqrtf(one_minus_rho_sq);
-    
-    /* t=0 noise correlation */
-    float z_noise_curr_0 = __half2float(d_z_noise_curr[z_noise_base + inner_idx]);
-    float z_noise_fresh_0 = curand_normal(&local_rng);
-    float z_noise_prop_0_raw = cpmmh_rho * z_noise_curr_0 + scale * z_noise_fresh_0;
-    half h_prop_0 = __float2half(z_noise_prop_0_raw);
-    d_z_noise_other[z_noise_base + inner_idx] = h_prop_0;
-    float z_noise_prop_0 = __half2float(h_prop_0);
-    
-    float z_tilde = z_tilde_stat_std * z_noise_prop_0;
-    float z = z_tilde_to_z(z_tilde);
-    
-    float theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
-    float mu_z_val = eval_curve(mu_base, mu_scale, mu_rate, z);
-    float sigma_h = eval_curve(sigma_base, sigma_scale, sigma_rate, z);
-    float phi = 1.0f - theta_z;
-    float h_stat_var = (sigma_h * sigma_h) / fmaxf(1.0f - phi * phi, 1e-6f);
-    
-    float mu_h = mu_z_val;
-    float var_h = h_stat_var;
-    float log_w = -__logf((float)N_INNER);
+    float z_tilde, mu_h, var_h, log_w;
     float ll_accum = 0.0f;
+    int t_start;
     
-    /* Process all observations */
-    for (int t = 0; t <= t_current; t++) {
+    if (t_checkpoint >= 0 && d_checkpoint_z != nullptr) {
+        /* Fixed-lag: Load checkpoint state (saved at t_checkpoint)
+         * This state was computed under θ_curr, but we run with θ_prop.
+         * The bias decays as exp(-L/τ) where τ ≈ 14 for ρ=0.95.
+         * 
+         * Note: We don't copy noise for 0 to t_start because:
+         * - Rejected: other buffer is discarded anyway
+         * - Accepted: kernel_commit_accepted_noise only copies t_start onwards,
+         *   preserving the old noise in indices 0 to t_start-1
+         */
+        z_tilde = d_checkpoint_z[global_idx];
+        mu_h = d_checkpoint_mu_h[global_idx];
+        var_h = d_checkpoint_var_h[global_idx];
+        log_w = d_checkpoint_log_w[global_idx];
+        t_start = t_checkpoint + 1;
+    } else {
+        /* Full history: Initialize from θ_prop's stationary */
+        float one_minus_rho_sq = fmaxf(1.0f - rho * rho, 1e-6f);
+        float z_tilde_stat_std = sigma_z / sqrtf(one_minus_rho_sq);
+        
+        /* Correlate t=0 noise */
+        float z_noise_curr_0 = __half2float(d_z_noise_curr[z_noise_base + inner_idx]);
+        float z_noise_fresh_0 = curand_normal(&local_rng);
+        float z_noise_prop_0 = cpmmh_rho * z_noise_curr_0 + scale * z_noise_fresh_0;
+        d_z_noise_other[z_noise_base + inner_idx] = __float2half(z_noise_prop_0);
+        
+        z_tilde = z_tilde_stat_std * z_noise_prop_0;
+        float z_init = z_tilde_to_z(z_tilde);
+        
+        float theta_z_init = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z_init);
+        float mu_z_init = eval_curve(mu_base, mu_scale, mu_rate, z_init);
+        float sigma_h_init = eval_curve(sigma_base, sigma_scale, sigma_rate, z_init);
+        float phi_init = 1.0f - theta_z_init;
+        float h_stat_var = (sigma_h_init * sigma_h_init) / fmaxf(1.0f - phi_init * phi_init, 1e-6f);
+        
+        mu_h = mu_z_init;
+        var_h = h_stat_var;
+        log_w = -__logf((float)N_INNER);
+        t_start = 0;
+    }
+    
+    /* Process observations from t_start to t_current */
+    for (int t = t_start; t <= t_current; t++) {
         float y_obs = y_history[t];
         
         /* Normalize weights */
@@ -838,13 +908,13 @@ void kernel_cpmmh_rejuvenate_fused_impl(
         
         /* Propagate */
         float z_tilde_new = rho * z_tilde + sigma_z * z_noise_prop_t1;
-        z = z_tilde_to_z(z_tilde_new);
+        float z = z_tilde_to_z(z_tilde_new);
         
         /* Kalman predict */
-        theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
-        mu_z_val = eval_curve(mu_base, mu_scale, mu_rate, z);
-        sigma_h = eval_curve(sigma_base, sigma_scale, sigma_rate, z);
-        phi = 1.0f - theta_z;
+        float theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
+        float mu_z_val = eval_curve(mu_base, mu_scale, mu_rate, z);
+        float sigma_h = eval_curve(sigma_base, sigma_scale, sigma_rate, z);
+        float phi = 1.0f - theta_z;
         
         float mu_pred = phi * mu_h + theta_z * mu_z_val;
         float var_pred = phi * phi * var_h + sigma_h * sigma_h;
@@ -888,17 +958,37 @@ void kernel_cpmmh_rejuvenate_fused_impl(
     particles_scratch.inner_var_h[global_idx] = var_h;
     particles_scratch.inner_log_w[global_idx] = log_w;
     
+    __shared__ float s_ll_base;
+    
     if (inner_idx == 0) {
-        s_ll_prop = ll_accum;
+        /* For fixed-lag, we compare WINDOW likelihoods only:
+         * - ll_window_prop = ll_accum (computed above from t_start to T)
+         * - ll_window_curr = s_ll_curr - checkpoint_ll
+         * 
+         * The base likelihood (0 to t_start) cancels in the ratio.
+         */
+        float ll_base = (t_checkpoint >= 0 && d_checkpoint_ll != nullptr) 
+                        ? d_checkpoint_ll[theta_idx] : 0.0f;
+        s_ll_base = ll_base;
+        s_ll_prop = ll_base + ll_accum;  /* Total: base + window */
         s_ess_prop = ess;
     }
     __syncthreads();
     
     /*─────────────────────────────────────────────────────────────────────────
      * MH ACCEPT/REJECT
+     * 
+     * For fixed-lag: compare window likelihoods (base cancels)
+     *   log_alpha = (ll_window_prop + lp_prop) - (ll_window_curr + lp_curr)
+     *   where ll_window_curr = s_ll_curr - s_ll_base
      *─────────────────────────────────────────────────────────────────────────*/
     if (inner_idx == 0) {
-        float log_alpha = (s_ll_prop + s_lp_prop) - (s_ll_curr + s_lp_curr);
+        /* For fixed-lag: subtract base from current to get window likelihood
+         * For full history (t_checkpoint < 0): s_ll_base = 0, so no change */
+        float ll_curr_effective = s_ll_curr - s_ll_base;
+        float ll_prop_effective = ll_accum;  /* Just the window part */
+        
+        float log_alpha = (ll_prop_effective + s_lp_prop) - (ll_curr_effective + s_lp_curr);
         
         float u = curand_uniform(&local_rng);
         s_accept = (__logf(u) < log_alpha) ? 1 : 0;
@@ -912,7 +1002,7 @@ void kernel_cpmmh_rejuvenate_fused_impl(
             particles.sigma_base[theta_idx] = s_sigma_base_prop;
             particles.sigma_scale[theta_idx] = s_sigma_scale_prop;
             particles.sigma_rate[theta_idx] = s_sigma_rate_prop;
-            particles.log_likelihood[theta_idx] = s_ll_prop;
+            particles.log_likelihood[theta_idx] = s_ll_prop;  /* Store total for next time */
             particles.ess_inner[theta_idx] = s_ess_prop;
             atomicAdd(d_accepts, 1);
         }
@@ -949,7 +1039,13 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
     int* d_swap_flags,
     unsigned long long seed,
     int move_id,
-    int block_id
+    int block_id,
+    int t_checkpoint,
+    const float* d_checkpoint_z,
+    const float* d_checkpoint_mu_h,
+    const float* d_checkpoint_var_h,
+    const float* d_checkpoint_log_w,
+    const float* d_checkpoint_ll
 ) {
     /* Wrapper exists for API compatibility; host should use template version */
     (void)particles; (void)particles_scratch; (void)y_history;
@@ -959,6 +1055,8 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
     (void)noise_capacity; (void)cpmmh_rho;
     (void)d_accepts; (void)d_swap_flags;
     (void)seed; (void)move_id; (void)block_id;
+    (void)t_checkpoint; (void)d_checkpoint_z; (void)d_checkpoint_mu_h;
+    (void)d_checkpoint_var_h; (void)d_checkpoint_log_w; (void)d_checkpoint_ll;
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
@@ -972,7 +1070,8 @@ __global__ void kernel_commit_accepted_noise(
     half* d_u0_noise_1,
     const int* d_swap_flags,
     int N_theta, int N_inner,
-    int t_current, int noise_capacity
+    int t_current, int noise_capacity,
+    int t_start  /* For fixed-lag: only commit from t_start onwards */
 ) {
     int theta_idx = blockIdx.x;
     int inner_idx = threadIdx.x;
@@ -982,16 +1081,48 @@ __global__ void kernel_commit_accepted_noise(
     
     int64_t z_base = (int64_t)theta_idx * N_inner * (noise_capacity + 1);
     
-    for (int t = 0; t <= t_current + 1; t++) {
+    /* Only copy from t_start to t_current+1 (window that was modified) */
+    for (int t = t_start; t <= t_current + 1; t++) {
         int64_t idx = z_base + t * N_inner + inner_idx;
         d_z_noise_0[idx] = d_z_noise_1[idx];
     }
     
     if (inner_idx == 0) {
         int64_t u0_base = (int64_t)theta_idx * (noise_capacity + 1);
-        for (int t = 0; t <= t_current + 1; t++) {
+        for (int t = t_start; t <= t_current + 1; t++) {
             d_u0_noise_0[u0_base + t] = d_u0_noise_1[u0_base + t];
         }
+    }
+}
+
+/*═══════════════════════════════════════════════════════════════════════════════
+ * KERNEL: Save Checkpoint for Fixed-Lag PMMH
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+__global__ void kernel_save_checkpoint(
+    const ThetaParticlesSoA particles,
+    float* d_checkpoint_z,
+    float* d_checkpoint_mu_h,
+    float* d_checkpoint_var_h,
+    float* d_checkpoint_log_w,
+    float* d_checkpoint_ll,
+    int N_theta, int N_inner
+) {
+    int theta_idx = blockIdx.x;
+    int inner_idx = threadIdx.x;
+    int global_idx = theta_idx * N_inner + inner_idx;
+    
+    if (theta_idx >= N_theta || inner_idx >= N_inner) return;
+    
+    /* Copy inner particle state */
+    d_checkpoint_z[global_idx] = particles.inner_z[global_idx];
+    d_checkpoint_mu_h[global_idx] = particles.inner_mu_h[global_idx];
+    d_checkpoint_var_h[global_idx] = particles.inner_var_h[global_idx];
+    d_checkpoint_log_w[global_idx] = particles.inner_log_w[global_idx];
+    
+    /* Thread 0 copies log-likelihood */
+    if (inner_idx == 0) {
+        d_checkpoint_ll[theta_idx] = particles.log_likelihood[theta_idx];
     }
 }
 
@@ -1130,6 +1261,15 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     state->proposal_std[6] = 0.02f;
     state->proposal_std[7] = 0.15f;
     
+    /* Fixed-lag checkpoint (disabled by default, L=0 means full history) */
+    state->fixed_lag_L = 0;
+    state->t_checkpoint = -1;
+    CUDA_CHECK(cudaMalloc(&state->d_checkpoint_z, N_total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&state->d_checkpoint_mu_h, N_total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&state->d_checkpoint_var_h, N_total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&state->d_checkpoint_log_w, N_total * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&state->d_checkpoint_ll, N_theta * sizeof(float)));
+    
     return state;
 }
 
@@ -1186,6 +1326,13 @@ void smc2_cuda_free(SMC2StateCUDA* state) {
     cudaFree(state->d_u0_noise[0]);
     cudaFree(state->d_u0_noise[1]);
     
+    /* Free fixed-lag checkpoint */
+    cudaFree(state->d_checkpoint_z);
+    cudaFree(state->d_checkpoint_mu_h);
+    cudaFree(state->d_checkpoint_var_h);
+    cudaFree(state->d_checkpoint_log_w);
+    cudaFree(state->d_checkpoint_ll);
+    
     free(state);
 }
 
@@ -1230,6 +1377,19 @@ void smc2_cuda_set_noise_capacity(SMC2StateCUDA* state, int capacity) {
     state->d_u0_noise[1] = new_u0_1;
     state->noise_buf = 0;
     state->noise_capacity = capacity;
+}
+
+void smc2_cuda_set_fixed_lag(SMC2StateCUDA* state, int L) {
+    /* 
+     * Set fixed-lag window size for PMMH rejuvenation.
+     * 
+     * L = 0:   Full history replay (default, exact but O(T) variance)
+     * L > 0:   Fixed-lag with window size L (bounded O(L) variance)
+     * 
+     * Recommended: L = 100-200 for ρ ≈ 0.95 (about 7 half-lives)
+     */
+    state->fixed_lag_L = L;
+    state->t_checkpoint = -1;  /* Reset checkpoint */
 }
 
 void smc2_cuda_init_from_prior(SMC2StateCUDA* state) {
@@ -1345,7 +1505,65 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
         state->d_particles = state->d_particles_temp;
         state->d_particles_temp = tmp;
         
+        /* Copy checkpoint arrays according to ancestors (if fixed-lag enabled) */
+        if (state->fixed_lag_L > 0 && state->t_checkpoint >= 0) {
+            /* Use particles_temp inner arrays as scratch */
+            kernel_copy_checkpoint<<<state->N_theta, state->N_inner>>>(
+                state->d_checkpoint_z,
+                state->d_checkpoint_mu_h,
+                state->d_checkpoint_var_h,
+                state->d_checkpoint_log_w,
+                state->d_checkpoint_ll,
+                state->d_particles_temp.inner_z,
+                state->d_particles_temp.inner_mu_h,
+                state->d_particles_temp.inner_var_h,
+                state->d_particles_temp.inner_log_w,
+                state->d_particles_temp.log_likelihood,
+                state->d_ancestors,
+                state->N_theta, state->N_inner
+            );
+            CUDA_CHECK(cudaDeviceSynchronize());
+            
+            /* Copy back from scratch to checkpoint */
+            int N_total = state->N_theta * state->N_inner;
+            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_z, state->d_particles_temp.inner_z,
+                                  N_total * sizeof(float), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_mu_h, state->d_particles_temp.inner_mu_h,
+                                  N_total * sizeof(float), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_var_h, state->d_particles_temp.inner_var_h,
+                                  N_total * sizeof(float), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_log_w, state->d_particles_temp.inner_log_w,
+                                  N_total * sizeof(float), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(state->d_checkpoint_ll, state->d_particles_temp.log_likelihood,
+                                  state->N_theta * sizeof(float), cudaMemcpyDeviceToDevice));
+        }
+        
         /* CPMMH rejuvenation - dispatch based on N_inner */
+        /* Determine if we should use fixed-lag */
+        int t_checkpoint_use = -1;
+        const float* cp_z = nullptr;
+        const float* cp_mu = nullptr;
+        const float* cp_var = nullptr;
+        const float* cp_logw = nullptr;
+        const float* cp_ll = nullptr;
+        
+        if (state->fixed_lag_L > 0 && state->t_checkpoint >= 0) {
+            /* Compute how many steps we'd replay with this checkpoint */
+            int steps_to_replay = state->t_current - state->t_checkpoint;
+            
+            /* Only use checkpoint if:
+             * 1. We have at least 1 step to replay (steps_to_replay > 0)
+             * 2. Checkpoint is recent enough (within 2L window) */
+            if (steps_to_replay > 0 && steps_to_replay <= 2 * state->fixed_lag_L) {
+                t_checkpoint_use = state->t_checkpoint;
+                cp_z = state->d_checkpoint_z;
+                cp_mu = state->d_checkpoint_mu_h;
+                cp_var = state->d_checkpoint_var_h;
+                cp_logw = state->d_checkpoint_log_w;
+                cp_ll = state->d_checkpoint_ll;
+            }
+        }
+        
         #define DISPATCH_CPMMH(N) \
             kernel_cpmmh_rejuvenate_fused_impl<N><<<state->N_theta, N, cpmmh_shared_mem_size<N>()>>>( \
                 state->d_particles, state->d_particles_temp, \
@@ -1355,7 +1573,8 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
                 state->N_theta, \
                 state->noise_capacity, state->cpmmh_rho, \
                 state->d_accepts, state->d_swap_flags, \
-                state->user_seed, state->n_rejuv_total / state->N_theta, k % 3)
+                state->user_seed, state->n_rejuv_total / state->N_theta, k % 3, \
+                t_checkpoint_use, cp_z, cp_mu, cp_var, cp_logw, cp_ll)
         
         for (int k = 0; k < state->K_rejuv; k++) {
             int h_accepts = 0;
@@ -1377,11 +1596,15 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
             }
             CUDA_CHECK(cudaDeviceSynchronize());
             
+            /* Compute t_start for noise commit: only commit the modified window */
+            int t_start_commit = (t_checkpoint_use >= 0) ? (t_checkpoint_use + 1) : 0;
+            
             kernel_commit_accepted_noise<<<state->N_theta, state->N_inner>>>(
                 curr_noise, other_noise, curr_u0, other_u0,
                 state->d_swap_flags,
                 state->N_theta, state->N_inner,
-                state->t_current, state->noise_capacity
+                state->t_current, state->noise_capacity,
+                t_start_commit
             );
             CUDA_CHECK(cudaDeviceSynchronize());
             
@@ -1396,6 +1619,29 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
         );
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaMemcpy(&h_ess, state->d_ess, sizeof(float), cudaMemcpyDeviceToHost));
+    }
+    
+    /* Fixed-lag: save checkpoint AFTER CPMMH to ensure we use the previous checkpoint
+     * during rejuvenation. This way:
+     *   - At t=100: checkpoint saved at t=100 (for use at t=101-199)
+     *   - At t=200: CPMMH uses checkpoint from t=100, THEN saves checkpoint at t=200
+     */
+    if (state->fixed_lag_L > 0) {
+        int t_checkpoint_target = (state->t_current / state->fixed_lag_L) * state->fixed_lag_L;
+        
+        if (t_checkpoint_target > state->t_checkpoint && state->t_current > 0) {
+            kernel_save_checkpoint<<<state->N_theta, state->N_inner>>>(
+                state->d_particles,
+                state->d_checkpoint_z,
+                state->d_checkpoint_mu_h,
+                state->d_checkpoint_var_h,
+                state->d_checkpoint_log_w,
+                state->d_checkpoint_ll,
+                state->N_theta, state->N_inner
+            );
+            CUDA_CHECK(cudaDeviceSynchronize());
+            state->t_checkpoint = t_checkpoint_target;
+        }
     }
     
     return h_ess;

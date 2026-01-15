@@ -286,6 +286,15 @@ struct SMC2StateCUDA {
     float ess_threshold_inner;  /**< (unused currently, always resample) */
     int K_rejuv;                /**< CPMMH moves per outer resample */
     
+    /* ═══ Fixed-Lag PMMH ═══ */
+    int fixed_lag_L;            /**< Window size (0 = full history, default) */
+    int t_checkpoint;           /**< Timestamp of last checkpoint */
+    float* d_checkpoint_z;      /**< Checkpoint: inner_z [N_theta × N_inner] */
+    float* d_checkpoint_mu_h;   /**< Checkpoint: inner_mu_h */
+    float* d_checkpoint_var_h;  /**< Checkpoint: inner_var_h */
+    float* d_checkpoint_log_w;  /**< Checkpoint: inner_log_w */
+    float* d_checkpoint_ll;     /**< Checkpoint: log_likelihood [N_theta] */
+    
     /* ═══ Diagnostics ═══ */
     int n_resamples;
     int n_rejuv_accepts;
@@ -726,6 +735,25 @@ void smc2_cuda_set_seed(SMC2StateCUDA* state, uint64_t seed);
  * Call if you know T will exceed current capacity.
  */
 void smc2_cuda_set_noise_capacity(SMC2StateCUDA* state, int capacity);
+
+/**
+ * @brief Enable fixed-lag PMMH for long sequences
+ * 
+ * @param state  SMC² state
+ * @param L      Window size (0 = full history replay, default)
+ * 
+ * For ρ ≈ 0.95, L = 100-200 is recommended (about 7 half-lives).
+ * 
+ * Benefits:
+ *   - Bounds PMMH variance to O(L) instead of O(T)
+ *   - Enables scaling to T > 2000 without accuracy degradation
+ *   - Rejuvenation runs in O(L) instead of O(T) time
+ * 
+ * Trade-off:
+ *   - Small bias: ignores info beyond lag L (typically ρ^L < 1%)
+ *   - Parameters may "track" slowly-drifting data (feature for finance)
+ */
+void smc2_cuda_set_fixed_lag(SMC2StateCUDA* state, int L);
 
 /**
  * @brief Initialize particles from prior
