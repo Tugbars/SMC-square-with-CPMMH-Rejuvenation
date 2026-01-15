@@ -454,134 +454,13 @@ __device__ __forceinline__ float u0_from_noise(float z_noise) {
 }
 
 /*─────────────────────────────────────────────────────────────────────────────
- * 4.4 CPMMH Sort (CUB BlockRadixSort)
+ * 4.4 CPMMH Sorting
  * 
- * Sorts particles by μ_h after resampling to preserve noise coupling.
- * This is THE key operation that makes CPMMH work.
- * 
- * Why CUB instead of bucket sort:
- *   - Deterministic: stable sort guarantees reproducible ordering
- *   - No atomics: bucket sort with atomicAdd serializes on bin collisions
- *   - Crash-safe: if all particles collapse to one bin (ESS→1), bucket sort
- *     triggers 256 serialized atomics → potential TDR timeout on Windows
- *   - CUB BlockRadixSort is O(N) for fixed-bit keys, same complexity
- * 
- * Implementation notes:
- *   - We sort indices by μ_h, then gather (z, μ, var) using sorted indices
- *   - This avoids CUB's limitation of single key-value pair
- *   - Requires CUB temp storage in shared memory
+ * Deterministic sort of particles by μ_h to preserve noise coupling.
+ * Implementation in smc2_sorting.cuh with build-time backend selection.
  *─────────────────────────────────────────────────────────────────────────────*/
 
-/* CUB include - must be at file scope, not inside function */
-#include <cub/cub.cuh>
-
-/**
- * @brief Deterministic sort of particle state by μ_h using CUB
- * 
- * @tparam BLOCK_SIZE  Number of particles (must match blockDim.x)
- * @param s_z          Shared array: regime z̃ [BLOCK_SIZE]
- * @param s_mu         Shared array: Kalman mean μ_h [BLOCK_SIZE] (sort key)
- * @param s_var        Shared array: Kalman variance [BLOCK_SIZE]
- * @param s_idx        Shared array: scratch for indices [BLOCK_SIZE]
- * @param s_temp       Shared array: CUB temp storage (use cpmmh_sort_temp_size<BLOCK_SIZE>())
- * 
- * After this call, particles are sorted by μ_h (ascending):
- *   s_mu[0] <= s_mu[1] <= ... <= s_mu[BLOCK_SIZE-1]
- * and s_z, s_var are permuted correspondingly.
- */
-template<int BLOCK_SIZE>
-__device__ __forceinline__
-void cpmmh_cub_sort(
-    float* s_z, float* s_mu, float* s_var,
-    int* s_idx,
-    void* s_temp
-) {
-    static_assert(BLOCK_SIZE <= 1024, "BLOCK_SIZE must be <= 1024 for CUB BlockRadixSort");
-    
-    int tid = threadIdx.x;
-    
-    /* CUB requires arrays, not scalars. ITEMS_PER_THREAD = 1 */
-    float keys[1] = { s_mu[tid] };
-    int values[1] = { tid };
-    
-    /* CUB BlockRadixSort type: sorts (key, value) pairs */
-    typedef cub::BlockRadixSort<float, BLOCK_SIZE, 1, int> BlockRadixSortT;
-    
-    /* Sort (key, index) pairs - stable, deterministic */
-    typename BlockRadixSortT::TempStorage& temp_storage = 
-        *reinterpret_cast<typename BlockRadixSortT::TempStorage*>(s_temp);
-    
-    BlockRadixSortT(temp_storage).Sort(keys, values);
-    __syncthreads();
-    
-    /* Write sorted index to shared memory */
-    s_idx[tid] = values[0];
-    __syncthreads();
-    
-    /* Gather: read from original position indicated by sorted index */
-    int src_idx = s_idx[tid];
-    float gathered_z = s_z[src_idx];
-    float gathered_mu = s_mu[src_idx];
-    float gathered_var = s_var[src_idx];
-    __syncthreads();
-    
-    /* Write gathered values to sorted positions */
-    s_z[tid] = gathered_z;
-    s_mu[tid] = gathered_mu;
-    s_var[tid] = gathered_var;
-    __syncthreads();
-}
-
-/**
- * @brief Get CUB temp storage size for cpmmh_cub_sort
- */
-template<int BLOCK_SIZE>
-__host__ __device__ __forceinline__
-constexpr size_t cpmmh_sort_temp_size() {
-    /* CUB BlockRadixSort temp storage - conservative upper bound */
-    return sizeof(typename cub::BlockRadixSort<float, BLOCK_SIZE, 1, int>::TempStorage);
-}
-
-/**
- * @brief Compute shared memory size for RBPF kernels (with CUB sort)
- * 
- * Layout (in bytes):
- *   [0..32*4)              : Warp reduction scratch (32 floats)
- *   [32*4..32*4+N*4)       : s_weights / s_z (reused) (N floats)
- *   [+N*4..+2N*4)          : s_cumsum / s_mu (reused) (N floats)
- *   [+2N*4..+3N*4)         : s_var (N floats)
- *   [+3N*4..+4N*4)         : s_idx (N ints for CUB gather)
- *   [+4N*4..+4N*4+CUB)     : CUB temp storage
- */
-template<int BLOCK_SIZE>
-__host__ __device__ __forceinline__
-constexpr size_t rbpf_shared_mem_size_cub() {
-    size_t base = (32 + 4 * BLOCK_SIZE) * sizeof(float);
-    size_t cub_temp = cpmmh_sort_temp_size<BLOCK_SIZE>();
-    /* Align CUB temp to 16 bytes */
-    return base + ((cub_temp + 15) / 16) * 16;
-}
-
-/**
- * @brief Compute shared memory size for CPMMH rejuvenation (with CUB sort)
- * 
- * Layout (in bytes):
- *   [0..32*4)              : Warp reduction scratch (32 floats)
- *   [32*4..32*4+N*4)       : s_z (N floats)
- *   [+N*4..+2N*4)          : s_mu (N floats)
- *   [+2N*4..+3N*4)         : s_var (N floats)
- *   [+3N*4..+4N*4)         : s_cdf (N floats) - can't reuse during replay
- *   [+4N*4..+5N*4)         : s_idx (N ints for CUB gather)
- *   [+5N*4..+5N*4+CUB)     : CUB temp storage
- */
-template<int BLOCK_SIZE>
-__host__ __device__ __forceinline__
-constexpr size_t cpmmh_shared_mem_size_cub() {
-    size_t base = (32 + 5 * BLOCK_SIZE) * sizeof(float);
-    size_t cub_temp = cpmmh_sort_temp_size<BLOCK_SIZE>();
-    /* Align CUB temp to 16 bytes */
-    return base + ((cub_temp + 15) / 16) * 16;
-}
+#include "smc2_sorting.cuh"
 
 /*═══════════════════════════════════════════════════════════════════════════════
  * SECTION 5: OCSN CONSTANTS (declared extern, defined in .cu)

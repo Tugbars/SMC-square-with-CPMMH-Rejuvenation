@@ -360,7 +360,7 @@ void kernel_rbpf_step_impl(
         __syncthreads();
         
         /*─────────────────────────────────────────────────────────────────────
-         * CPMMH CUB SORT by μ_h (deterministic, crash-safe)
+         * CPMMH Sort by μ_h (deterministic)
          *─────────────────────────────────────────────────────────────────────*/
         if ((t_current % SORT_EVERY_K) == 0) {
             s_z_sort[inner_idx] = z_tilde;
@@ -368,7 +368,7 @@ void kernel_rbpf_step_impl(
             s_var_sort[inner_idx] = var_h;
             __syncthreads();
             
-            cpmmh_cub_sort<N_INNER>(s_z_sort, s_mu_sort, s_var_sort, s_idx, s_cub_temp);
+            cpmmh_sort<N_INNER>(s_z_sort, s_mu_sort, s_var_sort, s_idx, s_cub_temp);
             
             z_tilde = s_z_sort[inner_idx];
             mu_h = s_mu_sort[inner_idx];
@@ -821,14 +821,14 @@ void kernel_cpmmh_rejuvenate_fused_impl(
         log_w = -__logf((float)N_INNER);
         __syncthreads();
         
-        /* CPMMH CUB sort (deterministic) */
+        /* CPMMH sort (deterministic) */
         if ((t % SORT_EVERY_K) == 0) {
             s_z[inner_idx] = z_tilde;
             s_mu[inner_idx] = mu_h;
             s_var[inner_idx] = var_h;
             __syncthreads();
             
-            cpmmh_cub_sort<N_INNER>(s_z, s_mu, s_var, s_idx, s_cub_temp);
+            cpmmh_sort<N_INNER>(s_z, s_mu, s_var, s_idx, s_cub_temp);
             
             z_tilde = s_z[inner_idx];
             mu_h = s_mu[inner_idx];
@@ -1282,7 +1282,7 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
     
     /* Dispatch based on N_inner - CUB requires compile-time block size */
     #define DISPATCH_RBPF_STEP(N) \
-        kernel_rbpf_step_impl<N><<<state->N_theta, N, rbpf_shared_mem_size_cub<N>()>>>( \
+        kernel_rbpf_step_impl<N><<<state->N_theta, N, rbpf_shared_mem_size<N>()>>>( \
             state->d_particles, y_obs, \
             state->N_theta, \
             state->d_z_noise[state->noise_buf], \
@@ -1347,7 +1347,7 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
         
         /* CPMMH rejuvenation - dispatch based on N_inner */
         #define DISPATCH_CPMMH(N) \
-            kernel_cpmmh_rejuvenate_fused_impl<N><<<state->N_theta, N, cpmmh_shared_mem_size_cub<N>()>>>( \
+            kernel_cpmmh_rejuvenate_fused_impl<N><<<state->N_theta, N, cpmmh_shared_mem_size<N>()>>>( \
                 state->d_particles, state->d_particles_temp, \
                 state->d_y_history, \
                 curr_noise, other_noise, curr_u0, other_u0, \

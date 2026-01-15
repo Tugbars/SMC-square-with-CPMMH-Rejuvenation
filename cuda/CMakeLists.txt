@@ -23,6 +23,12 @@ else()
 endif()
 
 # =============================================================================
+# Build Options
+# =============================================================================
+
+option(SMC2_USE_CUB_SORT "Use CUB BlockRadixSort instead of Bitonic (slower but standard)" OFF)
+
+# =============================================================================
 # Find CUDA Toolkit
 # =============================================================================
 
@@ -37,9 +43,9 @@ message(STATUS "[CUDA] Toolkit Version: ${CUDAToolkit_VERSION}")
 
 set(CMAKE_CUDA_ARCHITECTURES 120)
 
-# Aggressive optimization flags
-set(CUDA_COMMON_OPTIONS
-    $<$<COMPILE_LANGUAGE:CUDA>:
+# Optimization flags - only in Release
+set(CUDA_RELEASE_OPTIONS
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:
         -O3
         --use_fast_math
         --fmad=true
@@ -50,6 +56,22 @@ set(CUDA_COMMON_OPTIONS
         -lineinfo
         --expt-relaxed-constexpr
     >
+)
+
+# Debug flags
+set(CUDA_DEBUG_OPTIONS
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Debug>>:
+        -G
+        -g
+        -O0
+        --expt-relaxed-constexpr
+    >
+)
+
+# Combined
+set(CUDA_COMMON_OPTIONS
+    ${CUDA_RELEASE_OPTIONS}
+    ${CUDA_DEBUG_OPTIONS}
 )
 
 # Windows-specific options
@@ -76,6 +98,11 @@ target_include_directories(smc2_rbpf_cuda
 )
 
 target_compile_options(smc2_rbpf_cuda PRIVATE ${CUDA_COMMON_OPTIONS})
+
+# Sort backend selection
+if(SMC2_USE_CUB_SORT)
+    target_compile_definitions(smc2_rbpf_cuda PRIVATE SMC2_USE_CUB_SORT)
+endif()
 
 target_link_libraries(smc2_rbpf_cuda
     PUBLIC
@@ -105,6 +132,11 @@ add_executable(test_smc2_cuda
 
 target_compile_options(test_smc2_cuda PRIVATE ${CUDA_COMMON_OPTIONS})
 
+# Propagate sort backend to test
+if(SMC2_USE_CUB_SORT)
+    target_compile_definitions(test_smc2_cuda PRIVATE SMC2_USE_CUB_SORT)
+endif()
+
 target_link_libraries(test_smc2_cuda 
     PRIVATE 
         smc2_rbpf_cuda
@@ -129,6 +161,12 @@ endif()
 # Summary
 # =============================================================================
 
+if(SMC2_USE_CUB_SORT)
+    set(SORT_BACKEND "CUB BlockRadixSort (FP16 key)")
+else()
+    set(SORT_BACKEND "Bitonic Sort (default)")
+endif()
+
 message(STATUS "")
 message(STATUS "  ┌─────────────────────────────────────────────────────────────┐")
 message(STATUS "  │ SMC² RBPF CUDA                                              │")
@@ -137,5 +175,6 @@ message(STATUS "  │   Library:  smc2_rbpf_cuda                                
 message(STATUS "  │   Test:     test_smc2_cuda                                  │")
 message(STATUS "  │   Target:   sm_120 (RTX 5080 Blackwell)                     │")
 message(STATUS "  │   CUDA:     ${CUDAToolkit_VERSION}")
+message(STATUS "  │   Sort:     ${SORT_BACKEND}")
 message(STATUS "  └─────────────────────────────────────────────────────────────┘")
 message(STATUS "")
