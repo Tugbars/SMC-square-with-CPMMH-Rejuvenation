@@ -503,6 +503,9 @@ void ocsn_kalman_update(
     float* var_post,   /**< [out] Posterior variance */
     float* log_lik     /**< [out] Log marginal likelihood */
 ) {
+    /* Numerical guard: prevent division by zero and log instabilities */
+    float safe_var = fmaxf(var_pred, 1e-6f);
+    
     float log_alpha_tilde[OCSN_K];
     float log_max = -1e30f;
     
@@ -513,10 +516,10 @@ void ocsn_kalman_update(
         float inv_v_k = d_OCSN_INV_VARS[k];
         float log_v_k = d_OCSN_LOG_VARS[k];
         
-        float S = var_pred + v_k;
+        float S = safe_var + v_k;
         float inv_S = 1.0f / S;
         float innov = y - mu_pred - d_OCSN_MEANS[k];
-        float log_S = log_v_k + log1pf(var_pred * inv_v_k);
+        float log_S = log_v_k + log1pf(safe_var * inv_v_k);
         
         float val = d_OCSN_LOG_WEIGHTS[k] - 0.5f * (log_S + innov * innov * inv_S);
         log_alpha_tilde[k] = val;
@@ -539,13 +542,13 @@ void ocsn_kalman_update(
     for (int k = 0; k < OCSN_K; k++) {
         float w = __expf(log_alpha_tilde[k] - log_norm);
         
-        float S = var_pred + d_OCSN_VARS[k];
+        float S = safe_var + d_OCSN_VARS[k];
         float inv_S = 1.0f / S;
         float innov = y - mu_pred - d_OCSN_MEANS[k];
-        float K = var_pred * inv_S;
+        float K = safe_var * inv_S;
         
         float mu_k = mu_pred + K * innov;
-        float var_k = (1.0f - K) * var_pred;
+        float var_k = (1.0f - K) * safe_var;
         
         mu_out += w * mu_k;
         E_h_sq += w * (var_k + mu_k * mu_k);
