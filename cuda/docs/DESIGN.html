@@ -1,0 +1,1692 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SMC² with CPMMH Rejuvenation: Design Document</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #0d1117;
+            --bg-secondary: #161b22;
+            --bg-tertiary: #21262d;
+            --bg-card: #1c2128;
+            --text-primary: #e6edf3;
+            --text-secondary: #8b949e;
+            --text-muted: #6e7681;
+            --accent-blue: #58a6ff;
+            --accent-green: #3fb950;
+            --accent-orange: #d29922;
+            --accent-red: #f85149;
+            --accent-purple: #a371f7;
+            --accent-cyan: #39c5cf;
+            --border-color: #30363d;
+            --code-bg: #0d1117;
+            --diagram-bg: #161b22;
+            --shadow: 0 8px 24px rgba(0,0,0,0.4);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html {
+            scroll-behavior: smooth;
+        }
+
+        body {
+            font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.7;
+            font-size: 16px;
+        }
+
+        /* Header */
+        .header {
+            background: linear-gradient(180deg, var(--bg-secondary) 0%, var(--bg-primary) 100%);
+            border-bottom: 1px solid var(--border-color);
+            padding: 4rem 2rem;
+            text-align: center;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .header::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: 
+                radial-gradient(ellipse at 20% 50%, rgba(88, 166, 255, 0.08) 0%, transparent 50%),
+                radial-gradient(ellipse at 80% 50%, rgba(163, 113, 247, 0.08) 0%, transparent 50%);
+            pointer-events: none;
+        }
+
+        .header h1 {
+            font-family: 'Source Serif 4', Georgia, serif;
+            font-size: clamp(2rem, 5vw, 3.5rem);
+            font-weight: 700;
+            margin-bottom: 1rem;
+            background: linear-gradient(135deg, var(--text-primary) 0%, var(--accent-blue) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            position: relative;
+        }
+
+        .header .subtitle {
+            font-size: 1.25rem;
+            color: var(--text-secondary);
+            max-width: 600px;
+            margin: 0 auto;
+        }
+
+        .header .version {
+            margin-top: 1.5rem;
+            font-size: 0.875rem;
+            color: var(--text-muted);
+        }
+
+        /* Navigation */
+        .nav-container {
+            position: sticky;
+            top: 0;
+            background: rgba(13, 17, 23, 0.95);
+            backdrop-filter: blur(10px);
+            border-bottom: 1px solid var(--border-color);
+            z-index: 100;
+            padding: 0.75rem 2rem;
+        }
+
+        .nav-inner {
+            max-width: 1400px;
+            margin: 0 auto;
+            display: flex;
+            gap: 0.5rem;
+            overflow-x: auto;
+            scrollbar-width: none;
+        }
+
+        .nav-inner::-webkit-scrollbar {
+            display: none;
+        }
+
+        .nav-link {
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 0.8125rem;
+            font-weight: 500;
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            white-space: nowrap;
+            transition: all 0.2s ease;
+        }
+
+        .nav-link:hover {
+            color: var(--text-primary);
+            background: var(--bg-tertiary);
+        }
+
+        /* Main Content */
+        .main {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 3rem 2rem 6rem;
+        }
+
+        /* Sections */
+        section {
+            margin-bottom: 4rem;
+        }
+
+        h2 {
+            font-family: 'Source Serif 4', Georgia, serif;
+            font-size: 2rem;
+            font-weight: 700;
+            color: var(--text-primary);
+            margin-bottom: 1.5rem;
+            padding-bottom: 0.75rem;
+            border-bottom: 2px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        h2 .section-number {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 1rem;
+            font-weight: 600;
+            color: var(--accent-blue);
+            background: rgba(88, 166, 255, 0.1);
+            padding: 0.25rem 0.75rem;
+            border-radius: 4px;
+        }
+
+        h3 {
+            font-family: 'Source Serif 4', Georgia, serif;
+            font-size: 1.375rem;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin: 2.5rem 0 1rem;
+        }
+
+        h4 {
+            font-size: 1.125rem;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin: 2rem 0 0.75rem;
+        }
+
+        p {
+            margin-bottom: 1rem;
+            color: var(--text-secondary);
+        }
+
+        strong {
+            color: var(--text-primary);
+            font-weight: 600;
+        }
+
+        /* Lists */
+        ul, ol {
+            margin-bottom: 1rem;
+            padding-left: 1.5rem;
+            color: var(--text-secondary);
+        }
+
+        li {
+            margin-bottom: 0.5rem;
+        }
+
+        li strong {
+            color: var(--accent-cyan);
+        }
+
+        /* Tables */
+        .table-wrapper {
+            overflow-x: auto;
+            margin: 1.5rem 0;
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.9375rem;
+        }
+
+        th {
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            font-weight: 600;
+            text-align: left;
+            padding: 0.875rem 1rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        td {
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid var(--border-color);
+            color: var(--text-secondary);
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        tr:hover td {
+            background: rgba(88, 166, 255, 0.03);
+        }
+
+        td code {
+            background: var(--bg-tertiary);
+            padding: 0.125rem 0.375rem;
+            border-radius: 4px;
+            font-size: 0.8125rem;
+        }
+
+        /* Code blocks */
+        pre {
+            background: var(--code-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 1.25rem;
+            overflow-x: auto;
+            margin: 1.5rem 0;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8125rem;
+            line-height: 1.6;
+        }
+
+        code {
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--accent-cyan);
+        }
+
+        pre code {
+            color: var(--text-secondary);
+        }
+
+        /* Inline code */
+        p code, li code, td code {
+            background: var(--bg-tertiary);
+            padding: 0.125rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.875em;
+            color: var(--accent-orange);
+        }
+
+        /* Diagrams */
+        .diagram {
+            background: var(--diagram-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin: 2rem 0;
+            overflow-x: auto;
+            position: relative;
+        }
+
+        .diagram::before {
+            content: attr(data-title);
+            position: absolute;
+            top: -0.75rem;
+            left: 1.5rem;
+            background: var(--bg-primary);
+            padding: 0.25rem 0.75rem;
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: var(--accent-purple);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            border-radius: 4px;
+            border: 1px solid var(--border-color);
+        }
+
+        .diagram pre {
+            background: transparent;
+            border: none;
+            padding: 0.5rem;
+            margin: 0;
+            font-size: 0.75rem;
+            line-height: 1.4;
+            color: var(--text-secondary);
+        }
+
+        .diagram .highlight-blue { color: var(--accent-blue); }
+        .diagram .highlight-green { color: var(--accent-green); }
+        .diagram .highlight-orange { color: var(--accent-orange); }
+        .diagram .highlight-purple { color: var(--accent-purple); }
+        .diagram .highlight-red { color: var(--accent-red); }
+        .diagram .highlight-cyan { color: var(--accent-cyan); }
+
+        /* Info boxes */
+        .info-box {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-left: 4px solid var(--accent-blue);
+            border-radius: 8px;
+            padding: 1.25rem 1.5rem;
+            margin: 1.5rem 0;
+        }
+
+        .info-box.warning {
+            border-left-color: var(--accent-orange);
+        }
+
+        .info-box.success {
+            border-left-color: var(--accent-green);
+        }
+
+        .info-box p:last-child {
+            margin-bottom: 0;
+        }
+
+        /* Key insight box */
+        .key-insight {
+            background: linear-gradient(135deg, rgba(88, 166, 255, 0.1) 0%, rgba(163, 113, 247, 0.1) 100%);
+            border: 1px solid rgba(88, 166, 255, 0.3);
+            border-radius: 12px;
+            padding: 2rem;
+            margin: 2rem 0;
+            position: relative;
+        }
+
+        .key-insight::before {
+            content: '💡 KEY INSIGHT';
+            display: block;
+            font-size: 0.75rem;
+            font-weight: 700;
+            color: var(--accent-blue);
+            letter-spacing: 0.1em;
+            margin-bottom: 1rem;
+        }
+
+        .key-insight p {
+            color: var(--text-primary);
+            font-size: 1.0625rem;
+            margin-bottom: 0;
+        }
+
+        /* Formula */
+        .formula {
+            font-family: 'JetBrains Mono', monospace;
+            background: var(--bg-tertiary);
+            padding: 1rem 1.5rem;
+            border-radius: 8px;
+            margin: 1rem 0;
+            text-align: center;
+            font-size: 1rem;
+            color: var(--accent-cyan);
+            border: 1px solid var(--border-color);
+        }
+
+        /* Component badges */
+        .badge {
+            display: inline-block;
+            font-size: 0.75rem;
+            font-weight: 600;
+            padding: 0.25rem 0.625rem;
+            border-radius: 4px;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+        }
+
+        .badge-blue { background: rgba(88, 166, 255, 0.2); color: var(--accent-blue); }
+        .badge-green { background: rgba(63, 185, 80, 0.2); color: var(--accent-green); }
+        .badge-orange { background: rgba(210, 153, 34, 0.2); color: var(--accent-orange); }
+        .badge-purple { background: rgba(163, 113, 247, 0.2); color: var(--accent-purple); }
+
+        /* Algorithm steps */
+        .algorithm-step {
+            display: flex;
+            gap: 1rem;
+            margin: 1rem 0;
+            padding: 1rem;
+            background: var(--bg-card);
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+        }
+
+        .step-number {
+            flex-shrink: 0;
+            width: 2rem;
+            height: 2rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: var(--accent-blue);
+            color: var(--bg-primary);
+            font-weight: 700;
+            font-size: 0.875rem;
+            border-radius: 50%;
+        }
+
+        .step-content h4 {
+            margin: 0 0 0.5rem;
+            font-size: 1rem;
+        }
+
+        .step-content p {
+            margin: 0;
+            font-size: 0.9375rem;
+        }
+
+        /* References */
+        .reference {
+            padding: 0.75rem 1rem;
+            background: var(--bg-card);
+            border-radius: 6px;
+            margin: 0.5rem 0;
+            border-left: 3px solid var(--accent-purple);
+        }
+
+        .reference-number {
+            font-weight: 700;
+            color: var(--accent-purple);
+            margin-right: 0.5rem;
+        }
+
+        .reference-title {
+            color: var(--text-primary);
+            font-weight: 500;
+        }
+
+        .reference-authors {
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+        }
+
+        /* Footer */
+        .footer {
+            border-top: 1px solid var(--border-color);
+            padding: 3rem 2rem;
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 0.875rem;
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .header {
+                padding: 2.5rem 1.5rem;
+            }
+
+            .main {
+                padding: 2rem 1rem;
+            }
+
+            h2 {
+                font-size: 1.5rem;
+            }
+
+            .diagram pre {
+                font-size: 0.625rem;
+            }
+
+            .key-insight {
+                padding: 1.25rem;
+            }
+        }
+
+        /* Animations */
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        section {
+            animation: fadeIn 0.5s ease-out;
+        }
+
+        /* Scroll indicator */
+        .scroll-progress {
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 3px;
+            background: linear-gradient(90deg, var(--accent-blue), var(--accent-purple));
+            z-index: 1000;
+            transition: width 0.1s ease;
+        }
+    </style>
+</head>
+<body>
+    <div class="scroll-progress" id="scrollProgress"></div>
+
+    <header class="header">
+        <h1>SMC² with CPMMH Rejuvenation</h1>
+        <p class="subtitle">A hybrid algorithm for online Bayesian parameter estimation in regime-switching stochastic volatility models</p>
+        <p class="version">Design Document v1.0 · January 2026</p>
+    </header>
+
+    <nav class="nav-container">
+        <div class="nav-inner">
+            <a href="#introduction" class="nav-link">Introduction</a>
+            <a href="#model" class="nav-link">Model</a>
+            <a href="#background" class="nav-link">Background</a>
+            <a href="#hybrid" class="nav-link">Hybrid Algorithm</a>
+            <a href="#sorting" class="nav-link">Sorting Trick</a>
+            <a href="#ocsn" class="nav-link">OCSN Mixture</a>
+            <a href="#z-transform" class="nav-link">Z-Transform</a>
+            <a href="#fixed-lag" class="nav-link">Fixed-Lag</a>
+            <a href="#cuda" class="nav-link">CUDA</a>
+            <a href="#tuning" class="nav-link">Tuning</a>
+            <a href="#api" class="nav-link">API</a>
+            <a href="#references" class="nav-link">References</a>
+        </div>
+    </nav>
+
+    <main class="main">
+        <!-- Section 1: Introduction -->
+        <section id="introduction">
+            <h2><span class="section-number">01</span> Introduction</h2>
+            
+            <h3>1.1 The Problem</h3>
+            <p>We want to perform <strong>online Bayesian parameter estimation</strong> for a regime-switching stochastic volatility model. As financial data streams in tick-by-tick, we need to:</p>
+            <ol>
+                <li><strong>Track the hidden volatility state</strong> h<sub>t</sub> (filtering)</li>
+                <li><strong>Learn the model parameters</strong> θ (inference)</li>
+                <li><strong>Do it fast enough for HFT applications</strong> (&lt;1ms per observation)</li>
+            </ol>
+            
+            <p>This is hard because:</p>
+            <ul>
+                <li>The parameter space is 8-dimensional</li>
+                <li>The likelihood p(y<sub>1:T</sub> | θ) is intractable (no closed form)</li>
+                <li>Standard MCMC is too slow for online use</li>
+                <li>Standard particle filters don't learn parameters</li>
+            </ul>
+
+            <h3>1.2 Our Solution</h3>
+            <p>We present a <strong>hybrid algorithm</strong> that combines:</p>
+
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Component</th>
+                            <th>Source</th>
+                            <th>What It Provides</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><span class="badge badge-blue">SMC²</span></td>
+                            <td>Chopin et al. (2013)</td>
+                            <td>Massive parallelism (N<sub>θ</sub> × N<sub>inner</sub> particles)</td>
+                        </tr>
+                        <tr>
+                            <td><span class="badge badge-green">PMMH</span></td>
+                            <td>Andrieu et al. (2010)</td>
+                            <td>Correct Bayesian parameter updates</td>
+                        </tr>
+                        <tr>
+                            <td><span class="badge badge-purple">CPMMH</span></td>
+                            <td>Deligiannidis et al. (2018)</td>
+                            <td>Low-variance likelihood estimates</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="key-insight">
+                <p>Use SMC² for parallel forward filtering, but inject CPMMH-style rejuvenation when particle diversity drops. This gives us the parallelism of SMC² with the mixing quality of CPMMH.</p>
+            </div>
+        </section>
+
+        <!-- Section 2: The Model -->
+        <section id="model">
+            <h2><span class="section-number">02</span> The Stochastic Volatility Model</h2>
+
+            <h3>2.1 Model Structure</h3>
+            <p>We model log-volatility h<sub>t</sub> with a <strong>regime-switching</strong> structure. A latent regime variable z<sub>t</sub> ∈ (0, 3) controls the volatility dynamics:</p>
+
+            <div class="diagram" data-title="Generative Process">
+<pre>
+   <span class="highlight-purple">Regime Layer (slow-moving):</span>
+   ┌─────────┐      ρ·z̃ + σ_z·ε      ┌─────────┐
+   │  z̃<sub>t-1</sub>  │ ───────────────────▶ │   z̃<sub>t</sub>   │    z̃ ∈ ℝ
+   └─────────┘                       └────┬────┘
+                                          │
+                                          ▼ <span class="highlight-cyan">z = 1.5·(1 + tanh(z̃))</span>
+                                     ┌─────────┐
+                                     │   z<sub>t</sub>   │    z ∈ (0, 3)
+                                     └────┬────┘
+                                          │
+              ┌───────────────────────────┼───────────────────────┐
+              ▼                           ▼                       ▼
+         ┌─────────┐                 ┌─────────┐             ┌──────┐
+         │  <span class="highlight-orange">θ(z)</span>   │                 │  <span class="highlight-green">μ(z)</span>   │             │<span class="highlight-blue">σ_h(z)</span>│
+         └────┬────┘                 └────┬────┘             └──┬───┘
+              │ mean-reversion            │ long-run mean       │
+              │ speed                     │                     │
+              └───────────────┬───────────┴─────────────────────┘
+                              ▼
+   <span class="highlight-green">Volatility Layer:</span>     h<sub>t</sub> = (1-θ)·h<sub>t-1</sub> + θ·μ + σ_h·ε
+   ┌─────────┐                                   ┌─────────┐
+   │  h<sub>t-1</sub>  │ ─────────────────────────────────▶│   h<sub>t</sub>   │
+   └─────────┘                                   └────┬────┘
+                                                      │
+   <span class="highlight-blue">Observation Layer:</span>                                 ▼
+                                                 ┌─────────┐
+                    y<sub>t</sub> = exp(h<sub>t</sub>/2) · ε<sub>t</sub>       │   y<sub>t</sub>   │
+                                                 └─────────┘
+</pre>
+            </div>
+
+            <h3>2.2 Parameter Table</h3>
+            <p>We estimate <strong>8 parameters</strong> that control the regime-dependent dynamics:</p>
+
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Parameter</th>
+                            <th>Symbol</th>
+                            <th>Range</th>
+                            <th>Physical Meaning</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>Regime persistence</strong></td>
+                            <td><code>ρ</code></td>
+                            <td>(0.8, 0.999)</td>
+                            <td>How slowly the regime changes. ρ=0.95 → half-life ≈ 14 steps</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Regime volatility</strong></td>
+                            <td><code>σ_z</code></td>
+                            <td>(0.01, 1.0)</td>
+                            <td>How much the regime fluctuates</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Base mean</strong></td>
+                            <td><code>μ_base</code></td>
+                            <td>(-10, 5)</td>
+                            <td>Log-volatility in low regime. μ=-2 → vol ≈ 37%</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Mean scale</strong></td>
+                            <td><code>μ_scale</code></td>
+                            <td>(0, 5)</td>
+                            <td>Additional log-vol in high regime</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Mean rate</strong></td>
+                            <td><code>μ_rate</code></td>
+                            <td>(0.1, 5)</td>
+                            <td>How fast μ(z) saturates</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Base noise</strong></td>
+                            <td><code>σ_base</code></td>
+                            <td>(0.01, 1)</td>
+                            <td>Volatility-of-volatility in low regime</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Noise scale</strong></td>
+                            <td><code>σ_scale</code></td>
+                            <td>(0, 1)</td>
+                            <td>Additional vol-of-vol in high regime</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Noise rate</strong></td>
+                            <td><code>σ_rate</code></td>
+                            <td>(0.1, 5)</td>
+                            <td>How fast σ_h(z) saturates</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <h3>2.3 Curve Functions</h3>
+            <p>The regime variable z controls three curves:</p>
+
+            <div class="formula">
+θ(z) = θ_base + θ_scale · (1 - exp(-θ_rate · z))
+            </div>
+            <div class="formula">
+μ(z) = μ_base + μ_scale · (1 - exp(-μ_rate · z))
+            </div>
+            <div class="formula">
+σ_h(z) = σ_base + σ_scale · (1 - exp(-σ_rate · z))
+            </div>
+
+            <div class="diagram" data-title="Curve Shape">
+<pre>
+    value
+      ▲
+      │                          <span class="highlight-green">●────────────── base + scale</span>
+      │                     ●
+      │                ●
+      │           ●
+      │       ●
+      │    ●
+      │  ●
+      │ ●
+      │<span class="highlight-blue">●─────────────────────────────────────── base</span>
+      └──────────────────────────────────────▶ z
+      0              1              2         3
+      
+      <span class="highlight-orange">Low regime</span>              <span class="highlight-red">High regime</span>
+      (calm market)           (stressed market)
+</pre>
+            </div>
+        </section>
+
+        <!-- Section 3: Background -->
+        <section id="background">
+            <h2><span class="section-number">03</span> Background: SMC², PMMH, and CPMMH</h2>
+
+            <p>Before describing our hybrid, we briefly review the three algorithms we combine.</p>
+
+            <h3>3.1 Sequential Monte Carlo Squared (SMC²)</h3>
+            <p>SMC² maintains a population of <strong>θ-particles</strong>, each running its own <strong>particle filter</strong> on the latent states:</p>
+
+            <div class="diagram" data-title="SMC² Structure">
+<pre>
+  <span class="highlight-blue">θ-particle 1:</span>  θ₁ ──┬── [h₁,₁, h₁,₂, ..., h₁,N]  <span class="highlight-cyan">(inner filter)</span>
+                      │
+  <span class="highlight-blue">θ-particle 2:</span>  θ₂ ──┼── [h₂,₁, h₂,₂, ..., h₂,N]  <span class="highlight-cyan">(inner filter)</span>
+                      │
+  <span class="highlight-blue">θ-particle 3:</span>  θ₃ ──┼── [h₃,₁, h₃,₂, ..., h₃,N]  <span class="highlight-cyan">(inner filter)</span>
+                      │
+       ⋮              │           ⋮
+                      │
+  <span class="highlight-blue">θ-particle M:</span>  θ_M ─┴── [h_M,1, h_M,2, ..., h_M,N] <span class="highlight-cyan">(inner filter)</span>
+
+  Total particles: <span class="highlight-green">M × N</span>  (e.g., 256 × 256 = 65,536)
+</pre>
+            </div>
+
+            <div class="info-box">
+                <p><strong>Strengths:</strong> Massively parallel (each θ-particle independent)</p>
+                <p><strong>Weakness:</strong> Outer particles degenerate; standard rejuvenation uses random-walk MH</p>
+            </div>
+
+            <h3>3.2 Particle Marginal Metropolis-Hastings (PMMH)</h3>
+            <p>PMMH treats the particle filter likelihood estimate as an unbiased estimator in an MH accept/reject step:</p>
+
+            <div class="diagram" data-title="PMMH Iteration">
+<pre>
+  1. Current state: θ with likelihood estimate p̂(y|θ)
+
+  2. Propose: θ* ~ q(θ*|θ)
+
+  3. Run particle filter with θ* to get p̂(y|θ*)
+     ┌─────────────────────────────────────────┐
+     │  PF(θ*): t=1 ──▶ t=2 ──▶ ... ──▶ t=T   │ ◀── <span class="highlight-red">SEQUENTIAL!</span>
+     └─────────────────────────────────────────┘
+
+  4. Accept with probability:
+
+              p̂(y|θ*) · p(θ*) · q(θ|θ*)
+     α = min(1, ─────────────────────────────)
+              p̂(y|θ)  · p(θ)  · q(θ*|θ)
+</pre>
+            </div>
+
+            <div class="info-box warning">
+                <p><strong>Strength:</strong> Correct Bayesian updates (the noise in p̂ cancels!)</p>
+                <p><strong>Weakness:</strong> Step 3 is sequential over T — cannot parallelize</p>
+            </div>
+
+            <h3>3.3 Correlated PMMH (CPMMH)</h3>
+            <p>CPMMH reduces the variance of the acceptance ratio by <strong>correlating</strong> the random numbers between current and proposed:</p>
+
+            <div class="diagram" data-title="CPMMH Correlation">
+<pre>
+  <span class="highlight-orange">Standard PMMH:</span>
+    p̂(y|θ)  uses random numbers U = [u₁, u₂, ..., u_T]
+    p̂(y|θ*) uses random numbers U* = [u₁*, u₂*, ..., u_T*]  <span class="highlight-red">(fresh)</span>
+
+    ──▶ High variance in ratio p̂(y|θ*)/p̂(y|θ)
+
+  <span class="highlight-green">CPMMH:</span>
+    p̂(y|θ*) uses U* where:
+
+        <span class="highlight-cyan">u_i* = ρ · u_i + √(1-ρ²) · ε_i</span>    (ρ ≈ 0.99)
+                 ▲           ▲
+                 │           │
+           from current    fresh
+
+    ──▶ U* ≈ U, so p̂(y|θ*) ≈ p̂(y|θ) when θ* ≈ θ
+    ──▶ <span class="highlight-green">Much lower variance in acceptance ratio!</span>
+</pre>
+            </div>
+
+            <div class="info-box success">
+                <p><strong>Strength:</strong> 10-100x variance reduction → better mixing</p>
+                <p><strong>Weakness:</strong> Still sequential (must replay from t=1 to T)</p>
+            </div>
+        </section>
+
+        <!-- Section 4: Hybrid Algorithm -->
+        <section id="hybrid">
+            <h2><span class="section-number">04</span> The Hybrid Algorithm</h2>
+
+            <h3>4.1 The Key Insight</h3>
+            <p>We observe that:</p>
+            <ol>
+                <li><strong>SMC² forward filtering is embarrassingly parallel</strong> — each (θ, inner particle) is independent</li>
+                <li><strong>SMC² rejuvenation is the bottleneck</strong> — random-walk MH has poor mixing</li>
+                <li><strong>CPMMH has excellent mixing but is sequential</strong> — can't parallelize the replay</li>
+            </ol>
+
+            <div class="key-insight">
+                <p>Run SMC² normally until ESS drops, then inject <strong>CPMMH-style rejuvenation</strong> for each θ-particle <strong>in parallel</strong>. Each rejuvenation is sequential over T, but all M rejuvenations run simultaneously on the GPU.</p>
+            </div>
+
+            <div class="diagram" data-title="The Hybrid Algorithm">
+<pre>
+  for t = 1, 2, ..., T:
+
+    ┌─────────────────────────────────────────────────────────────┐
+    │ <span class="highlight-blue">STEP 1: Forward Filter (PARALLEL over all M×N particles)</span>   │
+    │                                                             │
+    │   for each θ-particle j = 1..M:        ─┐                   │
+    │     for each inner particle i = 1..N:   │ <span class="highlight-green">GPU: M×N threads</span>  │
+    │       propagate h[j,i]                  │                   │
+    │       weight by p(y_t | h[j,i])        ─┘                   │
+    └─────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+    ┌─────────────────────────────────────────────────────────────┐
+    │ <span class="highlight-orange">STEP 2: Check Outer ESS</span>                                     │
+    │                                                             │
+    │   ESS = 1 / Σ w_j²                                          │
+    │                                                             │
+    │   if ESS > threshold:  continue to next t                   │
+    │   if ESS < threshold:  <span class="highlight-red">trigger rejuvenation</span> ───────────┐    │
+    └─────────────────────────────────────────────────────────│────┘
+                                                              │
+                                                              ▼
+    ┌─────────────────────────────────────────────────────────────┐
+    │ <span class="highlight-purple">STEP 3: Resample θ-particles</span>                                │
+    │                                                             │
+    │   Multinomial resampling based on weights w_j               │
+    │   Copy inner particles, noise arrays, states                │
+    └─────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+    ┌─────────────────────────────────────────────────────────────┐
+    │ <span class="highlight-cyan">STEP 4: CPMMH Rejuvenation (PARALLEL over M θ-particles)</span>   │
+    │                                                             │
+    │   for each θ-particle j = 1..M:        ─┐                   │
+    │                                          │                  │
+    │     θ* ~ proposal(θ_j)                   │                  │
+    │                                          │ <span class="highlight-green">GPU: M blocks</span>    │
+    │     ┌─────────────────────────────────┐  │ <span class="highlight-green">N threads each</span>   │
+    │     │ Replay filter t=1..T with       │  │                  │
+    │     │ <span class="highlight-cyan">CORRELATED noise (ρ=0.99)</span>       │  │ Sequential       │
+    │     │ to get p̂(y|θ*)                  │  │ within block     │
+    │     └─────────────────────────────────┘  │                  │
+    │                                          │                  │
+    │     Accept/reject via MH ratio          ─┘                  │
+    └─────────────────────────────────────────────────────────────┘
+</pre>
+            </div>
+
+            <h3>4.2 Parallelism Analysis</h3>
+
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Operation</th>
+                            <th>Parallelism</th>
+                            <th>GPU Mapping</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Forward filter</td>
+                            <td>M × N</td>
+                            <td>M×N threads</td>
+                        </tr>
+                        <tr>
+                            <td>Inner resample</td>
+                            <td>M × N</td>
+                            <td>M×N threads</td>
+                        </tr>
+                        <tr>
+                            <td>Outer ESS</td>
+                            <td>M</td>
+                            <td>M threads</td>
+                        </tr>
+                        <tr>
+                            <td>Outer resample</td>
+                            <td>M</td>
+                            <td>M threads</td>
+                        </tr>
+                        <tr>
+                            <td>CPMMH replay</td>
+                            <td>M × N (spatial) × T (temporal)</td>
+                            <td>M blocks × N threads, T iterations</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <p>The CPMMH replay is <strong>sequential in T</strong> but <strong>parallel in M</strong>. With M=256 rejuvenations running simultaneously, we achieve high GPU utilization despite the sequential inner loop.</p>
+        </section>
+
+        <!-- Section 5: Sorting Trick -->
+        <section id="sorting">
+            <h2><span class="section-number">05</span> Making Coupling Work: The Sorting Trick</h2>
+
+            <h3>5.1 The Problem with Resampling</h3>
+            <p>CPMMH correlates random numbers to reduce variance:</p>
+
+            <div class="formula">
+u*[i] = ρ · u[i] + √(1-ρ²) · fresh[i]
+            </div>
+
+            <p>This only helps if <code>u[i]</code> affects the "same" particle in both current and proposed runs. But <strong>resampling scrambles particle identities</strong>:</p>
+
+            <div class="diagram" data-title="Coupling Failure WITHOUT Sorting">
+<pre>
+  <span class="highlight-orange">Before Resampling (t=49):</span>
+  ┌─────────────────────────────────────────────────────────────┐
+  │ Particle   │  μ_h   │  Uses noise  │  State region          │
+  ├────────────┼────────┼──────────────┼────────────────────────┤
+  │     0      │  -2.1  │    u[0]      │  Low volatility        │
+  │     1      │  -1.5  │    u[1]      │  Low volatility        │
+  │     2      │  +0.3  │    u[2]      │  Medium volatility     │
+  │     3      │  +1.8  │    u[3]      │  High volatility       │
+  └─────────────────────────────────────────────────────────────┘
+
+  <span class="highlight-red">Resampling with ancestors = [3, 3, 0, 3]:</span>
+
+  <span class="highlight-orange">After Resampling (t=50):</span>
+  ┌─────────────────────────────────────────────────────────────┐
+  │ Particle   │  μ_h   │  Uses noise  │  State region          │
+  ├────────────┼────────┼──────────────┼────────────────────────┤
+  │     0      │  +1.8  │    u[0]      │  High volatility  <span class="highlight-red">✗</span>    │
+  │     1      │  +1.8  │    u[1]      │  High volatility  <span class="highlight-red">✗</span>    │
+  │     2      │  -2.1  │    u[2]      │  Low volatility   <span class="highlight-red">✗</span>    │
+  │     3      │  +1.8  │    u[3]      │  High volatility  <span class="highlight-green">✓</span>    │
+  └─────────────────────────────────────────────────────────────┘
+
+  Particle 0 now has HIGH volatility but uses u[0], which was
+  calibrated for LOW volatility. <span class="highlight-red">The coupling is BROKEN!</span>
+
+  RESULT: u*[0] ≈ u[0] is useless — states are completely different
+</pre>
+            </div>
+
+            <h3>5.2 The Solution: Sort After Resampling</h3>
+            <p>We <strong>sort particles by μ_h</strong> after every resampling step:</p>
+
+            <div class="diagram" data-title="Coupling Restored WITH Sorting">
+<pre>
+  <span class="highlight-orange">After Resampling (t=50), BEFORE sort:</span>
+  ┌────────────────────────────────────────────────────┐
+  │ Particle   │  μ_h   │  State region                │
+  ├────────────┼────────┼──────────────────────────────┤
+  │     0      │  +1.8  │  High volatility             │
+  │     1      │  +1.8  │  High volatility             │
+  │     2      │  -2.1  │  Low volatility              │
+  │     3      │  +1.8  │  High volatility             │
+  └────────────────────────────────────────────────────┘
+                         │
+                         ▼ <span class="highlight-cyan">SORT BY μ_h</span>
+
+  <span class="highlight-green">After Sorting:</span>
+  ┌────────────────────────────────────────────────────┐
+  │ Particle   │  μ_h   │  State region                │
+  ├────────────┼────────┼──────────────────────────────┤
+  │     0      │  -2.1  │  Low volatility         <span class="highlight-green">✓</span>    │
+  │     1      │  +1.8  │  High volatility        <span class="highlight-green">✓</span>    │
+  │     2      │  +1.8  │  High volatility        <span class="highlight-green">✓</span>    │
+  │     3      │  +1.8  │  High volatility        <span class="highlight-green">✓</span>    │
+  └────────────────────────────────────────────────────┘
+
+  Now particle i ALWAYS represents the i-th quantile of the
+  h-distribution. The noise u[i] consistently affects the same
+  "region" of state space.
+
+  <span class="highlight-green">RESULT: Coupling ρ=0.99 actually reduces variance!</span>
+</pre>
+            </div>
+
+            <h3>5.3 Why Bitonic Sort?</h3>
+            <p>We need a <strong>deterministic</strong> sort — if the sort order depends on thread scheduling, the coupling breaks across runs. We use <strong>bitonic sort</strong>:</p>
+            <ul>
+                <li>O(N log²N) comparisons</li>
+                <li>Fully deterministic (no thread-order dependence)</li>
+                <li>In-place (no extra memory)</li>
+                <li>Fast on GPU for N ≤ 512</li>
+            </ul>
+        </section>
+
+        <!-- Section 6: OCSN -->
+        <section id="ocsn">
+            <h2><span class="section-number">06</span> Tractable Likelihoods: The OCSN Mixture</h2>
+
+            <h3>6.1 The Problem</h3>
+            <p>The observation model is:</p>
+            <div class="formula">
+y_t = exp(h_t / 2) · ε_t,    ε_t ~ N(0, 1)
+            </div>
+
+            <p>Taking logs to linearize:</p>
+            <div class="formula">
+log(y_t²) = h_t + log(ε_t²) = h_t + log(χ²(1))
+            </div>
+
+            <p>The <code>log(χ²(1))</code> term is <strong>non-Gaussian</strong> — it breaks Kalman filtering.</p>
+
+            <div class="diagram" data-title="Distribution of log(χ²(1))">
+<pre>
+    density
+      ▲
+      │
+      │    <span class="highlight-blue">●</span>
+      │   <span class="highlight-blue">● ●</span>
+      │  <span class="highlight-blue">●   ●</span>
+      │ <span class="highlight-blue">●     ●●</span>
+      │<span class="highlight-blue">●        ●●●</span>
+      │<span class="highlight-blue">           ●●●●●●●●●●●●●●</span>───
+    ──┼───────────────────────────────▶ x
+     -10    -5     0     5
+           ▲
+           │
+     Mean ≈ -1.27
+     <span class="highlight-red">Highly skewed!</span>
+     <span class="highlight-red">NOT Gaussian!</span>
+</pre>
+            </div>
+
+            <h3>6.2 The OCSN Approximation</h3>
+            <p>Omori, Chib, Shephard & Nakajima (2007) approximate <code>log(χ²(1))</code> as a <strong>10-component Gaussian mixture</strong>:</p>
+
+            <div class="formula">
+log(χ²(1)) ≈ Σᵢ wᵢ · N(mᵢ, vᵢ²)
+            </div>
+
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Component</th>
+                            <th>Weight wᵢ</th>
+                            <th>Mean mᵢ</th>
+                            <th>Variance vᵢ²</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr><td>1</td><td>0.00609</td><td>1.927</td><td>0.113²</td></tr>
+                        <tr><td>2</td><td>0.04775</td><td>1.347</td><td>0.178²</td></tr>
+                        <tr><td>3</td><td>0.13057</td><td>0.735</td><td>0.268²</td></tr>
+                        <tr><td>4</td><td>0.20674</td><td>0.023</td><td>0.406²</td></tr>
+                        <tr><td>5</td><td>0.22715</td><td>-0.852</td><td>0.627²</td></tr>
+                        <tr><td>6</td><td>0.18842</td><td>-1.973</td><td>0.986²</td></tr>
+                        <tr><td>7</td><td>0.12047</td><td>-3.468</td><td>1.575²</td></tr>
+                        <tr><td>8</td><td>0.05591</td><td>-5.552</td><td>2.545²</td></tr>
+                        <tr><td>9</td><td>0.01575</td><td>-8.684</td><td>4.166²</td></tr>
+                        <tr><td>10</td><td>0.00115</td><td>-14.654</td><td>7.333²</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <h3>6.3 Moment Matching vs Component Sampling</h3>
+            <p>Two approaches to use the mixture:</p>
+            <ul>
+                <li><strong>Approach 1: Sample component</strong> — Draw component index k ~ Categorical(w), condition on that component. Requires tracking discrete state.</li>
+                <li><strong>Approach 2: Moment matching</strong> (our choice) — Compute marginal mean and variance, use a single Gaussian approximation. Smoother likelihood surface for MH.</li>
+            </ul>
+
+            <div class="info-box success">
+                <p>We use moment matching because it makes the likelihood surface smoother, which benefits CPMMH exploration.</p>
+            </div>
+        </section>
+
+        <!-- Section 7: Z-Transform -->
+        <section id="z-transform">
+            <h2><span class="section-number">07</span> Proper Dynamics: The Z-Space Transform</h2>
+
+            <h3>7.1 The Problem with Clamping</h3>
+            <p>The regime variable z must be in (0, 3) for curve evaluation. Naive clamping:</p>
+
+            <pre><code>z_raw = ρ · z_{t-1} + σ_z · ε
+z = clamp(z_raw, 0.001, 2.999)</code></pre>
+
+            <p>This <strong>distorts the likelihood</strong>:</p>
+
+            <div class="diagram" data-title="Probability Pileup at Boundaries">
+<pre>
+  <span class="highlight-green">True AR(1) density for z:</span>           <span class="highlight-red">Clamped density:</span>
+
+      ▲                                   ▲
+      │     ●●●                           <span class="highlight-red">█</span>     ●●●
+      │   ●     ●                         <span class="highlight-red">█</span>   ●     ●
+      │  ●       ●                        <span class="highlight-red">█</span>  ●       ●
+      │ ●         ●                       <span class="highlight-red">█</span> ●         ●
+      │●           ●                      <span class="highlight-red">█</span>●           ●    <span class="highlight-red">█</span>
+      └──────────────▶                    └──────────────▶
+      0      z       3                    0      z       3
+                                          ▲                 ▲
+                                          │                 │
+                                     <span class="highlight-red">Probability</span>       <span class="highlight-red">Probability</span>
+                                     <span class="highlight-red">pileup!</span>           <span class="highlight-red">pileup!</span>
+
+  Clamping creates point masses at boundaries, making the
+  transition density incorrect and biasing parameter estimates.
+</pre>
+            </div>
+
+            <h3>7.2 The Tanh Reparameterization</h3>
+            <p>We introduce an <strong>unconstrained</strong> variable z̃ ∈ ℝ and transform:</p>
+
+            <div class="formula">
+z̃_t = ρ · z̃_{t-1} + σ_z · ε_t    (exact Gaussian AR(1))
+            </div>
+            <div class="formula">
+z_t = 1.5 · (1 + tanh(z̃_t))       (smooth map to (0, 3))
+            </div>
+
+            <div class="diagram" data-title="Smooth Transform: No Boundary Issues">
+<pre>
+  <span class="highlight-blue">z̃ space (unconstrained):</span>                <span class="highlight-green">z space (bounded):</span>
+
+      ▲                                   ▲
+      │     ●●●                           │       ●●●●
+      │   ●     ●                         │     ●      ●
+      │  ●       ●                        │    ●        ●
+      │ ●         ●                       │  ●            ●
+      │●           ●                      │●               ●
+      └──────────────▶                    └───────────────────▶
+     -∞      z̃      +∞                    0        z          3
+
+        <span class="highlight-blue">Exact Gaussian</span>          ──▶      <span class="highlight-green">Smooth, no pileup</span>
+        <span class="highlight-blue">transition density</span>               <span class="highlight-green">Proper likelihood</span>
+</pre>
+            </div>
+
+            <div class="info-box success">
+                <p><strong>Benefits:</strong></p>
+                <ul>
+                    <li>AR(1) on z̃ has exact Gaussian transition density</li>
+                    <li>No Jacobian needed (we track z̃, not z)</li>
+                    <li>Smooth likelihood surface for CPMMH</li>
+                </ul>
+            </div>
+        </section>
+
+        <!-- Section 8: Fixed-Lag -->
+        <section id="fixed-lag">
+            <h2><span class="section-number">08</span> Scaling to Large T: Fixed-Lag PMMH</h2>
+
+            <h3>8.1 The Variance Growth Problem</h3>
+            <p>The CPMMH likelihood estimate is a product of T terms:</p>
+            <div class="formula">
+p̂(y₁:T | θ) = ∏ₜ p̂(yₜ | y₁:ₜ₋₁, θ)
+            </div>
+
+            <p>In log space, this is a <strong>sum of T noisy terms</strong>:</p>
+            <div class="formula">
+log p̂(y₁:T | θ) = Σₜ log p̂(yₜ | y₁:ₜ₋₁, θ)
+            </div>
+
+            <p>By CLT, the variance grows linearly:</p>
+            <div class="formula">
+Var[log p̂(y₁:T | θ)] ∝ T
+            </div>
+
+            <div class="diagram" data-title="Variance Growth with T">
+<pre>
+  Variance
+      ▲
+      │                                              <span class="highlight-red">●</span>
+      │                                           <span class="highlight-red">●</span>
+      │                                        <span class="highlight-red">●</span>   Full history
+  5000│                                     <span class="highlight-red">●</span>      (L = 0)
+      │                                  <span class="highlight-red">●</span>
+      │                               <span class="highlight-red">●</span>
+      │                            <span class="highlight-red">●</span>
+      │                         <span class="highlight-red">●</span>
+      │                      <span class="highlight-red">●</span>
+      │                   <span class="highlight-red">●</span>
+  1000│                <span class="highlight-red">●</span>
+      │             <span class="highlight-red">●</span>
+      │          <span class="highlight-red">●</span>
+      │       <span class="highlight-red">●</span>
+   100│─ ─ <span class="highlight-green">●</span>─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  <span class="highlight-green">Fixed-lag (L=100)</span>
+      │    <span class="highlight-green">●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●</span>
+      │
+      └──────────────────────────────────────────────────────────▶ T
+          500    1000   2000       5000      10000
+
+  At T=5000, full-history variance is <span class="highlight-red">50×</span> the fixed-lag variance!
+</pre>
+            </div>
+
+            <div class="info-box warning">
+                <p><strong>High variance → erratic MH acceptance → poor mixing → degraded estimates</strong></p>
+            </div>
+
+            <h3>8.2 The Fixed-Lag Solution</h3>
+            <p>Instead of replaying the full history [0, T], we only replay a window [T-L, T]:</p>
+
+            <div class="diagram" data-title="Fixed-Lag PMMH">
+<pre>
+  <span class="highlight-red">Full History (L = 0):</span>
+  ┌─────────────────────────────────────────────────────┐
+  │ t=0  t=1  t=2  ...  t=T-L  ...  t=T-1  t=T         │
+  │  <span class="highlight-red">●────●────●────●────●────●────●────●────●</span>          │
+  │  └──────────────────────────────────────┘          │
+  │            Replay entire history                   │
+  │            Cost: <span class="highlight-red">O(T)</span>  Variance: <span class="highlight-red">O(T)</span>              │
+  └─────────────────────────────────────────────────────┘
+
+  <span class="highlight-green">Fixed-Lag (L = 100):</span>
+  ┌─────────────────────────────────────────────────────┐
+  │ t=0  t=1  t=2  ...  t=T-L  ...  t=T-1  t=T         │
+  │  <span class="highlight-blue">○────○────○────○────</span><span class="highlight-green">●════●════●════●════●</span>          │
+  │                      ▲    └────────────────┘        │
+  │                      │    Replay only window        │
+  │                <span class="highlight-purple">Checkpoint</span>                           │
+  │                      │                              │
+  │            Cost: <span class="highlight-green">O(L)</span>  Variance: <span class="highlight-green">O(L)</span>              │
+  └─────────────────────────────────────────────────────┘
+
+  <span class="highlight-blue">○</span> = Frozen (use checkpoint state)
+  <span class="highlight-green">●</span> = Replayed (run filter with proposed θ)
+</pre>
+            </div>
+
+            <h3>8.3 The Bias-Variance Tradeoff</h3>
+            <p>Fixed-lag introduces a small <strong>bias</strong> because we ignore observations before T-L:</p>
+            <div class="formula">
+Bias ≈ ρ^L
+            </div>
+
+            <p>For ρ = 0.95 and L = 100:</p>
+            <div class="formula">
+Bias ≈ 0.95^100 ≈ 0.006 (0.6%)
+            </div>
+
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>L</th>
+                            <th>Bias</th>
+                            <th>Variance Bound</th>
+                            <th>Recommendation</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>0</td>
+                            <td>0</td>
+                            <td>O(T)</td>
+                            <td>Only for short sequences</td>
+                        </tr>
+                        <tr>
+                            <td>50</td>
+                            <td>8%</td>
+                            <td>O(50)</td>
+                            <td>Aggressive</td>
+                        </tr>
+                        <tr style="background: rgba(63, 185, 80, 0.1);">
+                            <td><strong>100</strong></td>
+                            <td><strong>0.6%</strong></td>
+                            <td><strong>O(100)</strong></td>
+                            <td><strong>✓ Recommended</strong></td>
+                        </tr>
+                        <tr>
+                            <td>200</td>
+                            <td>0.003%</td>
+                            <td>O(200)</td>
+                            <td>Conservative</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <h3>8.4 Checkpoint System</h3>
+            <p>We save particle state every L steps:</p>
+
+            <div class="diagram" data-title="Checkpoint Timeline">
+<pre>
+  L = 100
+
+  t:  0    50   100   150   200   250   300   350   400
+      │     │     │     │     │     │     │     │     │
+      ▼     ▼     ▼     ▼     ▼     ▼     ▼     ▼     ▼
+      ●─────●─────●─────●─────●─────●─────●─────●─────●
+                  ▲           ▲           ▲           ▲
+                  │           │           │           │
+                <span class="highlight-green">SAVE</span>       <span class="highlight-green">SAVE</span>        <span class="highlight-green">SAVE</span>        <span class="highlight-green">SAVE</span>
+             checkpoint  checkpoint  checkpoint  checkpoint
+
+  When rejuvenation triggered at t=350:
+    - Load checkpoint from t=300
+    - Replay t=301..350 with proposed θ
+    - Compare window likelihoods
+</pre>
+            </div>
+
+            <div class="info-box">
+                <p><strong>Checkpoint contains:</strong></p>
+                <ul>
+                    <li>Inner particle states: z̃, μ_h, var_h, log_w</li>
+                    <li>Accumulated likelihood up to checkpoint: log p̂(y₁:T_checkpoint | θ)</li>
+                </ul>
+            </div>
+        </section>
+
+        <!-- Section 9: CUDA -->
+        <section id="cuda">
+            <h2><span class="section-number">09</span> CUDA Implementation</h2>
+
+            <h3>9.1 Memory Layout</h3>
+            <p>We use <strong>Structure of Arrays (SoA)</strong> for coalesced memory access:</p>
+
+            <div class="diagram" data-title="Memory Layout">
+<pre>
+  <span class="highlight-red">Array of Structures (AoS) — BAD for GPU:</span>
+  ┌────────────────────────────────────────────────────────┐
+  │ [θ₀, h₀, w₀] [θ₁, h₁, w₁] [θ₂, h₂, w₂] [θ₃, h₃, w₃]  │
+  └────────────────────────────────────────────────────────┘
+       ▲              Thread 1 reads θ₁
+       Thread 0 reads θ₀              ▲
+                                      <span class="highlight-red">Memory access scattered!</span>
+
+  <span class="highlight-green">Structure of Arrays (SoA) — GOOD for GPU:</span>
+  ┌────────────────────────────────────────────────────────┐
+  │ [θ₀, θ₁, θ₂, θ₃]  [h₀, h₁, h₂, h₃]  [w₀, w₁, w₂, w₃] │
+  └────────────────────────────────────────────────────────┘
+    ▲   ▲   ▲   ▲
+    │   │   │   │     <span class="highlight-green">Memory access coalesced!</span>
+    T0  T1  T2  T3    Single cache line serves all threads
+</pre>
+            </div>
+
+            <h3>9.2 FP16 Noise Arrays</h3>
+            <p>Random numbers are stored in <strong>half precision (FP16)</strong> to reduce memory bandwidth:</p>
+
+            <div class="info-box">
+                <p>Noise array shape: <code>[N_theta] × [N_inner] × [T+1]</code></p>
+                <p>With N_theta=256, N_inner=256, T=5000:</p>
+                <ul>
+                    <li><strong>FP32:</strong> 256 × 256 × 5001 × 4 bytes = <span class="highlight-red">1.22 GB</span></li>
+                    <li><strong>FP16:</strong> 256 × 256 × 5001 × 2 bytes = <span class="highlight-green">0.61 GB</span> ← 2× smaller</li>
+                </ul>
+                <p>FP16 precision (3-4 decimal digits) is sufficient for noise.</p>
+            </div>
+
+            <h3>9.3 Kernel Structure</h3>
+
+            <div class="diagram" data-title="Kernel Architecture">
+<pre>
+  One Update Step:
+
+  ┌─────────────────────────────────────────────────────────┐
+  │ <span class="highlight-blue">kernel_rbpf_step</span>                                        │
+  │ Grid: N_theta blocks, N_inner threads each              │
+  │                                                         │
+  │   1. Load observation y_t                               │
+  │   2. Propagate z̃ (AR(1) transition)                     │
+  │   3. Transform z = 1.5·(1 + tanh(z̃))                    │
+  │   4. Evaluate curves θ(z), μ(z), σ_h(z)                 │
+  │   5. Kalman predict h                                   │
+  │   6. OCSN mixture likelihood                            │
+  │   7. Kalman update h                                    │
+  │   8. Update weights                                     │
+  │   9. Compute inner ESS                                  │
+  │  10. Inner resample (if ESS low)                        │
+  │  11. Sort by μ_h (for CPMMH coupling)                   │
+  │  12. Accumulate outer likelihood                        │
+  └─────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+  ┌─────────────────────────────────────────────────────────┐
+  │ <span class="highlight-orange">kernel_compute_outer_ess</span>                                │
+  │ Grid: 1 block, N_theta threads                          │
+  └─────────────────────────────────────────────────────────┘
+                         │
+                         ▼ (if ESS < threshold)
+  ┌─────────────────────────────────────────────────────────┐
+  │ <span class="highlight-purple">kernel_outer_resample</span>                                   │
+  │ <span class="highlight-purple">kernel_copy_theta_particles</span>                             │
+  └─────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+  ┌─────────────────────────────────────────────────────────┐
+  │ <span class="highlight-cyan">kernel_cpmmh_rejuvenate_fused</span>                           │
+  │ Grid: N_theta blocks, N_inner threads each              │
+  │                                                         │
+  │   For each θ-particle (in parallel):                    │
+  │     1. Propose θ* from current θ                        │
+  │     2. Load checkpoint (if fixed-lag)                   │
+  │     3. Replay filter from t_start to T                  │
+  │        - Correlate noise: u* = ρ·u + √(1-ρ²)·fresh     │
+  │        - Inner resample + sort                          │
+  │        - Accumulate likelihood                          │
+  │     4. MH accept/reject                                 │
+  │     5. Swap buffers if accepted                         │
+  └─────────────────────────────────────────────────────────┘
+</pre>
+            </div>
+        </section>
+
+        <!-- Section 10: Tuning -->
+        <section id="tuning">
+            <h2><span class="section-number">10</span> Tuning Guide</h2>
+
+            <h3>10.1 Particle Counts</h3>
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Parameter</th>
+                            <th>Low</th>
+                            <th>Medium</th>
+                            <th>High</th>
+                            <th>Notes</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>N_theta</code></td>
+                            <td>64</td>
+                            <td>256</td>
+                            <td>512</td>
+                            <td>More = better posterior approximation</td>
+                        </tr>
+                        <tr>
+                            <td><code>N_inner</code></td>
+                            <td>64</td>
+                            <td>256</td>
+                            <td>512</td>
+                            <td>More = lower likelihood variance</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            <p><strong>Rule of thumb:</strong> N_theta × N_inner ≈ 65,536 (256 × 256) is a good balance.</p>
+
+            <h3>10.2 Fixed-Lag Window</h3>
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ρ</th>
+                            <th>Recommended L</th>
+                            <th>Bias</th>
+                            <th>Notes</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>0.90</td>
+                            <td>50</td>
+                            <td>0.5%</td>
+                            <td>Fast-moving regimes</td>
+                        </tr>
+                        <tr style="background: rgba(63, 185, 80, 0.1);">
+                            <td><strong>0.95</strong></td>
+                            <td><strong>100</strong></td>
+                            <td><strong>0.6%</strong></td>
+                            <td><strong>✓ Typical</strong></td>
+                        </tr>
+                        <tr>
+                            <td>0.99</td>
+                            <td>200</td>
+                            <td>1.3%</td>
+                            <td>Slow-moving regimes</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            <p><strong>Formula:</strong> L ≈ 7 × half-life, where half-life = log(0.5) / log(ρ)</p>
+
+            <h3>10.3 CPMMH Correlation</h3>
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>cpmmh_rho</th>
+                            <th>Acceptance Rate</th>
+                            <th>Variance Reduction</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>0.90</td>
+                            <td>~25%</td>
+                            <td>Low</td>
+                        </tr>
+                        <tr>
+                            <td>0.95</td>
+                            <td>~35%</td>
+                            <td>Medium</td>
+                        </tr>
+                        <tr style="background: rgba(63, 185, 80, 0.1);">
+                            <td><strong>0.99</strong></td>
+                            <td><strong>~50%</strong></td>
+                            <td><strong>✓ High</strong></td>
+                        </tr>
+                        <tr>
+                            <td>0.999</td>
+                            <td>~60%</td>
+                            <td>Very high (may reduce exploration)</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            <p><strong>Recommendation:</strong> Start with 0.99, increase if acceptance < 30%.</p>
+
+            <h3>10.4 ESS Thresholds</h3>
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Threshold</th>
+                            <th>Rejuvenation Frequency</th>
+                            <th>Notes</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>0.3</td>
+                            <td>Rare</td>
+                            <td>May lose diversity</td>
+                        </tr>
+                        <tr style="background: rgba(63, 185, 80, 0.1);">
+                            <td><strong>0.5</strong></td>
+                            <td><strong>Moderate</strong></td>
+                            <td><strong>✓ Recommended</strong></td>
+                        </tr>
+                        <tr>
+                            <td>0.7</td>
+                            <td>Frequent</td>
+                            <td>More computation</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- Section 11: API -->
+        <section id="api">
+            <h2><span class="section-number">11</span> API Reference</h2>
+
+            <h3>11.1 Allocation and Setup</h3>
+            <pre><code>// Allocate state
+SMC2StateCUDA* state = smc2_cuda_alloc(N_theta, N_inner);
+
+// Configure
+smc2_cuda_set_seed(state, 12345);           // Reproducibility
+smc2_cuda_set_noise_capacity(state, T+128); // Pre-allocate for T observations
+smc2_cuda_set_fixed_lag(state, 100);        // Enable fixed-lag with L=100
+
+// Initialize from prior
+smc2_cuda_init_from_prior(state);</code></pre>
+
+            <h3>11.2 Online Update</h3>
+            <pre><code>// Process each observation
+for (int t = 0; t < T; t++) {
+    float ess = smc2_cuda_update(state, y[t]);
+    
+    // Optionally monitor
+    if (ess < threshold) {
+        printf("Warning: low ESS at t=%d\n", t);
+    }
+}</code></pre>
+
+            <h3>11.3 Extract Results</h3>
+            <pre><code>// Get posterior mean and std
+float theta_mean[8], theta_std[8];
+smc2_cuda_get_theta_mean(state, theta_mean);
+smc2_cuda_get_theta_std(state, theta_std);
+
+// Parameters: [rho, sigma_z, mu_base, mu_scale, mu_rate, 
+//              sigma_base, sigma_scale, sigma_rate]</code></pre>
+
+            <h3>11.4 Cleanup</h3>
+            <pre><code>smc2_cuda_free(state);</code></pre>
+        </section>
+
+        <!-- Section 12: References -->
+        <section id="references">
+            <h2><span class="section-number">12</span> References</h2>
+
+            <div class="reference">
+                <span class="reference-number">[1]</span>
+                <span class="reference-title">SMC²: An efficient algorithm for sequential analysis of state space models.</span>
+                <div class="reference-authors">Chopin, Jacob, Papaspiliopoulos (2013). <em>JRSS-B</em></div>
+            </div>
+
+            <div class="reference">
+                <span class="reference-number">[2]</span>
+                <span class="reference-title">Particle Markov chain Monte Carlo methods.</span>
+                <div class="reference-authors">Andrieu, Doucet, Holenstein (2010). <em>JRSS-B</em></div>
+            </div>
+
+            <div class="reference">
+                <span class="reference-number">[3]</span>
+                <span class="reference-title">The Correlated Pseudo-Marginal Method.</span>
+                <div class="reference-authors">Deligiannidis, Doucet, Pitt (2018). <em>JRSS-B</em></div>
+            </div>
+
+            <div class="reference">
+                <span class="reference-number">[4]</span>
+                <span class="reference-title">Stochastic Volatility with Leverage: Fast and Efficient Likelihood Inference.</span>
+                <div class="reference-authors">Omori, Chib, Shephard, Nakajima (2007). <em>J. Econometrics</em></div>
+            </div>
+
+            <div class="reference">
+                <span class="reference-number">[5]</span>
+                <span class="reference-title">Sorting networks and their applications.</span>
+                <div class="reference-authors">Batcher (1968). <em>AFIPS</em></div>
+            </div>
+        </section>
+    </main>
+
+    <footer class="footer">
+        <p>SMC² with CPMMH Rejuvenation · Design Document v1.0 · January 2026</p>
+    </footer>
+
+    <script>
+        // Scroll progress indicator
+        window.addEventListener('scroll', () => {
+            const scrollProgress = document.getElementById('scrollProgress');
+            const scrollTop = document.documentElement.scrollTop;
+            const scrollHeight = document.documentElement.scrollHeight - document.documentElement.clientHeight;
+            const progress = (scrollTop / scrollHeight) * 100;
+            scrollProgress.style.width = progress + '%';
+        });
+
+        // Smooth scroll for navigation
+        document.querySelectorAll('.nav-link').forEach(link => {
+            link.addEventListener('click', (e) => {
+                e.preventDefault();
+                const targetId = link.getAttribute('href').substring(1);
+                const target = document.getElementById(targetId);
+                if (target) {
+                    const offset = 80; // Account for sticky nav
+                    const targetPosition = target.getBoundingClientRect().top + window.pageYOffset - offset;
+                    window.scrollTo({
+                        top: targetPosition,
+                        behavior: 'smooth'
+                    });
+                }
+            });
+        });
+    </script>
+</body>
+</html>
