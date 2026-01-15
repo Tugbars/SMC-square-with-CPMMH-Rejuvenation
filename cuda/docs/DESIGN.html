@@ -298,23 +298,22 @@
         .diagram::before {
             content: attr(data-title);
             position: absolute;
-            top: -0.75rem;
-            left: 1.5rem;
-            background: var(--bg-primary);
-            padding: 0.25rem 0.75rem;
+            top: 0;
+            left: 0;
+            background: var(--accent-purple);
+            color: var(--bg-primary);
+            padding: 0.5rem 1rem;
             font-size: 0.75rem;
             font-weight: 600;
-            color: var(--accent-purple);
             text-transform: uppercase;
             letter-spacing: 0.05em;
-            border-radius: 12px 0 8px 0;  /* Matches parent corner */
-            border: 1px solid var(--border-color);
+            border-radius: 12px 0 8px 0;
         }
 
         .diagram pre {
             background: transparent;
             border: none;
-            padding: 0.5rem;
+            padding: 2rem 0.5rem 0.5rem;
             margin: 0;
             font-size: 0.75rem;
             line-height: 1.4;

@@ -1,0 +1,836 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Prior Selection for Production Systems</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-cream: #fdfbf7;
+            --bg-warm: #f7f4ef;
+            --bg-card: #ffffff;
+            --bg-code: #1e1e2e;
+            --text-dark: #2d2a24;
+            --text-body: #4a463d;
+            --text-muted: #8a857a;
+            --accent-rust: #c45d35;
+            --accent-forest: #3d7a5a;
+            --accent-navy: #2d4a6f;
+            --accent-gold: #b8963e;
+            --accent-plum: #6d4e7a;
+            --border: #e5e0d8;
+            --border-dark: #d4cdc2;
+            --shadow: 0 2px 8px rgba(45, 42, 36, 0.08);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html {
+            scroll-behavior: smooth;
+        }
+
+        body {
+            font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-cream);
+            color: var(--text-body);
+            line-height: 1.75;
+            font-size: 15px;
+            font-weight: 400;
+        }
+
+        /* Header */
+        .header {
+            background: var(--bg-card);
+            border-bottom: 1px solid var(--border);
+            padding: 4rem 2rem;
+            text-align: center;
+        }
+
+        .header-icon {
+            width: 64px;
+            height: 64px;
+            margin: 0 auto 1.5rem;
+            background: linear-gradient(135deg, var(--accent-rust) 0%, var(--accent-gold) 100%);
+            border-radius: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.75rem;
+            color: white;
+            box-shadow: 0 4px 12px rgba(196, 93, 53, 0.25);
+        }
+
+        .header h1 {
+            font-family: 'Newsreader', Georgia, serif;
+            font-size: clamp(1.75rem, 4vw, 2.5rem);
+            font-weight: 500;
+            color: var(--text-dark);
+            margin-bottom: 0.75rem;
+        }
+
+        .header .lead {
+            font-size: 1.0625rem;
+            color: var(--text-muted);
+            max-width: 540px;
+            margin: 0 auto;
+        }
+
+        /* Nav */
+        .nav {
+            position: sticky;
+            top: 0;
+            background: rgba(253, 251, 247, 0.95);
+            backdrop-filter: blur(10px);
+            border-bottom: 1px solid var(--border);
+            z-index: 100;
+            padding: 0.625rem 2rem;
+        }
+
+        .nav-inner {
+            max-width: 900px;
+            margin: 0 auto;
+            display: flex;
+            gap: 0.25rem;
+            overflow-x: auto;
+            scrollbar-width: none;
+        }
+
+        .nav-inner::-webkit-scrollbar { display: none; }
+
+        .nav-link {
+            color: var(--text-muted);
+            text-decoration: none;
+            font-size: 0.8125rem;
+            font-weight: 500;
+            padding: 0.5rem 0.875rem;
+            border-radius: 6px;
+            white-space: nowrap;
+            transition: all 0.15s ease;
+        }
+
+        .nav-link:hover {
+            color: var(--text-dark);
+            background: var(--bg-warm);
+        }
+
+        /* Main */
+        .main {
+            max-width: 760px;
+            margin: 0 auto;
+            padding: 3rem 1.5rem 6rem;
+        }
+
+        /* Sections */
+        section {
+            margin-bottom: 4rem;
+        }
+
+        h2 {
+            font-family: 'Newsreader', Georgia, serif;
+            font-size: 1.625rem;
+            font-weight: 500;
+            color: var(--text-dark);
+            margin-bottom: 1.25rem;
+            padding-bottom: 0.625rem;
+            border-bottom: 2px solid var(--border);
+        }
+
+        h3 {
+            font-size: 1.125rem;
+            font-weight: 600;
+            color: var(--text-dark);
+            margin: 2rem 0 0.75rem;
+        }
+
+        h4 {
+            font-size: 0.9375rem;
+            font-weight: 600;
+            color: var(--accent-rust);
+            margin: 1.5rem 0 0.5rem;
+        }
+
+        p {
+            margin-bottom: 1rem;
+        }
+
+        strong {
+            color: var(--text-dark);
+            font-weight: 600;
+        }
+
+        /* Lists */
+        ul, ol {
+            margin-bottom: 1rem;
+            padding-left: 1.25rem;
+        }
+
+        li {
+            margin-bottom: 0.375rem;
+        }
+
+        /* Code */
+        code {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.8125em;
+            background: var(--bg-warm);
+            padding: 0.125rem 0.375rem;
+            border-radius: 4px;
+            color: var(--accent-navy);
+        }
+
+        pre {
+            background: var(--bg-code);
+            border-radius: 10px;
+            padding: 1.25rem;
+            overflow-x: auto;
+            margin: 1.25rem 0;
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.8125rem;
+            line-height: 1.6;
+            color: #cdd6f4;
+        }
+
+        pre code {
+            background: none;
+            padding: 0;
+            color: inherit;
+        }
+
+        .code-comment { color: #6c7086; }
+        .code-keyword { color: #cba6f7; }
+        .code-type { color: #89b4fa; }
+        .code-number { color: #fab387; }
+        .code-string { color: #a6e3a1; }
+
+        /* Tables */
+        .table-wrap {
+            overflow-x: auto;
+            margin: 1.25rem 0;
+            border-radius: 10px;
+            border: 1px solid var(--border);
+            box-shadow: var(--shadow);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.875rem;
+            background: var(--bg-card);
+        }
+
+        th {
+            background: var(--bg-warm);
+            color: var(--text-dark);
+            font-weight: 600;
+            text-align: left;
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        td {
+            padding: 0.625rem 1rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        tr:hover td {
+            background: var(--bg-warm);
+        }
+
+        /* Diagram */
+        .diagram {
+            background: var(--bg-code);
+            border-radius: 10px;
+            padding: 1.5rem;
+            margin: 1.5rem 0;
+            overflow-x: auto;
+            position: relative;
+        }
+
+        .diagram::before {
+            content: attr(data-title);
+            position: absolute;
+            top: 0;
+            left: 0;
+            background: var(--accent-rust);
+            color: white;
+            padding: 0.375rem 1rem;
+            font-size: 0.6875rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            border-radius: 10px 0 8px 0;
+        }
+
+        .diagram pre {
+            background: transparent;
+            padding: 1.5rem 0 0;
+            margin: 0;
+            font-size: 0.75rem;
+            line-height: 1.5;
+            color: #cdd6f4;
+        }
+
+        .hl-rust { color: #fab387; }
+        .hl-forest { color: #a6e3a1; }
+        .hl-navy { color: #89b4fa; }
+        .hl-gold { color: #f9e2af; }
+        .hl-plum { color: #cba6f7; }
+        .hl-red { color: #f38ba8; }
+
+        /* Cards */
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 1.25rem;
+            margin: 1rem 0;
+            box-shadow: var(--shadow);
+        }
+
+        .card h4 {
+            margin-top: 0;
+        }
+
+        .card-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1rem;
+            margin: 1.5rem 0;
+        }
+
+        /* Callouts */
+        .callout {
+            border-radius: 10px;
+            padding: 1rem 1.25rem;
+            margin: 1.5rem 0;
+            border-left: 4px solid;
+        }
+
+        .callout-tip {
+            background: rgba(61, 122, 90, 0.08);
+            border-color: var(--accent-forest);
+        }
+
+        .callout-warn {
+            background: rgba(196, 93, 53, 0.08);
+            border-color: var(--accent-rust);
+        }
+
+        .callout-info {
+            background: rgba(45, 74, 111, 0.08);
+            border-color: var(--accent-navy);
+        }
+
+        .callout-title {
+            font-weight: 600;
+            font-size: 0.8125rem;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            margin-bottom: 0.5rem;
+        }
+
+        .callout-tip .callout-title { color: var(--accent-forest); }
+        .callout-warn .callout-title { color: var(--accent-rust); }
+        .callout-info .callout-title { color: var(--accent-navy); }
+
+        .callout p:last-child { margin-bottom: 0; }
+
+        /* Pros/Cons table */
+        .pros-cons {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+            margin: 1rem 0;
+        }
+
+        .pros, .cons {
+            padding: 1rem;
+            border-radius: 8px;
+        }
+
+        .pros {
+            background: rgba(61, 122, 90, 0.08);
+            border: 1px solid rgba(61, 122, 90, 0.2);
+        }
+
+        .cons {
+            background: rgba(196, 93, 53, 0.08);
+            border: 1px solid rgba(196, 93, 53, 0.2);
+        }
+
+        .pros h5, .cons h5 {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 0.5rem;
+        }
+
+        .pros h5 { color: var(--accent-forest); }
+        .cons h5 { color: var(--accent-rust); }
+
+        .pros ul, .cons ul {
+            margin: 0;
+            padding-left: 1rem;
+            font-size: 0.875rem;
+        }
+
+        /* Decision tree */
+        .decision-tree {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 1.5rem;
+            margin: 1.5rem 0;
+            box-shadow: var(--shadow);
+        }
+
+        .decision-tree pre {
+            background: transparent;
+            color: var(--text-body);
+            padding: 0;
+            margin: 0;
+            font-size: 0.8125rem;
+        }
+
+        /* Footer */
+        .footer {
+            border-top: 1px solid var(--border);
+            padding: 2rem;
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 0.8125rem;
+        }
+
+        /* Responsive */
+        @media (max-width: 640px) {
+            .header { padding: 2.5rem 1rem; }
+            .main { padding: 2rem 1rem; }
+            h2 { font-size: 1.375rem; }
+            .pros-cons { grid-template-columns: 1fr; }
+            .card-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <div class="header-icon">π</div>
+        <h1>Prior Selection for Production</h1>
+        <p class="lead">How to choose priors when you don't know the true parameters, and what to do when priors don't match reality</p>
+    </header>
+
+    <nav class="nav">
+        <div class="nav-inner">
+            <a href="#problem" class="nav-link">The Problem</a>
+            <a href="#philosophies" class="nav-link">Two Philosophies</a>
+            <a href="#recommended" class="nav-link">Recommended Bounds</a>
+            <a href="#detection" class="nav-link">Boundary Detection</a>
+            <a href="#initialization" class="nav-link">Initialization</a>
+            <a href="#elicitation" class="nav-link">Domain Elicitation</a>
+            <a href="#summary" class="nav-link">Summary</a>
+        </div>
+    </nav>
+
+    <main class="main">
+        <!-- The Problem -->
+        <section id="problem">
+            <h2>The Prior Truncation Problem</h2>
+            
+            <p>If your prior bounds exclude the true parameter values, the filter <strong>cannot</strong> find them. The posterior piles up at the boundary:</p>
+
+            <div class="diagram" data-title="Truncation">
+<pre>
+Prior: mu_base ∈ [-2, 0]
+True:  mu_base = <span class="hl-red">-4.2</span>
+
+     Prior density
+         ▲
+         │    ┌────────────┐
+         │    │            │
+         │    │  <span class="hl-navy">ALLOWED</span>   │
+         │    │   <span class="hl-navy">REGION</span>   │
+         │    │            │
+         └────┴────────────┴──────────────────▶ mu_base
+             -2            0
+              <span class="hl-rust">▲</span>
+              <span class="hl-rust">│</span>
+         <span class="hl-rust">Posterior piles up here</span>
+         <span class="hl-rust">(can't go lower!)</span>
+                                    <span class="hl-gold">TRUE VALUE</span>
+                                        ↓
+         ─────────────────────────────(<span class="hl-gold">−4.2</span>)───
+</pre>
+            </div>
+
+            <h3>Symptoms of Prior Truncation</h3>
+            <ul>
+                <li>Posterior mean very close to prior boundary</li>
+                <li>Posterior std suspiciously small (artificially constrained)</li>
+                <li>Z-scores explode when you know ground truth</li>
+                <li>NLL remains elevated even after convergence</li>
+            </ul>
+
+            <div class="callout callout-warn">
+                <div class="callout-title">Real Example</div>
+                <p>With priors <code>mu_scale ∈ [0, 1]</code> and true value <code>2.8</code>, the estimate got stuck at <code>0.69</code> with 75% error — the filter literally couldn't reach the truth.</p>
+            </div>
+        </section>
+
+        <!-- Two Philosophies -->
+        <section id="philosophies">
+            <h2>Two Philosophies</h2>
+
+            <h3>Philosophy 1: Wide Priors (Robust)</h3>
+            <p>Use very wide, weakly informative priors that cover any plausible market regime:</p>
+
+<pre><code><span class="code-comment">// "I don't know much, but I know physics"</span>
+<span class="code-comment">// Vol can't be negative, rho must be < 1, etc.</span>
+
+PriorBounds wide = {
+    .mu_base_min  = <span class="code-number">-10.0f</span>,  <span class="code-comment">// 0.7% vol</span>
+    .mu_base_max  = <span class="code-number">0.0f</span>,    <span class="code-comment">// 100% vol</span>
+    .mu_scale_min = <span class="code-number">0.0f</span>,
+    .mu_scale_max = <span class="code-number">6.0f</span>,    <span class="code-comment">// ~400× vol increase possible</span>
+};</code></pre>
+
+            <div class="pros-cons">
+                <div class="pros">
+                    <h5>✓ Pros</h5>
+                    <ul>
+                        <li>Robust to unknown regimes</li>
+                        <li>Won't miss true values</li>
+                        <li>Simple — no adaptation logic</li>
+                        <li>Safe default choice</li>
+                    </ul>
+                </div>
+                <div class="cons">
+                    <h5>✗ Cons</h5>
+                    <ul>
+                        <li>Slower convergence</li>
+                        <li>Needs more data (T > 3000)</li>
+                        <li>Needs more particles</li>
+                        <li>May explore implausible regions</li>
+                    </ul>
+                </div>
+            </div>
+
+            <p><strong>When to use:</strong> Production systems, unknown market regimes, when robustness matters more than speed.</p>
+
+            <h3>Philosophy 2: Adaptive Priors</h3>
+            <p>Start with reasonable priors based on domain knowledge, but detect and respond to boundary hitting:</p>
+
+            <div class="diagram" data-title="Adaptive Strategy">
+<pre>
+<span class="hl-navy">1. START</span> with "typical market" priors
+   mu_base ∈ [-4, -1]    <span class="hl-plum">// 10-60% annual vol</span>
+   mu_scale ∈ [0, 2]     <span class="hl-plum">// up to 3× vol in stress</span>
+
+<span class="hl-navy">2. RUN</span> SMC² and monitor posterior
+
+<span class="hl-navy">3. DETECT</span> boundary hitting:
+   posterior_mean - 2σ < prior_min  →  <span class="hl-rust">hitting lower bound</span>
+   posterior_mean + 2σ > prior_max  →  <span class="hl-rust">hitting upper bound</span>
+
+<span class="hl-navy">4. RESPOND:</span>
+   Option A: Expand bounds and re-run
+   Option B: Flag result as unreliable
+   Option C: Use drift to gradually migrate
+</pre>
+            </div>
+
+            <div class="pros-cons">
+                <div class="pros">
+                    <h5>✓ Pros</h5>
+                    <ul>
+                        <li>Faster convergence initially</li>
+                        <li>Domain knowledge helps</li>
+                        <li>Tighter posteriors</li>
+                    </ul>
+                </div>
+                <div class="cons">
+                    <h5>✗ Cons</h5>
+                    <ul>
+                        <li>Complex logic</li>
+                        <li>May need re-runs</li>
+                        <li>Risk of missing regimes</li>
+                    </ul>
+                </div>
+            </div>
+
+            <p><strong>When to use:</strong> Research, known stable regimes, when you have good domain priors.</p>
+        </section>
+
+        <!-- Recommended Bounds -->
+        <section id="recommended">
+            <h2>Recommended Prior Bounds</h2>
+
+            <h3>Log-Volatility Scale Reference</h3>
+            <p>Understanding what μ_base values mean in terms of annualized volatility:</p>
+
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>μ_base</th>
+                            <th>exp(μ/2)</th>
+                            <th>Interpretation</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>-6.0</code></td>
+                            <td>5%</td>
+                            <td>Very calm (bonds, low-vol stocks)</td>
+                        </tr>
+                        <tr>
+                            <td><code>-4.0</code></td>
+                            <td>14%</td>
+                            <td>Normal equity vol</td>
+                        </tr>
+                        <tr>
+                            <td><code>-2.0</code></td>
+                            <td>37%</td>
+                            <td>Elevated (earnings, mild stress)</td>
+                        </tr>
+                        <tr>
+                            <td><code>-1.0</code></td>
+                            <td>61%</td>
+                            <td>High stress</td>
+                        </tr>
+                        <tr>
+                            <td><code>0.0</code></td>
+                            <td>100%</td>
+                            <td>Crisis levels</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <h3>Production Priors for Equity Markets</h3>
+
+<pre><code>PriorBounds production = {
+    <span class="code-comment">// Regime persistence</span>
+    .rho_min = <span class="code-number">0.85f</span>,       <span class="code-comment">// ~7 tick half-life</span>
+    .rho_max = <span class="code-number">0.995f</span>,      <span class="code-comment">// ~140 tick half-life</span>
+    
+    <span class="code-comment">// Regime innovation</span>
+    .sigma_z_min = <span class="code-number">0.02f</span>,   <span class="code-comment">// slow regime changes</span>
+    .sigma_z_max = <span class="code-number">0.25f</span>,   <span class="code-comment">// fast regime switching</span>
+    
+    <span class="code-comment">// Volatility mean curve</span>
+    .mu_base_min = <span class="code-number">-8.0f</span>,   <span class="code-comment">// ~2% vol floor</span>
+    .mu_base_max = <span class="code-number">-1.0f</span>,   <span class="code-comment">// ~60% vol floor</span>
+    .mu_scale_min = <span class="code-number">0.0f</span>,
+    .mu_scale_max = <span class="code-number">5.0f</span>,   <span class="code-comment">// up to ~12× vol increase</span>
+    .mu_rate_min = <span class="code-number">0.1f</span>,
+    .mu_rate_max = <span class="code-number">3.0f</span>,
+    
+    <span class="code-comment">// Vol-of-vol curve</span>
+    .sigma_base_min = <span class="code-number">0.02f</span>,
+    .sigma_base_max = <span class="code-number">0.30f</span>,
+    .sigma_scale_min = <span class="code-number">0.0f</span>,
+    .sigma_scale_max = <span class="code-number">0.60f</span>,
+    .sigma_rate_min = <span class="code-number">0.1f</span>,
+    .sigma_rate_max = <span class="code-number">3.0f</span>,
+};</code></pre>
+        </section>
+
+        <!-- Boundary Detection -->
+        <section id="detection">
+            <h2>Boundary Detection</h2>
+
+            <p>Implement runtime checks to detect when posteriors are truncated:</p>
+
+<pre><code><span class="code-type">bool</span> check_truncation(
+    <span class="code-keyword">const</span> <span class="code-type">float</span>* mean,
+    <span class="code-keyword">const</span> <span class="code-type">float</span>* std,
+    <span class="code-keyword">const</span> <span class="code-type">float</span>* prior_min,
+    <span class="code-keyword">const</span> <span class="code-type">float</span>* prior_max,
+    <span class="code-type">float</span> margin  <span class="code-comment">// e.g., 0.05 for 5%</span>
+) {
+    <span class="code-keyword">for</span> (<span class="code-type">int</span> p = <span class="code-number">0</span>; p < N_PARAMS; p++) {
+        <span class="code-type">float</span> range = prior_max[p] - prior_min[p];
+        
+        <span class="code-comment">// Check if 2σ interval hits boundary</span>
+        <span class="code-keyword">if</span> (mean[p] - <span class="code-number">2</span>*std[p] < prior_min[p] + margin*range) {
+            printf(<span class="code-string">"[WARN] Param %d at lower bound\n"</span>, p);
+            <span class="code-keyword">return</span> <span class="code-number">true</span>;
+        }
+        <span class="code-keyword">if</span> (mean[p] + <span class="code-number">2</span>*std[p] > prior_max[p] - margin*range) {
+            printf(<span class="code-string">"[WARN] Param %d at upper bound\n"</span>, p);
+            <span class="code-keyword">return</span> <span class="code-number">true</span>;
+        }
+    }
+    <span class="code-keyword">return</span> <span class="code-number">false</span>;
+}</code></pre>
+
+            <h3>Response Strategies</h3>
+
+            <div class="card-grid">
+                <div class="card">
+                    <h4>Strategy A: Expand & Re-run</h4>
+<pre style="font-size: 0.75rem; margin: 0.5rem 0;"><code>if (truncated) {
+  bounds.min[p] *= 1.5f;
+  smc2_reset(state);
+  // Re-run
+}</code></pre>
+                    <p style="font-size: 0.8125rem; margin-bottom: 0;">Good for batch processing where latency is acceptable.</p>
+                </div>
+                <div class="card">
+                    <h4>Strategy B: Flag & Continue</h4>
+<pre style="font-size: 0.75rem; margin: 0.5rem 0;"><code>if (truncated) {
+  result.confidence = LOW;
+  // Continue cautiously
+}</code></pre>
+                    <p style="font-size: 0.8125rem; margin-bottom: 0;">Good for real-time where you can't re-run.</p>
+                </div>
+                <div class="card">
+                    <h4>Strategy C: Increase Drift</h4>
+<pre style="font-size: 0.75rem; margin: 0.5rem 0;"><code>if (truncated) {
+  Q[p] *= 2.0f;
+  // Let drift migrate
+}</code></pre>
+                    <p style="font-size: 0.8125rem; margin-bottom: 0;">Good for streaming mode with drift enabled.</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Initialization -->
+        <section id="initialization">
+            <h2>Prior Initialization</h2>
+
+            <h3>Option 1: Sample from Prior</h3>
+<pre><code><span class="code-keyword">for</span> (<span class="code-type">int</span> j = <span class="code-number">0</span>; j < N_theta; j++) {
+    theta[j][p] = uniform(prior_min[p], prior_max[p]);
+}</code></pre>
+            <p><strong>Pros:</strong> Unbiased, explores full space<br>
+            <strong>Cons:</strong> Many particles start in implausible regions</p>
+
+            <h3>Option 2: Concentrated Start</h3>
+<pre><code><span class="code-type">float</span> mid = (prior_min[p] + prior_max[p]) / <span class="code-number">2</span>;
+<span class="code-type">float</span> range = prior_max[p] - prior_min[p];
+theta[j][p] = mid + <span class="code-number">0.1f</span> * range * randn();</code></pre>
+            <p><strong>Pros:</strong> Fast initial convergence<br>
+            <strong>Cons:</strong> May miss true value if prior midpoint is wrong</p>
+
+            <h3>Option 3: Warm Start (Recommended for Recalibration)</h3>
+<pre><code><span class="code-type">float</span>* prev = hcrbpf_get_params();
+theta[j][p] = prev[p] + jitter_std[p] * randn();</code></pre>
+            <p><strong>Pros:</strong> Best for recalibration — starts near known-good region<br>
+            <strong>Cons:</strong> May be trapped if previous params were wrong</p>
+
+            <div class="callout callout-tip">
+                <div class="callout-title">Recommendation</div>
+                <p>For a recalibration system: Use warm start in normal operation, but fall back to wide prior sampling when NLL excess indicates severe drift.</p>
+            </div>
+        </section>
+
+        <!-- Domain Elicitation -->
+        <section id="elicitation">
+            <h2>Domain-Specific Prior Elicitation</h2>
+
+            <p>Questions to ask when setting priors:</p>
+
+            <h3>Volatility Level (μ_base, μ_scale)</h3>
+            <ol>
+                <li>What's the <strong>lowest</strong> realistic annualized vol for this asset? → μ_base_min</li>
+                <li>What's the <strong>highest</strong> vol observed historically? → μ_base + μ_scale max</li>
+                <li>How much can vol <strong>increase</strong> during stress? → μ_scale_max</li>
+            </ol>
+
+            <div class="card">
+                <h4>Example: SPY (S&P 500 ETF)</h4>
+                <ul>
+                    <li>Lowest: ~8% (2017 calm) → μ_base_min ≈ -5.0</li>
+                    <li>Highest: ~80% (March 2020) → μ_base + μ_scale ≈ -0.4</li>
+                    <li>Stress multiplier: ~10× → μ_scale_max ≈ 4.0</li>
+                </ul>
+            </div>
+
+            <h3>Regime Dynamics (ρ, σ_z)</h3>
+            <ol>
+                <li>How long do vol regimes typically <strong>last</strong>? → ρ</li>
+                <li>How <strong>quickly</strong> can regimes switch? → σ_z</li>
+            </ol>
+
+            <div class="card">
+                <h4>Example</h4>
+                <ul>
+                    <li>VIX mean-reversion half-life: ~20-40 days → ρ ≈ 0.95-0.98</li>
+                    <li>Flash crash regime switch: &lt;1 day → σ_z up to 0.2</li>
+                </ul>
+            </div>
+        </section>
+
+        <!-- Summary -->
+        <section id="summary">
+            <h2>Summary: Decision Tree</h2>
+
+            <div class="decision-tree">
+<pre>
+<strong>START</strong>
+  │
+  ▼
+Is this a known, stable regime?
+  │
+  ├─ <span style="color: var(--accent-forest);">YES</span> → Use informative priors + warm start
+  │        Prior width: ±2σ around expected values
+  │        Init: from previous estimate
+  │
+  └─ <span style="color: var(--accent-rust);">NO</span> (unknown regime or recalibration after drift)
+       │
+       ▼
+     Use wide priors + full exploration
+       │
+       ├─ Prior width: cover all plausible values
+       │
+       ├─ Init: sample from prior (not concentrated)
+       │
+       └─ Enable boundary detection
+            │
+            ▼
+          Truncation detected?
+            │
+            ├─ <span style="color: var(--accent-forest);">NO</span> → Continue normally
+            │
+            └─ <span style="color: var(--accent-rust);">YES</span> → Expand bounds or increase drift Q
+</pre>
+            </div>
+
+            <div class="callout callout-info">
+                <div class="callout-title">Bottom Line</div>
+                <p>For a recalibration system that must handle unknown regimes, <strong>use wide priors and accept slower convergence</strong>. The drift mechanism helps explore even if you start in the wrong region. Always implement boundary detection as a safety check.</p>
+            </div>
+        </section>
+    </main>
+
+    <footer class="footer">
+        <p>Prior Selection for Production Systems · SMC² Documentation · January 2026</p>
+    </footer>
+
+    <script>
+        document.querySelectorAll('.nav-link').forEach(link => {
+            link.addEventListener('click', e => {
+                e.preventDefault();
+                const target = document.querySelector(link.getAttribute('href'));
+                if (target) {
+                    window.scrollTo({
+                        top: target.getBoundingClientRect().top + window.pageYOffset - 60,
+                        behavior: 'smooth'
+                    });
+                }
+            });
+        });
+    </script>
+</body>
+</html>
