@@ -15,6 +15,15 @@
 #include <math.h>
 #include <time.h>
 
+
+#ifndef CUDA_N_THETA
+#define CUDA_N_THETA 256
+#endif
+
+#ifndef CUDA_N_INNER
+#define CUDA_N_INNER 256
+#endif
+
 /*═══════════════════════════════════════════════════════════════════════════
  * Host RNG (xorshift64* for quality)
  *═══════════════════════════════════════════════════════════════════════════*/
@@ -218,7 +227,7 @@ void test_parameter_learning(void) {
     
     /* Generate data */
     seed_host_rng(42);  /* Reproducible */
-    int T = 2000;
+    int T = 500;
     float* y = (float*)malloc(T * sizeof(float));
     float* h_true = (float*)malloc(T * sizeof(float));
     

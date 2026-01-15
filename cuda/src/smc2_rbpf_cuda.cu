@@ -1,99 +1,21 @@
 /**
  * @file smc2_rbpf_cuda.cu
- * @brief SMC² with RBPF Inner Filter - CUDA Implementation
+ * @brief SMC² with RBPF Inner Filter - Kernel Implementations
  * 
- * Corrected version with:
- *   - Proper PMMH rejuvenation (O(t) full-history likelihood)
- *   - Fixed ESS calculation
- *   - Outer systematic resampling
- *   - Log-weight reset after resampling
- * 
- * OCSN NOTE: d_OCSN_MEANS are from Kim-Shephard-Chib (1998) Table 4,
- * which approximates RAW log χ²(1) directly. OCSN_OFFSET = 0.
+ * See smc2_rbpf_cuda.cuh for algorithm documentation.
+ * This file contains kernel bodies and host API implementation.
  */
 
 #include "smc2_rbpf_cuda.cuh"
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>      /* For uint64_t */
 #include <math.h>
 #include <time.h>
-#include <curand.h>      /* For curandGenerator_t */
-#include <cuda_fp16.h>   /* For half precision */
+#include <curand.h>
 
-/*═══════════════════════════════════════════════════════════════════════════
- * OCSN Constants in Constant Memory
- * 
- * 10-component Gaussian mixture approximation to log χ²(1).
- * 
- * Source: Omori, Chib, Shephard & Nakajima (2007), Table 1
- *         "Stochastic Volatility with Leverage: Fast and Efficient 
- *          Likelihood Inference", Journal of Econometrics
- * 
- * These weights, means, and variances are matched pairs approximating
- * the RAW log χ²(1) distribution (E[log χ²(1)] ≈ -1.2704, Var ≈ π²/2).
- * 
- * With OCSN_OFFSET = 0, the innovation formula is simply:
- *   innov = y - h_pred - m_k
- *═══════════════════════════════════════════════════════════════════════════*/
-
-__constant__ float d_OCSN_WEIGHTS[OCSN_K] = {
-    0.00609f, 0.04775f, 0.13057f, 0.20674f, 0.22715f,
-    0.18842f, 0.12047f, 0.05591f, 0.01575f, 0.00115f
-};
-
-__constant__ float d_OCSN_MEANS[OCSN_K] = {
-    1.92677f,  1.34744f,  0.73504f,  0.02266f, -0.85173f,
-   -1.97278f, -3.46788f, -5.55246f, -8.68384f, -14.65000f
-};
-
-__constant__ float d_OCSN_VARS[OCSN_K] = {
-    0.11265f, 0.17788f, 0.26768f, 0.40611f, 0.62699f,
-    0.98583f, 1.57469f, 2.54498f, 4.16591f, 7.33342f
-};
-
-__constant__ float d_OCSN_LOG_WEIGHTS[OCSN_K] = {
-    -5.1011072f, -3.0417762f, -2.0358458f, -1.5762933f, -1.4821447f,
-    -1.6690818f, -2.1163545f, -2.8840120f, -4.1509149f, -6.7679933f
-};
-
-/* Precomputed: 1.0 / v_k — eliminates divisions in hot path */
-__constant__ float d_OCSN_INV_VARS[OCSN_K] = {
-    8.87705282f, 5.62176748f, 3.73580395f, 2.46238704f, 1.59492177f,
-    1.01437367f, 0.63504563f, 0.39293040f, 0.24004359f, 0.13636202f
-};
-
-/* Precomputed: log(v_k) — used with log1pf for log(S) */
-__constant__ float d_OCSN_LOG_VARS[OCSN_K] = {
-    -2.18346961f, -1.72664611f, -1.31796304f, -0.90113122f, -0.46682469f,
-    -0.01427135f,  0.45405843f,  0.93412279f,  1.42693474f,  1.99244198f
-};
-
-__constant__ SVPrior d_prior;
-__constant__ SVBounds d_bounds;
-__constant__ SVCurve d_theta_curve;
-__constant__ float d_proposal_std[8];
-
-/*═══════════════════════════════════════════════════════════════════════════
- * CPMMH Coupling: Bucket Sort Configuration
- * 
- * Sorting particles by h (or mu_h in RBPF) after resampling preserves
- * the "slot identity" that CPMMH relies on for correlation.
- * Without sorting, resampling permutes particles randomly, breaking
- * the noise-to-state coupling that makes CPMMH work.
- *═══════════════════════════════════════════════════════════════════════════*/
-
-#ifndef SORT_EVERY_K
-#define SORT_EVERY_K 1      /* Sort every K timesteps (1 = every step, like working CPU code) */
-#endif
-
-#define SORT_BINS 64        /* Number of bins for bucket sort */
-#define SORT_H_MIN -20.0f   /* Min h value for binning */
-#define SORT_H_MAX  20.0f   /* Max h value for binning */
-
-/*═══════════════════════════════════════════════════════════════════════════
- * Error Checking
- *═══════════════════════════════════════════════════════════════════════════*/
+/*═══════════════════════════════════════════════════════════════════════════════
+ * CUDA ERROR CHECKING
+ *═══════════════════════════════════════════════════════════════════════════════*/
 
 #define CUDA_CHECK(call) do { \
     cudaError_t err = call; \
@@ -104,149 +26,64 @@ __constant__ float d_proposal_std[8];
     } \
 } while(0)
 
-/*═══════════════════════════════════════════════════════════════════════════
- * Warp/Block Reductions
- *═══════════════════════════════════════════════════════════════════════════*/
-
-__device__ __forceinline__ float warp_reduce_sum(float val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
-    }
-    return val;
-}
-
-__device__ __forceinline__ float warp_reduce_max(float val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
-        val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
-    }
-    return val;
-}
-
-__device__ float block_reduce_sum(float val, volatile float* shared) {
-    int lane = threadIdx.x % 32;
-    int wid = threadIdx.x / 32;
-    int numWarps = (blockDim.x + 31) >> 5;  /* Ceiling division */
-    
-    val = warp_reduce_sum(val);
-    
-    if (lane == 0) shared[wid] = val;
-    __syncthreads();
-    
-    val = (threadIdx.x < numWarps) ? shared[threadIdx.x] : 0.0f;
-    if (wid == 0) val = warp_reduce_sum(val);
-    
-    if (threadIdx.x == 0) shared[0] = val;
-    __syncthreads();
-    
-    return shared[0];
-}
-
-__device__ float block_reduce_max(float val, volatile float* shared) {
-    int lane = threadIdx.x % 32;
-    int wid = threadIdx.x / 32;
-    int numWarps = (blockDim.x + 31) >> 5;  /* Ceiling division */
-    
-    val = warp_reduce_max(val);
-    
-    if (lane == 0) shared[wid] = val;
-    __syncthreads();
-    
-    val = (threadIdx.x < numWarps) ? shared[threadIdx.x] : -1e30f;
-    if (wid == 0) val = warp_reduce_max(val);
-    
-    if (threadIdx.x == 0) shared[0] = val;
-    __syncthreads();
-    
-    return shared[0];
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
- * Parallel Inclusive Prefix Sum (Hillis-Steele scan)
+/*═══════════════════════════════════════════════════════════════════════════════
+ * OCSN CONSTANT MEMORY DEFINITIONS
  * 
- * Input:  data[0..n-1] in shared memory
- * Output: data[i] = sum(data[0..i]) (inclusive scan)
+ * 10-component Gaussian mixture approximation to log χ²(1).
+ * Source: Omori, Chib, Shephard & Nakajima (2007), Table 1
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+__device__ __constant__ float d_OCSN_WEIGHTS[OCSN_K] = {
+    0.00609f, 0.04775f, 0.13057f, 0.20674f, 0.22715f,
+    0.18842f, 0.12047f, 0.05591f, 0.01575f, 0.00115f
+};
+
+__device__ __constant__ float d_OCSN_MEANS[OCSN_K] = {
+    1.92677f,  1.34744f,  0.73504f,  0.02266f, -0.85173f,
+   -1.97278f, -3.46788f, -5.55246f, -8.68384f, -14.65000f
+};
+
+__device__ __constant__ float d_OCSN_VARS[OCSN_K] = {
+    0.11265f, 0.17788f, 0.26768f, 0.40611f, 0.62699f,
+    0.98583f, 1.57469f, 2.54498f, 4.16591f, 7.33342f
+};
+
+__device__ __constant__ float d_OCSN_LOG_WEIGHTS[OCSN_K] = {
+    -5.1011072f, -3.0417762f, -2.0358458f, -1.5762933f, -1.4821447f,
+    -1.6690818f, -2.1163545f, -2.8840120f, -4.1509149f, -6.7679933f
+};
+
+__device__ __constant__ float d_OCSN_INV_VARS[OCSN_K] = {
+    8.87705282f, 5.62176748f, 3.73580395f, 2.46238704f, 1.59492177f,
+    1.01437367f, 0.63504563f, 0.39293040f, 0.24004359f, 0.13636202f
+};
+
+__device__ __constant__ float d_OCSN_LOG_VARS[OCSN_K] = {
+    -2.18346961f, -1.72664611f, -1.31796304f, -0.90113122f, -0.46682469f,
+    -0.01427135f,  0.45405843f,  0.93412279f,  1.42693474f,  1.99244198f
+};
+
+/*═══════════════════════════════════════════════════════════════════════════════
+ * CONSTANT MEMORY
  * 
- * O(n log n) work, O(log n) depth — much better latency than serial O(n)
- * Requires n <= blockDim.x
- *═══════════════════════════════════════════════════════════════════════════*/
+ * Model parameters copied once at init, accessed by all kernels.
+ *═══════════════════════════════════════════════════════════════════════════════*/
 
-__device__ void block_inclusive_scan(volatile float* data, int n) {
-    int tid = threadIdx.x;
-    
-    /* Hillis-Steele: each step doubles the offset */
-    for (int offset = 1; offset < n; offset *= 2) {
-        float temp = 0.0f;
-        if (tid >= offset && tid < n) {
-            temp = data[tid - offset];
-        }
-        __syncthreads();
-        
-        if (tid >= offset && tid < n) {
-            data[tid] += temp;
-        }
-        __syncthreads();
-    }
-}
+__constant__ SVPrior  d_prior;
+__constant__ SVBounds d_bounds;
+__constant__ SVCurve  d_theta_curve;
+__constant__ float    d_proposal_std[8];
 
-/*═══════════════════════════════════════════════════════════════════════════
- * Helpers
- *═══════════════════════════════════════════════════════════════════════════*/
-
-__device__ __forceinline__ float eval_curve(float base, float scale, float rate, float z) {
-    return base + scale * (1.0f - __expf(-rate * z));
-}
-
-__device__ __forceinline__ float clampf(float x, float lo, float hi) {
-    return fminf(fmaxf(x, lo), hi);
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
- * Z-space Transform: Unconstrained z̃ ↔ Bounded z ∈ (0, 3)
- * 
- * The regime variable z must be in (0, 3) for the curve functions.
- * Instead of clamping (which breaks the likelihood), we reparameterize:
- * 
- *   z̃ ∈ ℝ           (unconstrained, follows exact Gaussian AR(1))
- *   z = 1.5·(1 + tanh(z̃)) ∈ (0, 3)   (bounded, used for curve evaluation)
- * 
- * Benefits:
- *   - AR(1) on z̃ has exact Gaussian transition density (no truncation)
- *   - z is always in valid range by construction
- *   - Smooth transform → no gradient discontinuities
- *   - No probability mass accumulation at boundaries
- * 
- * The z̃ dynamics: z̃_t = ρ·z̃_{t-1} + σ_z·ε_t
- * Stationary distribution: z̃ ~ N(0, σ_z²/(1-ρ²))
- *═══════════════════════════════════════════════════════════════════════════*/
-
-#define Z_CENTER 1.5f    /* Center of z range */
-#define Z_SCALE  1.5f    /* Half-width of z range */
-
-__device__ __forceinline__ float z_tilde_to_z(float z_tilde) {
-    /* z = 1.5 * (1 + tanh(z̃)) maps ℝ → (0, 3) */
-    return Z_CENTER * (1.0f + tanhf(z_tilde));
-}
-
-__device__ __forceinline__ float z_to_z_tilde(float z) {
-    /* z̃ = atanh((z - 1.5) / 1.5) maps (0, 3) → ℝ 
-     * Used only for initialization from prior samples */
-    float normalized = (z - Z_CENTER) / Z_SCALE;
-    /* Clamp to avoid atanh(±1) = ±∞ */
-    normalized = fmaxf(-0.999f, fminf(0.999f, normalized));
-    return atanhf(normalized);
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
- * Log Prior for θ parameters
- * Returns -INFINITY if out of bounds, otherwise sum of Gaussian log-densities
- *═══════════════════════════════════════════════════════════════════════════*/
+/*═══════════════════════════════════════════════════════════════════════════════
+ * LOG PRIOR EVALUATION
+ *═══════════════════════════════════════════════════════════════════════════════*/
 
 __device__ float log_prior_theta(
     float rho, float sigma_z,
     float mu_base, float mu_scale, float mu_rate,
     float sigma_base, float sigma_scale, float sigma_rate
 ) {
-    /* Bounds check - return -inf if any parameter out of bounds */
+    /* Bounds check */
     if (rho < d_bounds.rho_min || rho > d_bounds.rho_max) return -INFINITY;
     if (sigma_z < d_bounds.sigma_z_min || sigma_z > d_bounds.sigma_z_max) return -INFINITY;
     if (mu_base < d_bounds.mu_base_min || mu_base > d_bounds.mu_base_max) return -INFINITY;
@@ -256,7 +93,7 @@ __device__ float log_prior_theta(
     if (sigma_scale < d_bounds.sigma_scale_min || sigma_scale > d_bounds.sigma_scale_max) return -INFINITY;
     if (sigma_rate < d_bounds.sigma_rate_min || sigma_rate > d_bounds.sigma_rate_max) return -INFINITY;
     
-    /* Gaussian log-prior (ignoring normalization constants - they cancel in MH ratio) */
+    /* Gaussian log-prior (normalization constants cancel in MH ratio) */
     float lp = 0.0f;
     
     float d_rho = (rho - d_prior.rho_mean) / d_prior.rho_std;
@@ -275,184 +112,9 @@ __device__ float log_prior_theta(
     return lp;
 }
 
-/*═══════════════════════════════════════════════════════════════════════════
- * Derive u0 from z_noise - eliminates separate u0 storage
- * Maps correlated Gaussian noise to [0,1) for systematic resampling
- * 
- * Uses probability integral transform: if Z ~ N(0,1), then Φ(Z) ~ Uniform(0,1)
- * This is exact and preserves correlation structure for CPMMH coupling.
- *═══════════════════════════════════════════════════════════════════════════*/
-
-__device__ __forceinline__ float u0_from_noise(float z_noise) {
-    /* Φ(z) = 0.5 * (1 + erf(z / sqrt(2))) 
-     * CUDA's normcdff() computes this directly */
-    float u = normcdff(z_noise);
-    /* Clamp away from exact 0 and 1 to avoid edge cases in resampling */
-    return fmaxf(1e-7f, fminf(1.0f - 1e-7f, u));
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
- * OCSN Kalman Update
- * 
- * Implements the 10-component Gaussian mixture approximation to log χ²(1)
- * from Omori et al. (2007) for the stochastic volatility observation equation.
- * 
- * NOTE: We omit the -0.5*log(2π) constant from Gaussian log-density.
- * This does not affect MH acceptance ratios (cancels) or relative weights,
- * but the returned log_lik values are shifted by +0.5*log(2π) ≈ +0.919.
- * If absolute log-likelihood values are needed for model comparison,
- * subtract 0.5*log(2π) per observation externally.
- *═══════════════════════════════════════════════════════════════════════════*/
-
-__device__ void ocsn_kalman_update(
-    float y, float mu_pred, float var_pred,
-    float* mu_post_out, float* var_post_out, float* log_lik_out
-) {
-    float log_alpha_tilde[OCSN_K];
-    float log_max = -1e30f;
-    
-    /* Pass 1: Compute unnormalized log mixture weights
-     * Optimization: Use precomputed inv_vars and log_vars to reduce divisions */
-    #pragma unroll
-    for (int k = 0; k < OCSN_K; k++) {
-        float v_k = d_OCSN_VARS[k];
-        float inv_v_k = d_OCSN_INV_VARS[k];
-        float log_v_k = d_OCSN_LOG_VARS[k];
-        
-        float S = var_pred + v_k;
-        float inv_S = 1.0f / S;  /* ONE division per component */
-        
-        float innov = y - mu_pred - d_OCSN_MEANS[k];
-        
-        /* log(S) = log(v_k * (1 + var_pred/v_k)) = log_v_k + log1p(var_pred * inv_v_k) */
-        float log_S = log_v_k + log1pf(var_pred * inv_v_k);
-        
-        /* log α̃_k = log(q_k) - 0.5*log(S) - 0.5*innov²/S */
-        float val = d_OCSN_LOG_WEIGHTS[k] - 0.5f * (log_S + innov * innov * inv_S);
-        
-        log_alpha_tilde[k] = val;
-        log_max = fmaxf(log_max, val);
-    }
-    
-    /* Normalize: log(Σ exp(log_α̃_k)) */
-    float sum_exp = 0.0f;
-    #pragma unroll
-    for (int k = 0; k < OCSN_K; k++) {
-        sum_exp += __expf(log_alpha_tilde[k] - log_max);
-    }
-    float log_norm = log_max + __logf(sum_exp);
-    
-    /* Pass 2: Compute posterior mean/variance
-     * Recompute S, innov to save registers (occupancy > caching) */
-    float mu_post = 0.0f;
-    float E_h_sq = 0.0f;
-    
-    #pragma unroll
-    for (int k = 0; k < OCSN_K; k++) {
-        float w = __expf(log_alpha_tilde[k] - log_norm);
-        
-        /* Recompute (cheaper than register pressure) */
-        float S = var_pred + d_OCSN_VARS[k];
-        float inv_S = 1.0f / S;
-        float innov = y - mu_pred - d_OCSN_MEANS[k];
-        
-        /* Kalman gain: K = var_pred / S = var_pred * inv_S */
-        float K = var_pred * inv_S;
-        float mu_k = mu_pred + K * innov;
-        float var_k = (1.0f - K) * var_pred;
-        
-        mu_post += w * mu_k;
-        E_h_sq += w * (var_k + mu_k * mu_k);
-    }
-    
-    *mu_post_out = mu_post;
-    *var_post_out = fmaxf(E_h_sq - mu_post * mu_post, 1e-6f);
-    *log_lik_out = log_norm;
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
- * MIXTURE-AUGMENTED OCSN Kalman Update (Path A for CPMMH)
- * 
- * Instead of marginalizing over mixture components (deterministic), we:
- *   1. Compute posterior p(s|y, h_pred) over mixture components
- *   2. SAMPLE one component using correlated uniform (CPMMH coupling!)
- *   3. Do exact Kalman update with that single component
- * 
- * This restores correlatable randomness to the h-dynamics, enabling
- * CPMMH to learn variance parameters that affect σ_h.
- * 
- * The posterior over s is:
- *   p(s=k | y, h_pred) ∝ q_k · N(y; μ_pred + m_k, σ²_pred + v_k)
- * 
- * which is exactly what log_alpha_tilde[k] represents after normalization.
- *═══════════════════════════════════════════════════════════════════════════*/
-
-__device__ void ocsn_kalman_update_sampled(
-    float y, float mu_pred, float var_pred,
-    float u_mixture,  /* Correlated uniform ∈ [0,1) for mixture selection */
-    float* mu_post_out, float* var_post_out, float* log_lik_out
-) {
-    float log_alpha_tilde[OCSN_K];
-    float log_max = -1e30f;
-    
-    /* Pass 1: Compute unnormalized log posterior weights for mixture selection */
-    #pragma unroll
-    for (int k = 0; k < OCSN_K; k++) {
-        float v_k = d_OCSN_VARS[k];
-        float inv_v_k = d_OCSN_INV_VARS[k];
-        float log_v_k = d_OCSN_LOG_VARS[k];
-        
-        float S = var_pred + v_k;
-        float inv_S = 1.0f / S;
-        
-        float innov = y - mu_pred - d_OCSN_MEANS[k];
-        float log_S = log_v_k + log1pf(var_pred * inv_v_k);
-        
-        float val = d_OCSN_LOG_WEIGHTS[k] - 0.5f * (log_S + innov * innov * inv_S);
-        
-        log_alpha_tilde[k] = val;
-        log_max = fmaxf(log_max, val);
-    }
-    
-    /* Normalize to get proper weights */
-    float sum_exp = 0.0f;
-    #pragma unroll
-    for (int k = 0; k < OCSN_K; k++) {
-        sum_exp += __expf(log_alpha_tilde[k] - log_max);
-    }
-    float log_norm = log_max + __logf(sum_exp);
-    
-    /* Build CDF and sample mixture component using correlated uniform */
-    float cdf = 0.0f;
-    int s = OCSN_K - 1;  /* Default to last component */
-    
-    #pragma unroll
-    for (int k = 0; k < OCSN_K; k++) {
-        float w = __expf(log_alpha_tilde[k] - log_norm);
-        cdf += w;
-        if (u_mixture < cdf && s == OCSN_K - 1) {
-            s = k;
-        }
-    }
-    
-    /* Exact Kalman update with sampled component s */
-    float v_s = d_OCSN_VARS[s];
-    float m_s = d_OCSN_MEANS[s];
-    
-    float S = var_pred + v_s;
-    float K = var_pred / S;
-    float innov = y - mu_pred - m_s;
-    
-    *mu_post_out = mu_pred + K * innov;
-    *var_post_out = fmaxf((1.0f - K) * var_pred, 1e-6f);
-    
-    /* Log-likelihood is still the marginal (for proper MH ratio) */
-    *log_lik_out = log_norm;
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
- * RNG Initialization
- *═══════════════════════════════════════════════════════════════════════════*/
+/*═══════════════════════════════════════════════════════════════════════════════
+ * KERNEL: RNG Initialization
+ *═══════════════════════════════════════════════════════════════════════════════*/
 
 __global__ void kernel_init_rng(curandState* states, unsigned long long seed, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -461,15 +123,15 @@ __global__ void kernel_init_rng(curandState* states, unsigned long long seed, in
     }
 }
 
-/*═══════════════════════════════════════════════════════════════════════════
- * Initialize θ-particles from Prior (with noise storage for CPMMH)
- *═══════════════════════════════════════════════════════════════════════════*/
+/*═══════════════════════════════════════════════════════════════════════════════
+ * KERNEL: Initialize from Prior
+ *═══════════════════════════════════════════════════════════════════════════════*/
 
 __global__ void kernel_init_from_prior(
     ThetaParticlesSoA particles,
     int N_theta, int N_inner,
-    half* d_z_noise,    /* Store t=0 z-noise for CPMMH (FP16) */
-    half* d_u0_noise,   /* Store t=0 u0-noise for CPMMH (FP16) - SEPARATE */
+    half* d_z_noise,
+    half* d_u0_noise,
     int noise_capacity
 ) {
     int theta_idx = blockIdx.x;
@@ -480,10 +142,12 @@ __global__ void kernel_init_from_prior(
     
     curandState* rng = &particles.rng_states[global_idx];
     
+    /* Shared memory for θ parameters (sampled by thread 0) */
     __shared__ float s_rho, s_sigma_z;
     __shared__ float s_mu_base, s_mu_scale, s_mu_rate;
     __shared__ float s_sigma_base, s_sigma_scale, s_sigma_rate;
     
+    /* Thread 0: sample θ from prior with rejection */
     if (inner_idx == 0) {
         int attempts = 0;
         int valid = 0;
@@ -508,6 +172,7 @@ __global__ void kernel_init_from_prior(
             attempts++;
         }
         
+        /* Store θ parameters */
         particles.rho[theta_idx] = s_rho;
         particles.sigma_z[theta_idx] = s_sigma_z;
         particles.mu_base[theta_idx] = s_mu_base;
@@ -532,25 +197,24 @@ __global__ void kernel_init_from_prior(
     float one_minus_rho_sq = fmaxf(1.0f - rho * rho, 1e-6f);
     float z_tilde_stat_std = sigma_z / sqrtf(one_minus_rho_sq);
     
-    /* Generate t=0 z-noise, ROUND-TRIP through FP16 before use.
-     * Critical for PMMH: ensures replay sees exact same value. */
+    /* Generate t=0 noise with FP16 round-trip */
     float z_noise_raw = curand_normal(rng);
-    int64_t z_noise_idx = (int64_t)theta_idx * N_inner * (noise_capacity + 1) + inner_idx;  /* t=0 slot */
+    int64_t z_noise_idx = (int64_t)theta_idx * N_inner * (noise_capacity + 1) + inner_idx;
     half h_z_noise = __float2half(z_noise_raw);
     d_z_noise[z_noise_idx] = h_z_noise;
-    float z_noise_init = __half2float(h_z_noise);  /* Use truncated value */
+    float z_noise_init = __half2float(h_z_noise);
     
-    /* Generate t=0 u0-noise (thread 0 only) - SEPARATE from propagation noise */
+    /* Thread 0: generate u0 noise */
     if (inner_idx == 0) {
         float u0_noise_raw = curand_normal(rng);
-        int64_t u0_noise_idx = (int64_t)theta_idx * (noise_capacity + 1);  /* t=0 slot */
+        int64_t u0_noise_idx = (int64_t)theta_idx * (noise_capacity + 1);
         half h_u0_noise = __float2half(u0_noise_raw);
         d_u0_noise[u0_noise_idx] = h_u0_noise;
     }
     
-    /* z̃ in unconstrained space (exact Gaussian), z in bounded (0,3) for curves */
+    /* Initialize z̃ and compute derived quantities */
     float z_tilde = z_tilde_stat_std * z_noise_init;
-    float z = z_tilde_to_z(z_tilde);  /* Transform to (0,3) for curve evaluation */
+    float z = z_tilde_to_z(z_tilde);
     
     float theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
     float mu_z = eval_curve(s_mu_base, s_mu_scale, s_mu_rate, z);
@@ -560,37 +224,27 @@ __global__ void kernel_init_from_prior(
     float one_minus_phi_sq = fmaxf(1.0f - phi * phi, 1e-6f);
     float h_stat_var = (sigma_h * sigma_h) / one_minus_phi_sq;
     
-    /* Store z̃ (unconstrained) - the AR(1) state variable */
+    /* Store inner particle state */
     particles.inner_z[global_idx] = z_tilde;
     particles.inner_mu_h[global_idx] = mu_z;
     particles.inner_var_h[global_idx] = h_stat_var;
     particles.inner_log_w[global_idx] = -__logf((float)N_inner);
 }
 
-/*═══════════════════════════════════════════════════════════════════════════
- * Inner RBPF Step - OPTIMIZED for CPMMH
+/*═══════════════════════════════════════════════════════════════════════════════
+ * KERNEL: RBPF Forward Step
  * 
- * Design choices:
- *   1. FP16 noise storage (half bandwidth)
- *   2. u0 derived from z_noise via Φ(z) (no separate storage)
- *   3. ALWAYS RESAMPLE (R1): Every step resamples before propagation.
- *      This is NOT standard adaptive resampling but is required for
- *      deterministic CPMMH replay coupling. The coupling ensures that
- *      given the same noise sequence, the filter produces identical
- *      trajectories regardless of θ proposal.
- * 
- * Note: If adaptive resampling is desired in the forward pass, the
- * resampling decision and dedicated uniform must be stored separately.
- *═══════════════════════════════════════════════════════════════════════════*/
+ * Main filtering kernel. Fused: resample → sort → propagate → observe
+ *═══════════════════════════════════════════════════════════════════════════════*/
 
 __global__ void kernel_rbpf_step(
     ThetaParticlesSoA particles,
     float y_obs,
     int N_theta, int N_inner,
-    half* d_z_noise,   /* [N_theta * N_inner * (T+1)] - FP16 propagation noise */
-    half* d_u0_noise,  /* [N_theta * (T+1)] - FP16 resampling noise (SEPARATE) */
-    int t_current,     /* Current timestep (0-indexed) */
-    int noise_capacity /* Max T for noise arrays */
+    half* d_z_noise,
+    half* d_u0_noise,
+    int t_current,
+    int noise_capacity
 ) {
     int theta_idx = blockIdx.x;
     int inner_idx = threadIdx.x;
@@ -598,28 +252,18 @@ __global__ void kernel_rbpf_step(
     
     if (theta_idx >= N_theta || inner_idx >= N_inner) return;
     
-    /* Shared memory layout:
-     * [0..31]                    : s_reduction (warp reduction scratch)
-     * [32..32+N-1]               : s_weights / s_z_sort (reused)
-     * [32+N..32+2N-1]            : s_cumsum / s_mu_sort (reused)
-     * [32+2N..32+3N-1]           : s_var_sort
-     * [32+3N..32+3N+BINS-1]      : s_bin_count
-     * [32+3N+BINS..32+3N+2BINS-1]: s_bin_offset
-     */
+    /* Shared memory layout */
     extern __shared__ float shared_mem[];
     float* s_reduction = shared_mem;
     float* s_weights = &shared_mem[32];
     float* s_cumsum = &shared_mem[32 + N_inner];
     float* s_var_sort = &shared_mem[32 + 2 * N_inner];
-    
-    /* Reinterpret for sorting (reuse s_weights and s_cumsum) */
-    float* s_z_sort = s_weights;
-    float* s_mu_sort = s_cumsum;
-    
-    /* Bin arrays for bucket sort */
+    float* s_z_sort = s_weights;   /* Reused */
+    float* s_mu_sort = s_cumsum;   /* Reused */
     int* s_bin_count = (int*)&shared_mem[32 + 3 * N_inner];
     int* s_bin_offset = (int*)&shared_mem[32 + 3 * N_inner + SORT_BINS];
     
+    /* Load θ parameters to shared memory */
     __shared__ float s_rho, s_sigma_z;
     __shared__ float s_mu_base, s_mu_scale, s_mu_rate;
     __shared__ float s_sigma_base, s_sigma_scale, s_sigma_rate;
@@ -639,7 +283,7 @@ __global__ void kernel_rbpf_step(
     
     curandState local_rng = particles.rng_states[global_idx];
     
-    /* inner_z stores z̃ (unconstrained AR(1) state) */
+    /* Load particle state */
     float z_tilde = particles.inner_z[global_idx];
     float mu_h = particles.inner_mu_h[global_idx];
     float var_h = particles.inner_var_h[global_idx];
@@ -650,15 +294,13 @@ __global__ void kernel_rbpf_step(
     int64_t z_noise_idx = z_noise_base + (int64_t)(t_current + 1) * N_inner + inner_idx;
     int64_t u0_noise_idx = (int64_t)theta_idx * (noise_capacity + 1) + (t_current + 1);
     
-    /* STEP 1: Generate propagation z-noise, ROUND-TRIP through FP16 before use. */
+    /* Generate and store propagation noise (FP16 round-trip) */
     float z_noise_raw = curand_normal(&local_rng);
     half h_z_noise = __float2half(z_noise_raw);
     d_z_noise[z_noise_idx] = h_z_noise;
-    float z_noise = __half2float(h_z_noise);  /* Use truncated value */
+    float z_noise = __half2float(h_z_noise);
     
-    /* STEP 1b: Generate SEPARATE u0 noise for resampling (thread 0 only).
-     * CRITICAL: Resampling randomness must be independent of propagation noise.
-     * Coupling them biases diffusion parameter estimates (sigma_z, sigma_base, sigma_scale). */
+    /* Thread 0: generate resampling noise */
     if (inner_idx == 0) {
         float u0_noise_raw = curand_normal(&local_rng);
         half h_u0 = __float2half(u0_noise_raw);
@@ -667,7 +309,9 @@ __global__ void kernel_rbpf_step(
     }
     __syncthreads();
     
-    /* STEP 2: ALWAYS RESAMPLE (R1) with u0 from SEPARATE noise stream */
+    /*─────────────────────────────────────────────────────────────────────────
+     * RESAMPLE (always, for CPMMH determinism)
+     *─────────────────────────────────────────────────────────────────────────*/
     {
         float log_max = block_reduce_max(log_w, s_reduction);
         if (inner_idx == 0) s_log_max = log_max;
@@ -681,17 +325,14 @@ __global__ void kernel_rbpf_step(
         s_weights[inner_idx] = w_unnorm / s_sum_w;
         __syncthreads();
         
-        /* Parallel inclusive prefix sum for CDF */
+        /* Build CDF via parallel scan */
         s_cumsum[inner_idx] = s_weights[inner_idx];
         __syncthreads();
         block_inclusive_scan(s_cumsum, N_inner);
-        
-        /* Fix rounding: ensure CDF ends at exactly 1.0 */
-        if (inner_idx == N_inner - 1) {
-            s_cumsum[N_inner - 1] = 1.0f;
-        }
+        if (inner_idx == N_inner - 1) s_cumsum[N_inner - 1] = 1.0f;
         __syncthreads();
         
+        /* Systematic resampling */
         float u = (s_u0 + (float)inner_idx) / (float)N_inner;
         int lo = 0, hi = N_inner - 1;
         while (lo < hi) {
@@ -701,7 +342,7 @@ __global__ void kernel_rbpf_step(
         }
         int ancestor = lo;
         
-        /* Load ancestor's z̃ (unconstrained state) */
+        /* Load ancestor state */
         z_tilde = particles.inner_z[theta_idx * N_inner + ancestor];
         mu_h = particles.inner_mu_h[theta_idx * N_inner + ancestor];
         var_h = particles.inner_var_h[theta_idx * N_inner + ancestor];
@@ -709,66 +350,18 @@ __global__ void kernel_rbpf_step(
         
         __syncthreads();
         
-        /*═══════════════════════════════════════════════════════════════════
-         * CPMMH COUPLING: Bucket sort by mu_h after resampling
-         * 
-         * Resampling permutes particles randomly, breaking CPMMH's
-         * noise-to-state coupling. Sorting by mu_h restores "slot identity":
-         * particle i always holds the i-th quantile of h-distribution.
-         * This ensures correlated noise streams affect consistent states.
-         *═══════════════════════════════════════════════════════════════════*/
+        /*─────────────────────────────────────────────────────────────────────
+         * CPMMH BUCKET SORT by μ_h
+         *─────────────────────────────────────────────────────────────────────*/
         if ((t_current % SORT_EVERY_K) == 0) {
-            /* Store resampled state to shared memory for sorting */
             s_z_sort[inner_idx] = z_tilde;
             s_mu_sort[inner_idx] = mu_h;
             s_var_sort[inner_idx] = var_h;
             __syncthreads();
             
-            /* Clear bin counts */
-            if (inner_idx < SORT_BINS) {
-                s_bin_count[inner_idx] = 0;
-            }
-            __syncthreads();
+            cpmmh_bucket_sort(s_z_sort, s_mu_sort, s_var_sort, 
+                              s_bin_count, s_bin_offset, N_inner);
             
-            /* Compute bin for each particle based on mu_h */
-            const float inv_range = SORT_BINS / (SORT_H_MAX - SORT_H_MIN);
-            int my_bin = min(SORT_BINS - 1, max(0, (int)((mu_h - SORT_H_MIN) * inv_range)));
-            atomicAdd(&s_bin_count[my_bin], 1);
-            __syncthreads();
-            
-            /* Prefix sum to get bin offsets (single thread, BINS=64 is small) */
-            if (inner_idx == 0) {
-                int sum = 0;
-                for (int b = 0; b < SORT_BINS; b++) {
-                    s_bin_offset[b] = sum;
-                    sum += s_bin_count[b];
-                }
-            }
-            __syncthreads();
-            
-            /* Reset counts for slot claiming */
-            if (inner_idx < SORT_BINS) {
-                s_bin_count[inner_idx] = 0;
-            }
-            __syncthreads();
-            
-            /* Claim output slot within bin */
-            int slot = atomicAdd(&s_bin_count[my_bin], 1);
-            int out_idx = s_bin_offset[my_bin] + slot;
-            
-            /* Read my values before overwriting */
-            float my_z = s_z_sort[inner_idx];
-            float my_mu = s_mu_sort[inner_idx];
-            float my_var = s_var_sort[inner_idx];
-            __syncthreads();
-            
-            /* Scatter to sorted positions */
-            s_z_sort[out_idx] = my_z;
-            s_mu_sort[out_idx] = my_mu;
-            s_var_sort[out_idx] = my_var;
-            __syncthreads();
-            
-            /* Load sorted state back to registers */
             z_tilde = s_z_sort[inner_idx];
             mu_h = s_mu_sort[inner_idx];
             var_h = s_var_sort[inner_idx];
@@ -776,13 +369,15 @@ __global__ void kernel_rbpf_step(
         }
     }
     
-    /* STEP 3: Propagate z̃ using exact Gaussian AR(1) - NO CLAMPING */
+    /*─────────────────────────────────────────────────────────────────────────
+     * PROPAGATE z̃
+     *─────────────────────────────────────────────────────────────────────────*/
     float z_tilde_new = s_rho * z_tilde + s_sigma_z * z_noise;
-    
-    /* Transform to bounded z ∈ (0,3) for curve evaluation */
     float z = z_tilde_to_z(z_tilde_new);
     
-    /* Kalman predict */
+    /*─────────────────────────────────────────────────────────────────────────
+     * KALMAN PREDICT
+     *─────────────────────────────────────────────────────────────────────────*/
     float theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
     float mu_z = eval_curve(s_mu_base, s_mu_scale, s_mu_rate, z);
     float sigma_h = eval_curve(s_sigma_base, s_sigma_scale, s_sigma_rate, z);
@@ -792,22 +387,17 @@ __global__ void kernel_rbpf_step(
     float var_pred = phi * phi * var_h + sigma_h * sigma_h;
     var_pred = fmaxf(var_pred, 1e-8f);
     
-    /* MARGINALIZED OCSN update - deterministic moment-matching
-     * 
-     * This is the CORRECT approach for CPMMH+RBPF:
-     * - Marginalizing out the mixture component is mathematically equivalent 
-     *   to perfectly coupling it
-     * - A deterministic function of correlated inputs (z_noise, u0_noise) 
-     *   is inherently correlated
-     * - Avoids discrete "shot noise" that makes the likelihood rough
-     * - Gives the optimal MMSE estimator for the Gaussian approximation
-     */
+    /*─────────────────────────────────────────────────────────────────────────
+     * OCSN KALMAN UPDATE (marginalized)
+     *─────────────────────────────────────────────────────────────────────────*/
     float mu_post, var_post, log_lik;
     ocsn_kalman_update(y_obs, mu_pred, var_pred, &mu_post, &var_post, &log_lik);
     
     log_w += log_lik;
     
-    /* Normalize and compute ESS for outer level */
+    /*─────────────────────────────────────────────────────────────────────────
+     * NORMALIZE AND COMPUTE ESS
+     *─────────────────────────────────────────────────────────────────────────*/
     float log_max = block_reduce_max(log_w, s_reduction);
     if (inner_idx == 0) s_log_max = log_max;
     __syncthreads();
@@ -824,7 +414,9 @@ __global__ void kernel_rbpf_step(
     
     float ll_incr = s_log_max + __logf(fmaxf(s_sum_w, 1e-30f)) - __logf((float)N_inner);
     
-    /* Store z̃ (unconstrained) - this is the AR(1) state variable */
+    /*─────────────────────────────────────────────────────────────────────────
+     * STORE RESULTS
+     *─────────────────────────────────────────────────────────────────────────*/
     particles.inner_z[global_idx] = z_tilde_new;
     particles.inner_mu_h[global_idx] = mu_post;
     particles.inner_var_h[global_idx] = var_post;
@@ -838,9 +430,9 @@ __global__ void kernel_rbpf_step(
     }
 }
 
-/*═══════════════════════════════════════════════════════════════════════════
- * Compute Outer ESS
- *═══════════════════════════════════════════════════════════════════════════*/
+/*═══════════════════════════════════════════════════════════════════════════════
+ * KERNEL: Compute Outer ESS
+ *═══════════════════════════════════════════════════════════════════════════════*/
 
 __global__ void kernel_compute_outer_ess(
     ThetaParticlesSoA particles,
@@ -852,6 +444,7 @@ __global__ void kernel_compute_outer_ess(
     
     float log_w = (idx < N_theta) ? particles.log_weight[idx] : -1e30f;
     
+    /* Normalize weights */
     float log_max = block_reduce_max(log_w, s_data);
     __shared__ float s_log_max;
     if (idx == 0) s_log_max = log_max;
@@ -868,6 +461,7 @@ __global__ void kernel_compute_outer_ess(
         particles.weight[idx] = w;
     }
     
+    /* Compute ESS */
     float w_sq = (idx < N_theta) ? w * w : 0.0f;
     float sum_w_sq = block_reduce_sum(w_sq, s_data);
     
@@ -876,9 +470,9 @@ __global__ void kernel_compute_outer_ess(
     }
 }
 
-/*═══════════════════════════════════════════════════════════════════════════
- * Outer Resampling
- *═══════════════════════════════════════════════════════════════════════════*/
+/*═══════════════════════════════════════════════════════════════════════════════
+ * KERNEL: Outer Resampling
+ *═══════════════════════════════════════════════════════════════════════════════*/
 
 __global__ void kernel_outer_resample(
     ThetaParticlesSoA particles,
@@ -892,12 +486,14 @@ __global__ void kernel_outer_resample(
     if (idx < N_theta) s_cumsum[idx] = particles.weight[idx];
     __syncthreads();
     
+    /* Serial prefix sum (N_theta = 256 is small) */
     if (idx == 0) {
         for (int i = 1; i < N_theta; i++) s_cumsum[i] += s_cumsum[i-1];
         s_cumsum[N_theta - 1] = 1.0f;
     }
     __syncthreads();
     
+    /* Systematic resampling */
     if (idx < N_theta) {
         float u = (*d_uniform + (float)idx) / (float)N_theta;
         int lo = 0, hi = N_theta - 1;
@@ -910,9 +506,9 @@ __global__ void kernel_outer_resample(
     }
 }
 
-/*═══════════════════════════════════════════════════════════════════════════
- * Copy θ-particles After Resampling
- *═══════════════════════════════════════════════════════════════════════════*/
+/*═══════════════════════════════════════════════════════════════════════════════
+ * KERNEL: Copy θ-Particles After Resampling
+ *═══════════════════════════════════════════════════════════════════════════════*/
 
 __global__ void kernel_copy_theta_particles(
     ThetaParticlesSoA src,
@@ -928,6 +524,7 @@ __global__ void kernel_copy_theta_particles(
     
     int ancestor = d_ancestors[theta_idx];
     
+    /* Thread 0: copy θ parameters */
     if (inner_idx == 0) {
         dst.rho[theta_idx] = src.rho[ancestor];
         dst.sigma_z[theta_idx] = src.sigma_z[ancestor];
@@ -938,12 +535,13 @@ __global__ void kernel_copy_theta_particles(
         dst.sigma_scale[theta_idx] = src.sigma_scale[ancestor];
         dst.sigma_rate[theta_idx] = src.sigma_rate[ancestor];
         
-        dst.log_weight[theta_idx] = 0.0f;  /* Reset after resampling */
+        dst.log_weight[theta_idx] = 0.0f;
         dst.weight[theta_idx] = 1.0f / N_theta;
         dst.log_likelihood[theta_idx] = src.log_likelihood[ancestor];
         dst.ess_inner[theta_idx] = src.ess_inner[ancestor];
     }
     
+    /* All threads: copy inner particle state */
     if (inner_idx < N_inner) {
         int src_idx = ancestor * N_inner + inner_idx;
         int dst_idx = theta_idx * N_inner + inner_idx;
@@ -953,18 +551,18 @@ __global__ void kernel_copy_theta_particles(
         dst.inner_var_h[dst_idx] = src.inner_var_h[src_idx];
         dst.inner_log_w[dst_idx] = src.inner_log_w[src_idx];
         
-        /* CRITICAL: Re-initialize RNG with unique seed per particle
-         * Otherwise all particles copied from same ancestor have identical RNG! */
+        /* Re-init RNG (critical: copied particles must have distinct RNG!) */
         curand_init(resample_seed, dst_idx, 0, &dst.rng_states[dst_idx]);
     }
 }
 
-/* Copy noise arrays after outer resampling - PING-PONG VERSION
- * Reads from src buffer, writes to dst buffer based on ancestors
- * No temp storage needed - just swap buffer index after */
+/*═══════════════════════════════════════════════════════════════════════════════
+ * KERNEL: Copy Noise Arrays (Ping-Pong)
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
 __global__ void kernel_copy_noise_arrays(
-    const half* src_z_noise,  /* Read from current buffer */
-    half* dst_z_noise,        /* Write to other buffer */
+    const half* src_z_noise,
+    half* dst_z_noise,
     const int* d_ancestors,
     int N_theta, int N_inner,
     int t_current, int noise_capacity
@@ -979,49 +577,38 @@ __global__ void kernel_copy_noise_arrays(
     int64_t dst_z_base = (int64_t)theta_idx * N_inner * (noise_capacity + 1);
     int64_t src_z_base = (int64_t)ancestor * N_inner * (noise_capacity + 1);
     
-    /* Copy z-noise for all timesteps up to t_current+1 */
     for (int t = 0; t <= t_current + 1; t++) {
         int64_t src_idx = src_z_base + t * N_inner + inner_idx;
         int64_t dst_idx = dst_z_base + t * N_inner + inner_idx;
         dst_z_noise[dst_idx] = src_z_noise[src_idx];
     }
-    /* u0 derived from z_noise - no separate copy needed */
 }
 
-/*═══════════════════════════════════════════════════════════════════════════
- * JOINT CPMMH Rejuvenation Kernel
+/*═══════════════════════════════════════════════════════════════════════════════
+ * KERNEL: CPMMH Fused Rejuvenation
  * 
- * Proposes all 8 parameters jointly. Lower acceptance but 1 replay.
- * 
- * Optimizations applied:
- *   1. FUSED: Generate fresh noise + correlate + replay + MH in one kernel
- *   2. FP16: Half precision noise storage (half bandwidth)
- *   3. NO u0 ARRAYS: u0 derived from z_noise (zero extra storage)
- *   4. NO ESS in replay: Always resample (R1)
- *   5. PING-PONG: On accept, swap buffer index instead of copying
- *═══════════════════════════════════════════════════════════════════════════*/
+ * The big one. See header for algorithm documentation.
+ *═══════════════════════════════════════════════════════════════════════════════*/
 
 __global__ void kernel_cpmmh_rejuvenate_fused(
     ThetaParticlesSoA particles,
     ThetaParticlesSoA particles_scratch,
     const float* y_history,
-    half* d_z_noise_curr,      /* Current propagation noise (FP16) */
-    half* d_z_noise_other,     /* Other ping-pong buffer (FP16) */
-    half* d_u0_noise_curr,     /* Current resampling noise (FP16) - SEPARATE */
-    half* d_u0_noise_other,    /* Other ping-pong buffer (FP16) */
+    half* d_z_noise_curr,
+    half* d_z_noise_other,
+    half* d_u0_noise_curr,
+    half* d_u0_noise_other,
     int t_current,
     int N_theta, int N_inner,
     int noise_capacity,
     float cpmmh_rho,
     int* d_accepts,
-    int* d_swap_flags,         /* Per-particle: 1 if accepted (needs buffer swap) */
-    unsigned long long seed,   /* Unused in joint mode, kept for API consistency */
-    int move_id,               /* Unused in joint mode, kept for API consistency */
-    int block_id               /* Unused in joint mode, kept for API consistency */
+    int* d_swap_flags,
+    unsigned long long seed,
+    int move_id,
+    int block_id
 ) {
-    (void)seed;     /* Suppress unused warning */
-    (void)move_id;  /* Suppress unused warning */
-    (void)block_id; /* Suppress unused warning */
+    (void)seed; (void)move_id; (void)block_id;  /* Unused in joint mode */
     
     int theta_idx = blockIdx.x;
     int inner_idx = threadIdx.x;
@@ -1029,36 +616,32 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
     
     if (theta_idx >= N_theta || inner_idx >= N_inner) return;
     
+    /* Shared memory */
     extern __shared__ float shared_mem[];
     float* s_reduction = shared_mem;
     float* s_z = &shared_mem[32];
     float* s_mu = &shared_mem[32 + N_inner];
     float* s_var = &shared_mem[32 + 2 * N_inner];
     float* s_cdf = &shared_mem[32 + 3 * N_inner];
-    
-    /* Bin arrays for bucket sort (CPMMH coupling) */
     int* s_bin_count = (int*)&shared_mem[32 + 4 * N_inner];
     int* s_bin_offset = (int*)&shared_mem[32 + 4 * N_inner + SORT_BINS];
     
-    __shared__ float s_log_max, s_sum_w;
-    __shared__ float s_ess_prop;
-    
+    __shared__ float s_log_max, s_sum_w, s_ess_prop;
     __shared__ float s_rho_curr, s_sigma_z_curr;
     __shared__ float s_mu_base_curr, s_mu_scale_curr, s_mu_rate_curr;
     __shared__ float s_sigma_base_curr, s_sigma_scale_curr, s_sigma_rate_curr;
-    
     __shared__ float s_rho_prop, s_sigma_z_prop;
     __shared__ float s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop;
     __shared__ float s_sigma_base_prop, s_sigma_scale_prop, s_sigma_rate_prop;
-    
-    __shared__ float s_ll_curr, s_ll_prop;
-    __shared__ float s_lp_curr, s_lp_prop;
+    __shared__ float s_ll_curr, s_ll_prop, s_lp_curr, s_lp_prop;
     __shared__ int s_accept, s_valid;
-    __shared__ float s_u0_shared;  /* For derived u0 in replay */
+    __shared__ float s_u0_shared;
     
     curandState local_rng = particles.rng_states[global_idx];
     
-    /* Thread 0: Load current θ, propose θ', compute log priors */
+    /*─────────────────────────────────────────────────────────────────────────
+     * PROPOSE θ* (thread 0)
+     *─────────────────────────────────────────────────────────────────────────*/
     if (inner_idx == 0) {
         s_rho_curr = particles.rho[theta_idx];
         s_sigma_z_curr = particles.sigma_z[theta_idx];
@@ -1070,12 +653,11 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
         s_sigma_rate_curr = particles.sigma_rate[theta_idx];
         
         s_ll_curr = particles.log_likelihood[theta_idx];
-        
         s_lp_curr = log_prior_theta(s_rho_curr, s_sigma_z_curr,
                                      s_mu_base_curr, s_mu_scale_curr, s_mu_rate_curr,
                                      s_sigma_base_curr, s_sigma_scale_curr, s_sigma_rate_curr);
         
-        /* ONE-SHOT proposal */
+        /* Random walk proposal */
         s_rho_prop = s_rho_curr + d_proposal_std[0] * curand_normal(&local_rng);
         s_sigma_z_prop = s_sigma_z_curr + d_proposal_std[1] * curand_normal(&local_rng);
         s_mu_base_prop = s_mu_base_curr + d_proposal_std[2] * curand_normal(&local_rng);
@@ -1101,16 +683,12 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
         return;
     }
     
-    /* Noise base index for this θ-particle */
     int64_t z_noise_base = (int64_t)theta_idx * N_inner * (noise_capacity + 1);
-    
-    /* CPMMH correlation scale */
     float scale = sqrtf(1.0f - cpmmh_rho * cpmmh_rho);
     
-    /*═══════════════════════════════════════════════════════════════════════
-     * INLINE REPLAY with FUSED noise generation and correlation
-     * Generate fresh → correlate → use immediately (all in registers)
-     *═══════════════════════════════════════════════════════════════════════*/
+    /*─────────────────────────────────────────────────────────────────────────
+     * FULL-HISTORY REPLAY with correlated noise
+     *─────────────────────────────────────────────────────────────────────────*/
     
     float rho = s_rho_prop;
     float sigma_z = s_sigma_z_prop;
@@ -1121,23 +699,19 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
     float sigma_scale = s_sigma_scale_prop;
     float sigma_rate = s_sigma_rate_prop;
     
-    /* Initialize from stationary using t=0 noise (FUSED: generate + correlate) */
+    /* Initialize from stationary */
     float one_minus_rho_sq = fmaxf(1.0f - rho * rho, 1e-6f);
     float z_tilde_stat_std = sigma_z / sqrtf(one_minus_rho_sq);
     
+    /* t=0 noise correlation */
     float z_noise_curr_0 = __half2float(d_z_noise_curr[z_noise_base + inner_idx]);
     float z_noise_fresh_0 = curand_normal(&local_rng);
     float z_noise_prop_0_raw = cpmmh_rho * z_noise_curr_0 + scale * z_noise_fresh_0;
-    
-    /* ROUND-TRIP: Store as FP16, load back for use.
-     * Ensures stored value matches what we compute with. */
     half h_prop_0 = __float2half(z_noise_prop_0_raw);
     d_z_noise_other[z_noise_base + inner_idx] = h_prop_0;
     float z_noise_prop_0 = __half2float(h_prop_0);
     
-    /* z̃ in unconstrained space (exact Gaussian AR(1) stationary dist) */
     float z_tilde = z_tilde_stat_std * z_noise_prop_0;
-    /* Transform to bounded z ∈ (0,3) for curve evaluation */
     float z = z_tilde_to_z(z_tilde);
     
     float theta_z = eval_curve(d_theta_curve.base, d_theta_curve.scale, d_theta_curve.rate, z);
@@ -1169,36 +743,27 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
         
         float w_norm = w_unnorm / fmaxf(sum_w, 1e-30f);
         
-        /* ALWAYS RESAMPLE (R1) - store z̃ (unconstrained) for resampling */
+        /* Store state for resampling */
         s_z[inner_idx] = z_tilde;
         s_mu[inner_idx] = mu_h;
         s_var[inner_idx] = var_h;
         s_cdf[inner_idx] = w_norm;
         __syncthreads();
         
-        /* Parallel inclusive prefix sum for CDF */
         block_inclusive_scan(s_cdf, N_inner);
-        
-        /* Fix rounding: ensure CDF ends at exactly 1.0 */
-        if (inner_idx == N_inner - 1) {
-            s_cdf[N_inner - 1] = 1.0f;
-        }
+        if (inner_idx == N_inner - 1) s_cdf[N_inner - 1] = 1.0f;
         __syncthreads();
         
-        /* FUSED: Generate fresh noise for timestep t+1, correlate */
+        /* Generate correlated noise for t+1 */
         int64_t z_idx_t1 = z_noise_base + (int64_t)(t + 1) * N_inner + inner_idx;
         float z_noise_curr_t1 = __half2float(d_z_noise_curr[z_idx_t1]);
         float z_noise_fresh_t1 = curand_normal(&local_rng);
         float z_noise_prop_t1_raw = cpmmh_rho * z_noise_curr_t1 + scale * z_noise_fresh_t1;
-        
-        /* ROUND-TRIP: Store as FP16, load back for use */
         half h_prop_t1 = __float2half(z_noise_prop_t1_raw);
         d_z_noise_other[z_idx_t1] = h_prop_t1;
         float z_noise_prop_t1 = __half2float(h_prop_t1);
         
-        /* SEPARATE u0 noise for resampling (thread 0 only)
-         * CRITICAL: Must be independent of propagation noise to avoid biasing
-         * diffusion parameters (sigma_z, sigma_base, sigma_scale) */
+        /* Thread 0: correlate resampling noise */
         if (inner_idx == 0) {
             int64_t u0_idx_t1 = (int64_t)theta_idx * (noise_capacity + 1) + (t + 1);
             float u0_noise_curr = __half2float(d_u0_noise_curr[u0_idx_t1]);
@@ -1210,6 +775,7 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
         }
         __syncthreads();
         
+        /* Systematic resampling */
         float u = (s_u0_shared + (float)inner_idx) / (float)N_inner;
         int lo = 0, hi = N_inner - 1;
         while (lo < hi) {
@@ -1218,78 +784,29 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
             else hi = mid;
         }
         
-        /* Load ancestor's z̃ (unconstrained state) */
         z_tilde = s_z[lo];
         mu_h = s_mu[lo];
         var_h = s_var[lo];
         log_w = -__logf((float)N_inner);
         __syncthreads();
         
-        /*═══════════════════════════════════════════════════════════════════
-         * CPMMH COUPLING: Bucket sort by mu_h after resampling
-         *═══════════════════════════════════════════════════════════════════*/
+        /* CPMMH bucket sort */
         if ((t % SORT_EVERY_K) == 0) {
-            /* Store resampled state to shared memory for sorting */
             s_z[inner_idx] = z_tilde;
             s_mu[inner_idx] = mu_h;
             s_var[inner_idx] = var_h;
             __syncthreads();
             
-            /* Clear bin counts */
-            if (inner_idx < SORT_BINS) {
-                s_bin_count[inner_idx] = 0;
-            }
-            __syncthreads();
+            cpmmh_bucket_sort(s_z, s_mu, s_var, s_bin_count, s_bin_offset, N_inner);
             
-            /* Compute bin for each particle based on mu_h */
-            const float inv_range = SORT_BINS / (SORT_H_MAX - SORT_H_MIN);
-            int my_bin = min(SORT_BINS - 1, max(0, (int)((mu_h - SORT_H_MIN) * inv_range)));
-            atomicAdd(&s_bin_count[my_bin], 1);
-            __syncthreads();
-            
-            /* Prefix sum to get bin offsets */
-            if (inner_idx == 0) {
-                int sum = 0;
-                for (int b = 0; b < SORT_BINS; b++) {
-                    s_bin_offset[b] = sum;
-                    sum += s_bin_count[b];
-                }
-            }
-            __syncthreads();
-            
-            /* Reset counts for slot claiming */
-            if (inner_idx < SORT_BINS) {
-                s_bin_count[inner_idx] = 0;
-            }
-            __syncthreads();
-            
-            /* Claim output slot within bin */
-            int slot = atomicAdd(&s_bin_count[my_bin], 1);
-            int out_idx = s_bin_offset[my_bin] + slot;
-            
-            /* Read my values before overwriting */
-            float my_z = s_z[inner_idx];
-            float my_mu = s_mu[inner_idx];
-            float my_var = s_var[inner_idx];
-            __syncthreads();
-            
-            /* Scatter to sorted positions */
-            s_z[out_idx] = my_z;
-            s_mu[out_idx] = my_mu;
-            s_var[out_idx] = my_var;
-            __syncthreads();
-            
-            /* Load sorted state back to registers */
             z_tilde = s_z[inner_idx];
             mu_h = s_mu[inner_idx];
             var_h = s_var[inner_idx];
             __syncthreads();
         }
         
-        /* Propagate z̃ using exact Gaussian AR(1) - NO CLAMPING */
+        /* Propagate */
         float z_tilde_new = rho * z_tilde + sigma_z * z_noise_prop_t1;
-        
-        /* Transform to bounded z ∈ (0,3) for curve evaluation */
         z = z_tilde_to_z(z_tilde_new);
         
         /* Kalman predict */
@@ -1302,13 +819,13 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
         float var_pred = phi * phi * var_h + sigma_h * sigma_h;
         var_pred = fmaxf(var_pred, 1e-8f);
         
-        /* MARGINALIZED OCSN update - deterministic moment-matching */
+        /* OCSN update */
         float mu_post, var_post, log_lik;
         ocsn_kalman_update(y_obs, mu_pred, var_pred, &mu_post, &var_post, &log_lik);
         
         log_w += log_lik;
         
-        /* Accumulate log-likelihood */
+        /* Accumulate likelihood */
         log_max = block_reduce_max(log_w, s_reduction);
         if (inner_idx == 0) s_log_max = log_max;
         __syncthreads();
@@ -1323,19 +840,18 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
         float ll_incr = log_max + __logf(fmaxf(sum_w, 1e-30f)) - __logf((float)N_inner);
         ll_accum += ll_incr;
         
-        /* Update state for next iteration (z̃ is the AR(1) state) */
         z_tilde = z_tilde_new;
         mu_h = mu_post;
         var_h = var_post;
     }
     
-    /* Compute final ESS for diagnostics */
+    /* Final ESS */
     float w_norm = __expf(log_w - s_log_max) / fmaxf(s_sum_w, 1e-30f);
     float w_sq = w_norm * w_norm;
     float sum_w_sq = block_reduce_sum(w_sq, s_reduction);
     float ess = 1.0f / fmaxf(sum_w_sq, 1e-30f);
     
-    /* Store proposed PF state to scratch (z̃ is the state variable) */
+    /* Store proposed state */
     particles_scratch.inner_z[global_idx] = z_tilde;
     particles_scratch.inner_mu_h[global_idx] = mu_h;
     particles_scratch.inner_var_h[global_idx] = var_h;
@@ -1347,9 +863,9 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
     }
     __syncthreads();
     
-    /*═══════════════════════════════════════════════════════════════════════
-     * MH Accept/Reject
-     *═══════════════════════════════════════════════════════════════════════*/
+    /*─────────────────────────────────────────────────────────────────────────
+     * MH ACCEPT/REJECT
+     *─────────────────────────────────────────────────────────────────────────*/
     if (inner_idx == 0) {
         float log_alpha = (s_ll_prop + s_lp_prop) - (s_ll_curr + s_lp_curr);
         
@@ -1370,26 +886,25 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
             atomicAdd(d_accepts, 1);
         }
         
-        /* Record whether this particle accepted (for buffer swap) */
         d_swap_flags[theta_idx] = s_accept;
     }
     __syncthreads();
     
-    /* On accept: copy PF state from scratch */
+    /* On accept: copy proposed state */
     if (s_accept) {
         particles.inner_z[global_idx] = particles_scratch.inner_z[global_idx];
         particles.inner_mu_h[global_idx] = particles_scratch.inner_mu_h[global_idx];
         particles.inner_var_h[global_idx] = particles_scratch.inner_var_h[global_idx];
         particles.inner_log_w[global_idx] = particles_scratch.inner_log_w[global_idx];
-        /* Noise already written to other buffer - swap handled by host */
     }
     
     particles.rng_states[global_idx] = local_rng;
 }
 
-/* Commit proposed noise to current buffer for accepted CPMMH particles.
- * For accepted particles, copies noise from proposal buffer (d_z_noise_1) 
- * to current buffer (d_z_noise_0). Rejected particles keep their original noise. */
+/*═══════════════════════════════════════════════════════════════════════════════
+ * KERNEL: Commit Accepted Noise
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
 __global__ void kernel_commit_accepted_noise(
     half* d_z_noise_0,
     half* d_z_noise_1,
@@ -1403,17 +918,15 @@ __global__ void kernel_commit_accepted_noise(
     int inner_idx = threadIdx.x;
     
     if (theta_idx >= N_theta || inner_idx >= N_inner) return;
-    if (d_swap_flags[theta_idx] == 0) return;  /* Rejected: keep original noise */
+    if (d_swap_flags[theta_idx] == 0) return;
     
     int64_t z_base = (int64_t)theta_idx * N_inner * (noise_capacity + 1);
     
-    /* Copy proposed z_noise to current buffer */
     for (int t = 0; t <= t_current + 1; t++) {
         int64_t idx = z_base + t * N_inner + inner_idx;
         d_z_noise_0[idx] = d_z_noise_1[idx];
     }
     
-    /* Copy proposed u0_noise to current buffer (thread 0 only) */
     if (inner_idx == 0) {
         int64_t u0_base = (int64_t)theta_idx * (noise_capacity + 1);
         for (int t = 0; t <= t_current + 1; t++) {
@@ -1422,12 +935,11 @@ __global__ void kernel_commit_accepted_noise(
     }
 }
 
-/*═══════════════════════════════════════════════════════════════════════════
- * Host API
- *═══════════════════════════════════════════════════════════════════════════*/
+/*═══════════════════════════════════════════════════════════════════════════════
+ * HOST API IMPLEMENTATION
+ *═══════════════════════════════════════════════════════════════════════════════*/
 
-/* Fast host-side xorshift64* for outer resampling uniform generation
- * Avoids costly curandGenerator creation/destruction per resample */
+/* Fast xorshift64* for host-side uniform generation */
 static inline uint64_t xorshift64star(uint64_t* state) {
     uint64_t x = *state;
     x ^= x >> 12;
@@ -1438,9 +950,8 @@ static inline uint64_t xorshift64star(uint64_t* state) {
 }
 
 static inline float xorshift64star_uniform(uint64_t* state) {
-    /* Generate uniform in (0, 1) - avoid exact 0 and 1 */
     uint64_t r = xorshift64star(state);
-    return (float)((r >> 11) + 1) * (1.0f / 9007199254740994.0f);  /* 2^53 + 2 */
+    return (float)((r >> 11) + 1) * (1.0f / 9007199254740994.0f);
 }
 
 SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
@@ -1451,7 +962,7 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     state->N_inner = N_inner;
     state->ess_threshold_outer = 0.5f;
     state->ess_threshold_inner = 0.5f;
-    state->K_rejuv = 1;  /* One correct PMMH move per resample is sufficient */
+    state->K_rejuv = 1;
     
     int N_total = N_theta * N_inner;
     
@@ -1493,7 +1004,7 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     CUDA_CHECK(cudaMalloc(&state->d_particles_temp.ess_inner, N_theta * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&state->d_particles_temp.rng_states, N_total * sizeof(curandState)));
     
-    /* Init RNG */
+    /* Initialize RNG */
     kernel_init_rng<<<(N_total + 255) / 256, 256>>>(state->d_particles.rng_states, 12345ULL, N_total);
     CUDA_CHECK(cudaDeviceSynchronize());
     
@@ -1502,75 +1013,27 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     CUDA_CHECK(cudaMalloc(&state->d_y_history, state->y_history_capacity * sizeof(float)));
     state->y_history_len = 0;
     
-    /* Scratch */
+    /* Scratch arrays */
     CUDA_CHECK(cudaMalloc(&state->d_ancestors, N_theta * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&state->d_uniform, sizeof(float)));
     CUDA_CHECK(cudaMalloc(&state->d_ess, sizeof(float)));
     CUDA_CHECK(cudaMalloc(&state->d_accepts, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&state->d_swap_flags, N_theta * sizeof(int)));
     
-    /* CPMMH: Allocate PING-PONG noise buffers (FP16 for bandwidth reduction)
-     * No u0 arrays - derived from z_noise */
+    /* CPMMH noise buffers */
     state->noise_capacity = 2048;
-    state->cpmmh_rho = 0.99f;  /* High correlation for variance reduction */
-    state->noise_buf = 0;     /* Start with buffer 0 */
-    
-    /* Initialize host-side RNG for fast outer resampling uniform generation
-     * Default: time-based seed (non-reproducible). Use smc2_cuda_set_seed() for reproducibility. */
+    state->cpmmh_rho = 0.99f;
+    state->noise_buf = 0;
     state->user_seed = 0;
     state->host_rng_state = 0x853C49E6748FEA9BULL ^ (uint64_t)time(NULL);
     
     int64_t z_noise_size = (int64_t)N_theta * N_inner * (state->noise_capacity + 1);
     int64_t u0_noise_size = (int64_t)N_theta * (state->noise_capacity + 1);
     
-    /* Two ping-pong buffers for z_noise (FP16) — propagation noise */
     CUDA_CHECK(cudaMalloc(&state->d_z_noise[0], z_noise_size * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&state->d_z_noise[1], z_noise_size * sizeof(half)));
-    
-    /* Two ping-pong buffers for u0_noise (FP16) — resampling noise (SEPARATE from propagation) */
     CUDA_CHECK(cudaMalloc(&state->d_u0_noise[0], u0_noise_size * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&state->d_u0_noise[1], u0_noise_size * sizeof(half)));
-    
-    /* Initialize buffer 0 with N(0,1) noise - need to generate FP32 then convert */
-    float* temp_noise;
-    CUDA_CHECK(cudaMalloc(&temp_noise, z_noise_size * sizeof(float)));
-    curandGenerator_t gen;
-    curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
-    curandSetPseudoRandomGeneratorSeed(gen, 54321ULL);
-    curandGenerateNormal(gen, temp_noise, z_noise_size, 0.0f, 1.0f);
-    curandDestroyGenerator(gen);
-    
-    /* Convert FP32 to FP16 on host - use simple truncation */
-    {
-        uint16_t* h_temp = (uint16_t*)malloc(z_noise_size * sizeof(uint16_t));
-        float* f_temp = (float*)malloc(z_noise_size * sizeof(float));
-        CUDA_CHECK(cudaMemcpy(f_temp, temp_noise, z_noise_size * sizeof(float), cudaMemcpyDeviceToHost));
-        for (int64_t i = 0; i < z_noise_size; i++) {
-            /* Simple FP32 to FP16 conversion (IEEE 754) */
-            float val = f_temp[i];
-            /* Clamp to FP16 range */
-            if (val > 65504.0f) val = 65504.0f;
-            if (val < -65504.0f) val = -65504.0f;
-            /* Convert using union */
-            union { float f; uint32_t u; } fu;
-            fu.f = val;
-            uint32_t f32 = fu.u;
-            uint16_t sign = (f32 >> 16) & 0x8000;
-            int32_t exp = ((f32 >> 23) & 0xFF) - 127 + 15;
-            uint32_t mant = (f32 >> 13) & 0x3FF;
-            if (exp <= 0) {
-                h_temp[i] = sign;  /* Flush to zero */
-            } else if (exp >= 31) {
-                h_temp[i] = sign | 0x7C00;  /* Infinity */
-            } else {
-                h_temp[i] = sign | (exp << 10) | mant;
-            }
-        }
-        CUDA_CHECK(cudaMemcpy(state->d_z_noise[0], h_temp, z_noise_size * sizeof(uint16_t), cudaMemcpyHostToDevice));
-        free(h_temp);
-        free(f_temp);
-    }
-    cudaFree(temp_noise);
     
     /* Default prior */
     state->prior.rho_mean = 0.95f; state->prior.rho_std = 0.02f;
@@ -1597,15 +1060,15 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     state->theta_curve.scale = 0.08f;
     state->theta_curve.rate = 1.5f;
     
-    /* Proposal std - tuned for ~15-30% acceptance with correct likelihood */
-    state->proposal_std[0] = 0.01f;   /* rho */
-    state->proposal_std[1] = 0.02f;   /* sigma_z */
-    state->proposal_std[2] = 0.1f;    /* mu_base */
-    state->proposal_std[3] = 0.1f;    /* mu_scale */
-    state->proposal_std[4] = 0.15f;   /* mu_rate */
-    state->proposal_std[5] = 0.02f;   /* sigma_base */
-    state->proposal_std[6] = 0.02f;   /* sigma_scale */
-    state->proposal_std[7] = 0.15f;   /* sigma_rate */
+    /* Proposal std */
+    state->proposal_std[0] = 0.01f;
+    state->proposal_std[1] = 0.02f;
+    state->proposal_std[2] = 0.1f;
+    state->proposal_std[3] = 0.1f;
+    state->proposal_std[4] = 0.15f;
+    state->proposal_std[5] = 0.02f;
+    state->proposal_std[6] = 0.02f;
+    state->proposal_std[7] = 0.15f;
     
     return state;
 }
@@ -1613,6 +1076,7 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
 void smc2_cuda_free(SMC2StateCUDA* state) {
     if (!state) return;
     
+    /* Free main particles */
     cudaFree(state->d_particles.rho);
     cudaFree(state->d_particles.sigma_z);
     cudaFree(state->d_particles.mu_base);
@@ -1631,6 +1095,7 @@ void smc2_cuda_free(SMC2StateCUDA* state) {
     cudaFree(state->d_particles.ess_inner);
     cudaFree(state->d_particles.rng_states);
     
+    /* Free temp particles */
     cudaFree(state->d_particles_temp.rho);
     cudaFree(state->d_particles_temp.sigma_z);
     cudaFree(state->d_particles_temp.mu_base);
@@ -1656,7 +1121,6 @@ void smc2_cuda_free(SMC2StateCUDA* state) {
     cudaFree(state->d_accepts);
     cudaFree(state->d_swap_flags);
     
-    /* CPMMH ping-pong noise buffers (FP16) */
     cudaFree(state->d_z_noise[0]);
     cudaFree(state->d_z_noise[1]);
     cudaFree(state->d_u0_noise[0]);
@@ -1666,8 +1130,6 @@ void smc2_cuda_free(SMC2StateCUDA* state) {
 }
 
 void smc2_cuda_set_seed(SMC2StateCUDA* state, uint64_t seed) {
-    /* Set user seed for reproducibility. Call before smc2_cuda_init_from_prior.
-     * If seed == 0, time-based seeding will be used (non-reproducible). */
     state->user_seed = seed;
     if (seed != 0) {
         state->host_rng_state = 0x853C49E6748FEA9BULL ^ seed;
@@ -1675,7 +1137,7 @@ void smc2_cuda_set_seed(SMC2StateCUDA* state, uint64_t seed) {
 }
 
 void smc2_cuda_set_noise_capacity(SMC2StateCUDA* state, int capacity) {
-    if (capacity <= state->noise_capacity) return;  /* Already big enough */
+    if (capacity <= state->noise_capacity) return;
     
     int64_t new_z_size = (int64_t)state->N_theta * state->N_inner * (capacity + 1);
     int64_t old_z_size = (int64_t)state->N_theta * state->N_inner * (state->noise_capacity + 1);
@@ -1688,7 +1150,6 @@ void smc2_cuda_set_noise_capacity(SMC2StateCUDA* state, int capacity) {
     CUDA_CHECK(cudaMalloc(&new_u0_0, new_u0_size * sizeof(half)));
     CUDA_CHECK(cudaMalloc(&new_u0_1, new_u0_size * sizeof(half)));
     
-    /* Copy existing data if any */
     if (state->d_z_noise[0] && old_z_size > 0) {
         CUDA_CHECK(cudaMemcpy(new_z_0, state->d_z_noise[0], 
                               old_z_size * sizeof(half), cudaMemcpyDeviceToDevice));
@@ -1717,7 +1178,6 @@ void smc2_cuda_init_from_prior(SMC2StateCUDA* state) {
     CUDA_CHECK(cudaMemcpyToSymbol(d_theta_curve, &state->theta_curve, sizeof(SVCurve)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_proposal_std, state->proposal_std, 8 * sizeof(float)));
     
-    /* Reinitialize RNG with user seed if set (for reproducibility) */
     int N_total = state->N_theta * state->N_inner;
     unsigned long long rng_seed = (state->user_seed != 0) ? state->user_seed : 12345ULL;
     kernel_init_rng<<<(N_total + 255) / 256, 256>>>(state->d_particles.rng_states, rng_seed, N_total);
@@ -1755,33 +1215,14 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
     state->y_history_len++;
     state->t_current++;
     
-    /* Check if noise capacity needs to grow */
+    /* Grow noise if needed */
     if (state->t_current >= state->noise_capacity) {
-        int new_cap = state->noise_capacity * 2;
-        int64_t new_z_size = (int64_t)state->N_theta * state->N_inner * (new_cap + 1);
-        int64_t old_z_size = (int64_t)state->N_theta * state->N_inner * (state->noise_capacity + 1);
-        
-        half *new_z_0, *new_z_1;
-        CUDA_CHECK(cudaMalloc(&new_z_0, new_z_size * sizeof(half)));
-        CUDA_CHECK(cudaMalloc(&new_z_1, new_z_size * sizeof(half)));
-        
-        /* Copy old data from current buffer */
-        CUDA_CHECK(cudaMemcpy(new_z_0, state->d_z_noise[state->noise_buf], 
-                              old_z_size * sizeof(half), cudaMemcpyDeviceToDevice));
-        
-        cudaFree(state->d_z_noise[0]);
-        cudaFree(state->d_z_noise[1]);
-        
-        state->d_z_noise[0] = new_z_0;
-        state->d_z_noise[1] = new_z_1;
-        state->noise_buf = 0;  /* Reset to buffer 0 */
-        state->noise_capacity = new_cap;
+        smc2_cuda_set_noise_capacity(state, state->noise_capacity * 2);
     }
     
-    /* Shared memory: 32 (reduction) + 3*N (sort arrays) + 2*SORT_BINS (bin arrays) */
-    size_t shared_size = (32 + 3 * state->N_inner + 2 * SORT_BINS) * sizeof(float);
+    size_t shared_size = rbpf_shared_mem_size(state->N_inner);
     
-    /* Forward filter step - uses current noise buffer */
+    /* Forward step */
     kernel_rbpf_step<<<state->N_theta, state->N_inner, shared_size>>>(
         state->d_particles, y_obs,
         state->N_theta, state->N_inner,
@@ -1799,21 +1240,18 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
     float h_ess;
     CUDA_CHECK(cudaMemcpy(&h_ess, state->d_ess, sizeof(float), cudaMemcpyDeviceToHost));
     
+    /* Resample and rejuvenate if needed */
     if (h_ess < state->ess_threshold_outer * state->N_theta) {
         state->n_resamples++;
         
-        /* Generate uniform for outer resampling using fast host-side RNG
-         * (Avoids costly curandGenerator create/destroy overhead) */
         float h_uniform = xorshift64star_uniform(&state->host_rng_state);
         CUDA_CHECK(cudaMemcpy(state->d_uniform, &h_uniform, sizeof(float), cudaMemcpyHostToDevice));
         
-        /* Resample θ-particles */
         kernel_outer_resample<<<1, state->N_theta, state->N_theta * sizeof(float)>>>(
             state->d_particles, state->d_ancestors, state->d_uniform, state->N_theta
         );
         CUDA_CHECK(cudaDeviceSynchronize());
         
-        /* Copy particles - pass unique seed for RNG re-initialization */
         unsigned long long resample_seed = time(NULL) * 1000ULL + state->n_resamples * 12345ULL;
         kernel_copy_theta_particles<<<state->N_theta, state->N_inner>>>(
             state->d_particles, state->d_particles_temp, state->d_ancestors,
@@ -1821,66 +1259,48 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
         );
         CUDA_CHECK(cudaDeviceSynchronize());
         
-        /* Copy noise arrays using ping-pong: curr → other buffer */
         int other_buf = 1 - state->noise_buf;
         kernel_copy_noise_arrays<<<state->N_theta, state->N_inner>>>(
-            state->d_z_noise[state->noise_buf],  /* Source */
-            state->d_z_noise[other_buf],          /* Destination */
+            state->d_z_noise[state->noise_buf],
+            state->d_z_noise[other_buf],
             state->d_ancestors,
             state->N_theta, state->N_inner,
             state->t_current, state->noise_capacity
         );
         CUDA_CHECK(cudaDeviceSynchronize());
         
-        /* Swap to the new buffer (noise is now in other_buf) */
         state->noise_buf = other_buf;
         
-        /* Swap particle pointers */
         ThetaParticlesSoA tmp = state->d_particles;
         state->d_particles = state->d_particles_temp;
         state->d_particles_temp = tmp;
         
-        /* FUSED CPMMH rejuvenation - ONE kernel does everything */
-        /* Shared memory: 32 (reduction) + 4*N (z,mu,var,cdf) + 2*SORT_BINS (bin arrays) */
-        size_t pmmh_shared_size = (32 + 4 * state->N_inner + 2 * SORT_BINS) * sizeof(float);
-        
-        /* Base move_id for this resample event (ensures unique Philox sequences) */
-        int base_move_id = state->n_rejuv_total / state->N_theta;
+        /* CPMMH rejuvenation */
+        size_t cpmmh_shared = cpmmh_shared_mem_size(state->N_inner);
         
         for (int k = 0; k < state->K_rejuv; k++) {
             int h_accepts = 0;
             CUDA_CHECK(cudaMemcpy(state->d_accepts, &h_accepts, sizeof(int), cudaMemcpyHostToDevice));
             
-            /* Current buffer and other buffer for ping-pong during CPMMH */
             half* curr_noise = state->d_z_noise[state->noise_buf];
             half* other_noise = state->d_z_noise[1 - state->noise_buf];
-            half* curr_u0_noise = state->d_u0_noise[state->noise_buf];
-            half* other_u0_noise = state->d_u0_noise[1 - state->noise_buf];
+            half* curr_u0 = state->d_u0_noise[state->noise_buf];
+            half* other_u0 = state->d_u0_noise[1 - state->noise_buf];
             
-            kernel_cpmmh_rejuvenate_fused<<<state->N_theta, state->N_inner, pmmh_shared_size>>>(
-                state->d_particles, 
-                state->d_particles_temp,  /* Scratch for proposed PF state */
+            kernel_cpmmh_rejuvenate_fused<<<state->N_theta, state->N_inner, cpmmh_shared>>>(
+                state->d_particles, state->d_particles_temp,
                 state->d_y_history,
-                curr_noise,               /* Current z_noise buffer */
-                other_noise,              /* Other z_noise buffer for proposals */
-                curr_u0_noise,            /* Current u0_noise buffer (SEPARATE) */
-                other_u0_noise,           /* Other u0_noise buffer for proposals */
+                curr_noise, other_noise, curr_u0, other_u0,
                 state->t_current,
                 state->N_theta, state->N_inner,
-                state->noise_capacity,
-                state->cpmmh_rho,
-                state->d_accepts,
-                state->d_swap_flags,      /* Per-particle accept flags */
-                state->user_seed,         /* Philox base seed */
-                base_move_id + k,         /* Unique move index for Philox */
-                k % 3                     /* Block id: cycle 0,1,2 (ignored in joint mode) */
+                state->noise_capacity, state->cpmmh_rho,
+                state->d_accepts, state->d_swap_flags,
+                state->user_seed, state->n_rejuv_total / state->N_theta, k % 3
             );
             CUDA_CHECK(cudaDeviceSynchronize());
             
-            /* For accepted particles, copy noise from other → curr */
             kernel_commit_accepted_noise<<<state->N_theta, state->N_inner>>>(
-                curr_noise, other_noise,
-                curr_u0_noise, other_u0_noise,
+                curr_noise, other_noise, curr_u0, other_u0,
                 state->d_swap_flags,
                 state->N_theta, state->N_inner,
                 state->t_current, state->noise_capacity
