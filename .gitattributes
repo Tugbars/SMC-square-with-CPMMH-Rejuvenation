@@ -1,2 +1,14 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Exclude documentation from language statistics
+*.html linguist-documentation
+*.md linguist-documentation
+
+# Exclude generated files
+docs/*.html linguist-generated
+docs/*.md linguist-generated
+
+# Ensure CUDA files are recognized
+*.cu linguist-language=CUDA
+*.cuh linguist-language=CUDA
+
+# Vendor/third-party (if any)
+# vendor/** linguist-vendored
