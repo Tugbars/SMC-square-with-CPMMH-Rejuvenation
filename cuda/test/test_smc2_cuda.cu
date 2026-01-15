@@ -242,7 +242,7 @@ void test_parameter_learning(void) {
     printf("  True h: mean=%.3f, std=%.3f\n", h_mean, h_std);
     
     /* Initialize SMC² */
-    SMC2StateCUDA* state = smc2_cuda_alloc(128, 128);
+    SMC2StateCUDA* state = smc2_cuda_alloc(256, 256);
     
     /* Set reproducible seed */
     smc2_cuda_set_seed(state, 12345);
@@ -309,23 +309,34 @@ void test_parameter_learning(void) {
     const char* names[8] = {"rho", "sigma_z", "mu_base", "mu_scale",
                             "mu_rate", "sigma_base", "sigma_scale", "sigma_rate"};
     
-    printf("\n%-12s  %8s  %8s  %8s  %7s  %s\n", 
-           "Parameter", "True", "Est", "Std", "z-score", "Status");
-    printf("─────────────────────────────────────────────────────────────────\n");
+    printf("\n%-12s  %8s  %8s  %8s  %7s  %7s  %s\n", 
+           "Parameter", "True", "Est", "Std", "Err%", "z-score", "Status");
+    printf("─────────────────────────────────────────────────────────────────────────\n");
     
     int n_ok = 0;
+    int n_within_15pct = 0;
     for (int i = 0; i < 8; i++) {
         float err = theta_mean[i] - true_params[i];
         float z_score = fabsf(err) / fmaxf(theta_std[i], 1e-6f);
+        
+        /* Percentage error: use absolute for params near zero */
+        float pct_err;
+        if (fabsf(true_params[i]) < 0.01f) {
+            pct_err = err * 100.0f;  /* Absolute as percentage */
+        } else {
+            pct_err = 100.0f * err / true_params[i];
+        }
+        
         const char* status = (z_score <= 2.0f) ? "OK" : (z_score <= 3.0f) ? "WARN" : "MISS";
         if (z_score <= 2.0f) n_ok++;
+        if (fabsf(pct_err) <= 15.0f) n_within_15pct++;
         
-        printf("%-12s  %8.4f  %8.4f  %8.4f  %7.2f  [%s]\n", 
-               names[i], true_params[i], theta_mean[i], theta_std[i], z_score, status);
+        printf("%-12s  %8.4f  %8.4f  %8.4f  %+6.1f%%  %7.2f  [%s]\n", 
+               names[i], true_params[i], theta_mean[i], theta_std[i], pct_err, z_score, status);
     }
     
-    printf("─────────────────────────────────────────────────────────────────\n");
-    printf("OVERALL: %d/8 within 2σ of true value\n", n_ok);
+    printf("─────────────────────────────────────────────────────────────────────────\n");
+    printf("OVERALL: %d/8 within 2σ, %d/8 within 15%% relative error\n", n_ok, n_within_15pct);
     printf("%s\n", n_ok >= 6 ? "PASSED" : "NEEDS INVESTIGATION");
     
     cudaEventDestroy(start);
