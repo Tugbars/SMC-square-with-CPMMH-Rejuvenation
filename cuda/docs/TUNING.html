@@ -1,0 +1,1256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SMC² CUDA Tuning Guide</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-base: #fafaf9;
+            --bg-card: #ffffff;
+            --bg-code: #1c1c1e;
+            --bg-muted: #f5f5f4;
+            --text-primary: #1c1c1e;
+            --text-secondary: #57534e;
+            --text-muted: #a8a29e;
+            --accent-red: #dc2626;
+            --accent-orange: #ea580c;
+            --accent-amber: #d97706;
+            --accent-green: #16a34a;
+            --accent-teal: #0d9488;
+            --accent-blue: #2563eb;
+            --accent-indigo: #4f46e5;
+            --accent-violet: #7c3aed;
+            --border: #e7e5e4;
+            --border-dark: #d6d3d1;
+            --shadow-sm: 0 1px 2px rgba(0,0,0,0.05);
+            --shadow-md: 0 4px 6px -1px rgba(0,0,0,0.1), 0 2px 4px -2px rgba(0,0,0,0.1);
+            --shadow-lg: 0 10px 15px -3px rgba(0,0,0,0.1), 0 4px 6px -4px rgba(0,0,0,0.1);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        html {
+            scroll-behavior: smooth;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-base);
+            color: var(--text-primary);
+            line-height: 1.7;
+            font-size: 15px;
+            font-weight: 400;
+        }
+
+        /* Header */
+        .header {
+            background: var(--bg-card);
+            border-bottom: 1px solid var(--border);
+            padding: 4rem 2rem 3rem;
+            text-align: center;
+        }
+
+        .header-eyebrow {
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            color: var(--accent-indigo);
+            margin-bottom: 1rem;
+        }
+
+        .header h1 {
+            font-family: 'Fraunces', Georgia, serif;
+            font-size: clamp(2rem, 5vw, 3rem);
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 1rem;
+        }
+
+        .header .lead {
+            font-size: 1.125rem;
+            color: var(--text-secondary);
+            max-width: 600px;
+            margin: 0 auto;
+            font-weight: 400;
+        }
+
+        /* Nav */
+        .nav {
+            position: sticky;
+            top: 0;
+            background: rgba(250, 250, 249, 0.95);
+            backdrop-filter: blur(10px);
+            border-bottom: 1px solid var(--border);
+            z-index: 100;
+            padding: 0.625rem 2rem;
+        }
+
+        .nav-inner {
+            max-width: 1100px;
+            margin: 0 auto;
+            display: flex;
+            gap: 0.25rem;
+            overflow-x: auto;
+            scrollbar-width: none;
+        }
+
+        .nav-inner::-webkit-scrollbar { display: none; }
+
+        .nav-link {
+            color: var(--text-muted);
+            text-decoration: none;
+            font-size: 0.8125rem;
+            font-weight: 500;
+            padding: 0.5rem 0.875rem;
+            border-radius: 6px;
+            white-space: nowrap;
+            transition: all 0.15s ease;
+        }
+
+        .nav-link:hover {
+            color: var(--text-primary);
+            background: var(--bg-muted);
+        }
+
+        /* Main */
+        .main {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 3rem 1.5rem 6rem;
+        }
+
+        /* Sections */
+        section {
+            margin-bottom: 4rem;
+        }
+
+        h2 {
+            font-family: 'Fraunces', Georgia, serif;
+            font-size: 1.75rem;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 1.5rem;
+            padding-bottom: 0.75rem;
+            border-bottom: 2px solid var(--border);
+        }
+
+        h3 {
+            font-size: 1.125rem;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin: 2rem 0 0.75rem;
+        }
+
+        h4 {
+            font-size: 0.9375rem;
+            font-weight: 600;
+            color: var(--accent-indigo);
+            margin: 1.5rem 0 0.5rem;
+        }
+
+        p {
+            margin-bottom: 1rem;
+            color: var(--text-secondary);
+        }
+
+        strong {
+            color: var(--text-primary);
+            font-weight: 600;
+        }
+
+        /* Lists */
+        ul, ol {
+            margin-bottom: 1rem;
+            padding-left: 1.25rem;
+            color: var(--text-secondary);
+        }
+
+        li {
+            margin-bottom: 0.375rem;
+        }
+
+        /* Code */
+        code {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.8125em;
+            background: var(--bg-muted);
+            padding: 0.125rem 0.375rem;
+            border-radius: 4px;
+            color: var(--accent-violet);
+        }
+
+        pre {
+            background: var(--bg-code);
+            border-radius: 8px;
+            padding: 1.25rem;
+            overflow-x: auto;
+            margin: 1rem 0;
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 0.8125rem;
+            line-height: 1.6;
+            color: #e5e5e5;
+        }
+
+        pre code {
+            background: none;
+            padding: 0;
+            color: inherit;
+        }
+
+        .code-comment { color: #6b7280; }
+        .code-keyword { color: #f472b6; }
+        .code-type { color: #38bdf8; }
+        .code-number { color: #fbbf24; }
+        .code-string { color: #a3e635; }
+
+        /* Tables */
+        .table-wrap {
+            overflow-x: auto;
+            margin: 1.5rem 0;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            box-shadow: var(--shadow-sm);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.875rem;
+        }
+
+        th {
+            background: var(--bg-muted);
+            color: var(--text-primary);
+            font-weight: 600;
+            text-align: left;
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid var(--border);
+            white-space: nowrap;
+        }
+
+        td {
+            padding: 0.625rem 1rem;
+            border-bottom: 1px solid var(--border);
+            color: var(--text-secondary);
+            vertical-align: top;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        tr:hover td {
+            background: rgba(79, 70, 229, 0.02);
+        }
+
+        td code {
+            font-size: 0.75rem;
+        }
+
+        .highlight-row td {
+            background: rgba(22, 163, 74, 0.05);
+        }
+
+        /* Cards */
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1.25rem;
+            margin: 1rem 0;
+            box-shadow: var(--shadow-sm);
+        }
+
+        .card-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 1rem;
+            margin: 1.5rem 0;
+        }
+
+        .card h4 {
+            margin-top: 0;
+        }
+
+        .card p:last-child {
+            margin-bottom: 0;
+        }
+
+        /* Status indicators */
+        .status {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.375rem;
+            font-size: 0.75rem;
+            font-weight: 600;
+            padding: 0.25rem 0.625rem;
+            border-radius: 100px;
+        }
+
+        .status-good {
+            background: rgba(22, 163, 74, 0.1);
+            color: var(--accent-green);
+        }
+
+        .status-warn {
+            background: rgba(217, 119, 6, 0.1);
+            color: var(--accent-amber);
+        }
+
+        .status-bad {
+            background: rgba(220, 38, 38, 0.1);
+            color: var(--accent-red);
+        }
+
+        .status::before {
+            content: '';
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+
+        /* Callouts */
+        .callout {
+            border-radius: 8px;
+            padding: 1rem 1.25rem;
+            margin: 1.5rem 0;
+            border-left: 4px solid;
+        }
+
+        .callout-tip {
+            background: rgba(22, 163, 74, 0.05);
+            border-color: var(--accent-green);
+        }
+
+        .callout-warn {
+            background: rgba(217, 119, 6, 0.05);
+            border-color: var(--accent-amber);
+        }
+
+        .callout-info {
+            background: rgba(37, 99, 235, 0.05);
+            border-color: var(--accent-blue);
+        }
+
+        .callout-title {
+            font-weight: 600;
+            font-size: 0.8125rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 0.5rem;
+        }
+
+        .callout-tip .callout-title { color: var(--accent-green); }
+        .callout-warn .callout-title { color: var(--accent-amber); }
+        .callout-info .callout-title { color: var(--accent-blue); }
+
+        .callout p:last-child { margin-bottom: 0; }
+
+        /* Sliders / Range visualization */
+        .range-viz {
+            background: var(--bg-muted);
+            border-radius: 6px;
+            padding: 1rem 1.25rem;
+            margin: 1rem 0;
+        }
+
+        .range-bar {
+            height: 8px;
+            background: var(--border);
+            border-radius: 4px;
+            position: relative;
+            margin: 0.75rem 0;
+        }
+
+        .range-fill {
+            position: absolute;
+            height: 100%;
+            border-radius: 4px;
+            background: linear-gradient(90deg, var(--accent-green), var(--accent-amber), var(--accent-red));
+        }
+
+        .range-marker {
+            position: absolute;
+            top: -4px;
+            width: 16px;
+            height: 16px;
+            background: var(--bg-card);
+            border: 2px solid var(--accent-indigo);
+            border-radius: 50%;
+            transform: translateX(-50%);
+        }
+
+        .range-labels {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+        }
+
+        /* Formula */
+        .formula {
+            font-family: 'IBM Plex Mono', monospace;
+            background: var(--bg-muted);
+            border: 1px solid var(--border);
+            padding: 0.875rem 1.25rem;
+            border-radius: 6px;
+            margin: 1rem 0;
+            text-align: center;
+            font-size: 0.9375rem;
+            color: var(--text-primary);
+        }
+
+        /* Diagnostic panels */
+        .diag-panel {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 0.75rem;
+            margin: 1.5rem 0;
+        }
+
+        .diag-item {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1rem;
+            text-align: center;
+        }
+
+        .diag-value {
+            font-family: 'IBM Plex Mono', monospace;
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .diag-label {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-top: 0.25rem;
+        }
+
+        .diag-item.good .diag-value { color: var(--accent-green); }
+        .diag-item.warn .diag-value { color: var(--accent-amber); }
+        .diag-item.bad .diag-value { color: var(--accent-red); }
+
+        /* Decision tree */
+        .decision {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1.5rem;
+            margin: 1.5rem 0;
+        }
+
+        .decision-q {
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 1rem;
+        }
+
+        .decision-branches {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+        }
+
+        .decision-branch {
+            padding: 1rem;
+            border-radius: 6px;
+            font-size: 0.875rem;
+        }
+
+        .decision-branch.yes {
+            background: rgba(22, 163, 74, 0.05);
+            border: 1px solid rgba(22, 163, 74, 0.2);
+        }
+
+        .decision-branch.no {
+            background: rgba(220, 38, 38, 0.05);
+            border: 1px solid rgba(220, 38, 38, 0.2);
+        }
+
+        .decision-branch strong {
+            display: block;
+            margin-bottom: 0.5rem;
+        }
+
+        .decision-branch.yes strong { color: var(--accent-green); }
+        .decision-branch.no strong { color: var(--accent-red); }
+
+        /* Footer */
+        .footer {
+            border-top: 1px solid var(--border);
+            padding: 2rem;
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 0.8125rem;
+        }
+
+        /* Responsive */
+        @media (max-width: 640px) {
+            .header { padding: 2.5rem 1rem 2rem; }
+            .main { padding: 2rem 1rem; }
+            h2 { font-size: 1.5rem; }
+            .decision-branches { grid-template-columns: 1fr; }
+            .card-grid { grid-template-columns: 1fr; }
+        }
+
+        /* Print */
+        @media print {
+            .nav { display: none; }
+            body { font-size: 12px; }
+        }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <div class="header-eyebrow">Reference Guide</div>
+        <h1>SMC² CUDA Tuning</h1>
+        <p class="lead">Parameter selection, diagnostics, and optimization strategies for the streaming particle filter</p>
+    </header>
+
+    <nav class="nav">
+        <div class="nav-inner">
+            <a href="#overview" class="nav-link">Overview</a>
+            <a href="#particles" class="nav-link">Particle Counts</a>
+            <a href="#fixed-lag" class="nav-link">Fixed-Lag</a>
+            <a href="#cpmmh" class="nav-link">CPMMH</a>
+            <a href="#drift" class="nav-link">Drift Matrix Q</a>
+            <a href="#liu-west" class="nav-link">Liu-West</a>
+            <a href="#diagnostics" class="nav-link">Diagnostics</a>
+            <a href="#recipes" class="nav-link">Recipes</a>
+            <a href="#troubleshooting" class="nav-link">Troubleshooting</a>
+        </div>
+    </nav>
+
+    <main class="main">
+        <!-- Overview -->
+        <section id="overview">
+            <h2>Parameter Overview</h2>
+            
+            <p>The SMC² system has several interconnected parameters. Tuning is not independent — changes to one parameter often require adjustments to others.</p>
+
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Parameter</th>
+                            <th>Symbol</th>
+                            <th>Default</th>
+                            <th>Affects</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>θ-particles</td>
+                            <td><code>N_theta</code></td>
+                            <td>256</td>
+                            <td>Posterior resolution, GPU occupancy</td>
+                        </tr>
+                        <tr>
+                            <td>Inner particles</td>
+                            <td><code>N_inner</code></td>
+                            <td>256</td>
+                            <td>Likelihood variance, memory</td>
+                        </tr>
+                        <tr>
+                            <td>Fixed-lag window</td>
+                            <td><code>L</code></td>
+                            <td>100</td>
+                            <td>Bias vs variance, memory</td>
+                        </tr>
+                        <tr>
+                            <td>CPMMH correlation</td>
+                            <td><code>ρ_cpmmh</code></td>
+                            <td>0.99</td>
+                            <td>Acceptance rate, exploration</td>
+                        </tr>
+                        <tr>
+                            <td>Outer ESS threshold</td>
+                            <td><code>τ_outer</code></td>
+                            <td>0.5</td>
+                            <td>Rejuvenation frequency</td>
+                        </tr>
+                        <tr>
+                            <td>Inner ESS threshold</td>
+                            <td><code>τ_inner</code></td>
+                            <td>0.5</td>
+                            <td>Resampling frequency</td>
+                        </tr>
+                        <tr>
+                            <td>Drift matrix</td>
+                            <td><code>Q</code></td>
+                            <td>See below</td>
+                            <td>Regime adaptation speed</td>
+                        </tr>
+                        <tr>
+                            <td>Liu-West shrinkage</td>
+                            <td><code>a</code></td>
+                            <td>0.98</td>
+                            <td>Particle diversity</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="callout callout-info">
+                <div class="callout-title">Rule of Thumb</div>
+                <p>Start with defaults. Only tune when diagnostics indicate a problem. Tune one parameter at a time and observe the effect for at least 1000 ticks before adjusting another.</p>
+            </div>
+        </section>
+
+        <!-- Particle Counts -->
+        <section id="particles">
+            <h2>Particle Counts</h2>
+
+            <h3>N_theta (θ-particles)</h3>
+            <p>Controls the resolution of the parameter posterior. More particles = better approximation of the true posterior, but diminishing returns beyond ~512.</p>
+
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>N_theta</th>
+                            <th>Memory</th>
+                            <th>Quality</th>
+                            <th>Use Case</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>64</code></td>
+                            <td>~25 MB</td>
+                            <td><span class="status status-warn">Marginal</span></td>
+                            <td>Debugging, quick tests</td>
+                        </tr>
+                        <tr>
+                            <td><code>128</code></td>
+                            <td>~50 MB</td>
+                            <td><span class="status status-warn">Acceptable</span></td>
+                            <td>Development, prototyping</td>
+                        </tr>
+                        <tr class="highlight-row">
+                            <td><code>256</code></td>
+                            <td>~100 MB</td>
+                            <td><span class="status status-good">Good</span></td>
+                            <td>Production (recommended)</td>
+                        </tr>
+                        <tr>
+                            <td><code>512</code></td>
+                            <td>~200 MB</td>
+                            <td><span class="status status-good">Excellent</span></td>
+                            <td>High-accuracy requirements</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <h3>N_inner (Inner particles per θ)</h3>
+            <p>Controls the variance of the likelihood estimate. More inner particles = lower variance = more stable acceptance rates in CPMMH.</p>
+
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>N_inner</th>
+                            <th>Likelihood σ</th>
+                            <th>Accept Rate Impact</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>64</code></td>
+                            <td>High (~2-3)</td>
+                            <td>Erratic, needs high ρ_cpmmh</td>
+                        </tr>
+                        <tr>
+                            <td><code>128</code></td>
+                            <td>Medium (~1-2)</td>
+                            <td>Workable with ρ_cpmmh=0.99</td>
+                        </tr>
+                        <tr class="highlight-row">
+                            <td><code>256</code></td>
+                            <td>Low (~0.5-1)</td>
+                            <td>Stable, good mixing</td>
+                        </tr>
+                        <tr>
+                            <td><code>512</code></td>
+                            <td>Very low (~0.3)</td>
+                            <td>Very stable, diminishing returns</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="formula">
+                Total particles = N_theta × N_inner = 256 × 256 = 65,536
+            </div>
+
+            <div class="callout callout-tip">
+                <div class="callout-title">GPU Occupancy</div>
+                <p>For best GPU utilization, keep <code>N_theta</code> as a multiple of 32 (warp size) and <code>N_inner</code> as a power of 2. The product should be at least 32,768 for good throughput on modern GPUs.</p>
+            </div>
+        </section>
+
+        <!-- Fixed-Lag -->
+        <section id="fixed-lag">
+            <h2>Fixed-Lag Window (L)</h2>
+
+            <p>The fixed-lag parameter L controls how much history CPMMH replays during rejuvenation. Larger L = less bias but more variance and compute.</p>
+
+            <h3>Bias-Variance Tradeoff</h3>
+
+            <div class="formula">
+                Bias ≈ ρ<sup>L</sup> &nbsp;&nbsp;&nbsp; (decays exponentially with L)
+            </div>
+
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ρ (persistence)</th>
+                            <th>L = 50</th>
+                            <th>L = 100</th>
+                            <th>L = 200</th>
+                            <th>Recommended L</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>0.90</code></td>
+                            <td>0.5% bias</td>
+                            <td>0.003%</td>
+                            <td>~0%</td>
+                            <td>50</td>
+                        </tr>
+                        <tr class="highlight-row">
+                            <td><code>0.95</code></td>
+                            <td>7.7% bias</td>
+                            <td>0.6%</td>
+                            <td>0.003%</td>
+                            <td>100</td>
+                        </tr>
+                        <tr>
+                            <td><code>0.99</code></td>
+                            <td>60% bias</td>
+                            <td>37%</td>
+                            <td>13%</td>
+                            <td>200-300</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <h3>Memory Impact</h3>
+
+            <p>Circular buffer size = N_theta × N_inner × (L + 1) × 2 bytes (FP16)</p>
+
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>L</th>
+                            <th>Buffer Size (256×256)</th>
+                            <th>Replay Time</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>50</td>
+                            <td>6.7 MB</td>
+                            <td>~5 ms</td>
+                        </tr>
+                        <tr class="highlight-row">
+                            <td>100</td>
+                            <td>13.1 MB</td>
+                            <td>~10 ms</td>
+                        </tr>
+                        <tr>
+                            <td>200</td>
+                            <td>26.2 MB</td>
+                            <td>~20 ms</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="callout callout-warn">
+                <div class="callout-title">Rule of Thumb</div>
+                <p>Set L ≈ 7 × half-life, where half-life = log(0.5) / log(ρ). For ρ = 0.95, half-life ≈ 14, so L ≈ 100 is appropriate.</p>
+            </div>
+        </section>
+
+        <!-- CPMMH -->
+        <section id="cpmmh">
+            <h2>CPMMH Correlation (ρ_cpmmh)</h2>
+
+            <p>The correlation parameter controls how similar the random numbers are between current and proposed particle filters. Higher correlation = lower variance in likelihood ratio = higher acceptance rate.</p>
+
+            <div class="range-viz">
+                <div class="range-labels">
+                    <span>More exploration</span>
+                    <span>More acceptance</span>
+                </div>
+                <div class="range-bar">
+                    <div class="range-fill" style="left: 0; right: 0;"></div>
+                    <div class="range-marker" style="left: 80%;"></div>
+                </div>
+                <div class="range-labels">
+                    <span>ρ = 0.90</span>
+                    <span>ρ = 0.95</span>
+                    <span>ρ = 0.99</span>
+                    <span>ρ = 0.999</span>
+                </div>
+            </div>
+
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ρ_cpmmh</th>
+                            <th>Expected Accept %</th>
+                            <th>Exploration</th>
+                            <th>When to Use</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>0.90</code></td>
+                            <td>15-25%</td>
+                            <td><span class="status status-good">High</span></td>
+                            <td>Low N_inner, need diversity</td>
+                        </tr>
+                        <tr>
+                            <td><code>0.95</code></td>
+                            <td>30-40%</td>
+                            <td><span class="status status-good">Medium</span></td>
+                            <td>Balanced</td>
+                        </tr>
+                        <tr class="highlight-row">
+                            <td><code>0.99</code></td>
+                            <td>45-55%</td>
+                            <td><span class="status status-warn">Low-Medium</span></td>
+                            <td>Default, stable operation</td>
+                        </tr>
+                        <tr>
+                            <td><code>0.999</code></td>
+                            <td>55-65%</td>
+                            <td><span class="status status-bad">Low</span></td>
+                            <td>High N_inner, acceptance too low</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="decision">
+                <div class="decision-q">Is your acceptance rate below 30%?</div>
+                <div class="decision-branches">
+                    <div class="decision-branch yes">
+                        <strong>Yes → Increase ρ_cpmmh</strong>
+                        Try 0.995 or 0.999. If still low, increase N_inner.
+                    </div>
+                    <div class="decision-branch no">
+                        <strong>No → Check exploration</strong>
+                        If params aren't moving, decrease ρ_cpmmh to 0.95.
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Drift Matrix Q -->
+        <section id="drift">
+            <h2>Drift Matrix Q</h2>
+
+            <p>The drift matrix Q controls how much parameters can change per rejuvenation. This is the key to adapting to regime changes.</p>
+
+            <h3>Per-Parameter Values</h3>
+
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Parameter</th>
+                            <th>Typical Posterior σ</th>
+                            <th>Q_sqrt (default)</th>
+                            <th>Q_sqrt (aggressive)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>ρ</code> (persistence)</td>
+                            <td>0.015 - 0.025</td>
+                            <td>0.005</td>
+                            <td>0.01</td>
+                        </tr>
+                        <tr>
+                            <td><code>σ_z</code> (z innovation)</td>
+                            <td>0.03 - 0.08</td>
+                            <td>0.01</td>
+                            <td>0.02</td>
+                        </tr>
+                        <tr>
+                            <td><code>μ_base</code> (vol mean base)</td>
+                            <td>0.3 - 0.6</td>
+                            <td>0.1</td>
+                            <td>0.2</td>
+                        </tr>
+                        <tr>
+                            <td><code>μ_scale</code> (vol mean scale)</td>
+                            <td>0.3 - 0.6</td>
+                            <td>0.1</td>
+                            <td>0.2</td>
+                        </tr>
+                        <tr>
+                            <td><code>μ_rate</code> (vol mean rate)</td>
+                            <td>0.1 - 0.3</td>
+                            <td>0.05</td>
+                            <td>0.1</td>
+                        </tr>
+                        <tr>
+                            <td><code>σ_base</code> (vol-of-vol base)</td>
+                            <td>0.05 - 0.15</td>
+                            <td>0.02</td>
+                            <td>0.05</td>
+                        </tr>
+                        <tr>
+                            <td><code>σ_scale</code> (vol-of-vol scale)</td>
+                            <td>0.05 - 0.15</td>
+                            <td>0.02</td>
+                            <td>0.05</td>
+                        </tr>
+                        <tr>
+                            <td><code>σ_rate</code> (vol-of-vol rate)</td>
+                            <td>0.1 - 0.3</td>
+                            <td>0.05</td>
+                            <td>0.1</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <h3>Adaptive Q Scaling</h3>
+
+            <p>Scale Q based on filter stress (NLL excess):</p>
+
+<pre><code><span class="code-comment">// Stress factor: 1.0 (calm) to 2.0+ (stressed)</span>
+<span class="code-type">float</span> stress = <span class="code-number">1.0f</span> + nll_excess_accum / <span class="code-number">50.0f</span>;
+stress = fminf(stress, <span class="code-number">3.0f</span>);  <span class="code-comment">// Cap at 3x</span>
+
+<span class="code-keyword">for</span> (<span class="code-type">int</span> p = <span class="code-number">0</span>; p < <span class="code-number">8</span>; p++) {
+    Q_effective[p] = Q_base[p] * stress;
+}</code></pre>
+
+            <div class="callout callout-tip">
+                <div class="callout-title">Tuning Strategy</div>
+                <p>Start with conservative Q values. If regime changes take too long to detect (high NLL persists for 500+ ticks), increase Q. If parameters oscillate unnecessarily during stable periods, decrease Q.</p>
+            </div>
+        </section>
+
+        <!-- Liu-West -->
+        <section id="liu-west">
+            <h2>Liu-West Regularization</h2>
+
+            <p>After resampling, particles may collapse to duplicates. Liu-West regularization maintains diversity through shrinkage + jitter.</p>
+
+            <div class="formula">
+                θ'[j] = a · θ[j] + (1-a) · μ_θ + h · Chol(Σ_θ) · ε
+            </div>
+
+            <p>where <code>h² = 1 - a²</code> to preserve total variance.</p>
+
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Shrinkage (a)</th>
+                            <th>Jitter (h)</th>
+                            <th>Behavior</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><code>0.90</code></td>
+                            <td><code>0.436</code></td>
+                            <td>High jitter, fast adaptation, may over-disperse</td>
+                        </tr>
+                        <tr>
+                            <td><code>0.95</code></td>
+                            <td><code>0.312</code></td>
+                            <td>Moderate jitter, good balance</td>
+                        </tr>
+                        <tr class="highlight-row">
+                            <td><code>0.98</code></td>
+                            <td><code>0.199</code></td>
+                            <td>Default: stable, sufficient exploration</td>
+                        </tr>
+                        <tr>
+                            <td><code>0.99</code></td>
+                            <td><code>0.141</code></td>
+                            <td>Conservative, slow adaptation</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="callout callout-info">
+                <div class="callout-title">Interaction with Q</div>
+                <p>Liu-West jitter and drift Q both add exploration. If using both, you may want smaller values for each. If using only one, increase its magnitude.</p>
+            </div>
+        </section>
+
+        <!-- Diagnostics -->
+        <section id="diagnostics">
+            <h2>Diagnostics</h2>
+
+            <p>Monitor these metrics to assess filter health:</p>
+
+            <h3>Healthy Filter</h3>
+
+            <div class="diag-panel">
+                <div class="diag-item good">
+                    <div class="diag-value">45-55%</div>
+                    <div class="diag-label">Accept Rate</div>
+                </div>
+                <div class="diag-item good">
+                    <div class="diag-value">&gt; 0.5</div>
+                    <div class="diag-label">Outer ESS / N_θ</div>
+                </div>
+                <div class="diag-item good">
+                    <div class="diag-value">&lt; 2.0</div>
+                    <div class="diag-label">Z-scores</div>
+                </div>
+                <div class="diag-item good">
+                    <div class="diag-value">Stable</div>
+                    <div class="diag-label">NLL Trend</div>
+                </div>
+            </div>
+
+            <h3>Warning Signs</h3>
+
+            <div class="diag-panel">
+                <div class="diag-item warn">
+                    <div class="diag-value">25-35%</div>
+                    <div class="diag-label">Accept Rate</div>
+                </div>
+                <div class="diag-item warn">
+                    <div class="diag-value">0.3 - 0.5</div>
+                    <div class="diag-label">Outer ESS / N_θ</div>
+                </div>
+                <div class="diag-item warn">
+                    <div class="diag-value">2.0 - 3.0</div>
+                    <div class="diag-label">Z-scores</div>
+                </div>
+                <div class="diag-item warn">
+                    <div class="diag-value">Rising</div>
+                    <div class="diag-label">NLL Trend</div>
+                </div>
+            </div>
+
+            <h3>Critical Problems</h3>
+
+            <div class="diag-panel">
+                <div class="diag-item bad">
+                    <div class="diag-value">&lt; 20%</div>
+                    <div class="diag-label">Accept Rate</div>
+                </div>
+                <div class="diag-item bad">
+                    <div class="diag-value">&lt; 0.2</div>
+                    <div class="diag-label">Outer ESS / N_θ</div>
+                </div>
+                <div class="diag-item bad">
+                    <div class="diag-value">&gt; 3.0</div>
+                    <div class="diag-label">Z-scores</div>
+                </div>
+                <div class="diag-item bad">
+                    <div class="diag-value">Spiking</div>
+                    <div class="diag-label">NLL Trend</div>
+                </div>
+            </div>
+
+            <h3>Diagnostic Formulas</h3>
+
+            <div class="card-grid">
+                <div class="card">
+                    <h4>Effective Sample Size</h4>
+                    <div class="formula" style="font-size: 0.8125rem; text-align: left;">ESS = 1 / Σ w[j]²</div>
+                    <p>Measures particle diversity. ESS/N &lt; 0.5 triggers rejuvenation.</p>
+                </div>
+                <div class="card">
+                    <h4>Z-score</h4>
+                    <div class="formula" style="font-size: 0.8125rem; text-align: left;">z = |θ_est - θ_true| / σ_posterior</div>
+                    <p>Measures statistical consistency. z &lt; 2 means truth is within 95% CI.</p>
+                </div>
+                <div class="card">
+                    <h4>NLL Excess</h4>
+                    <div class="formula" style="font-size: 0.8125rem; text-align: left;">excess = max(0, nll - baseline)</div>
+                    <p>Accumulated evidence of parameter mismatch.</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Recipes -->
+        <section id="recipes">
+            <h2>Tuning Recipes</h2>
+
+            <h3>Recipe 1: Fast Adaptation (HFT)</h3>
+            <p>Prioritize speed of regime detection over parameter precision.</p>
+
+            <div class="card">
+<pre><code>N_theta     = 128
+N_inner     = 128
+L           = 50
+ρ_cpmmh     = 0.99
+Q_sqrt      = 2× default  <span class="code-comment">// More drift</span>
+a           = 0.95        <span class="code-comment">// More jitter</span>
+τ_outer     = 0.6         <span class="code-comment">// More frequent rejuvenation</span></code></pre>
+            </div>
+
+            <h3>Recipe 2: High Accuracy (Research)</h3>
+            <p>Prioritize parameter precision over adaptation speed.</p>
+
+            <div class="card">
+<pre><code>N_theta     = 512
+N_inner     = 512
+L           = 200
+ρ_cpmmh     = 0.995
+Q_sqrt      = 0.5× default  <span class="code-comment">// Less drift</span>
+a           = 0.99          <span class="code-comment">// Less jitter</span>
+τ_outer     = 0.4           <span class="code-comment">// Less frequent rejuvenation</span></code></pre>
+            </div>
+
+            <h3>Recipe 3: Balanced (Default)</h3>
+            <p>Good tradeoff for most production use cases.</p>
+
+            <div class="card">
+<pre><code>N_theta     = 256
+N_inner     = 256
+L           = 100
+ρ_cpmmh     = 0.99
+Q_sqrt      = default
+a           = 0.98
+τ_outer     = 0.5</code></pre>
+            </div>
+
+            <h3>Recipe 4: Memory Constrained</h3>
+            <p>For GPUs with limited VRAM (&lt; 4GB).</p>
+
+            <div class="card">
+<pre><code>N_theta     = 128
+N_inner     = 128
+L           = 64
+ρ_cpmmh     = 0.995        <span class="code-comment">// Higher to compensate for fewer particles</span>
+Q_sqrt      = 1.5× default
+a           = 0.97
+
+<span class="code-comment">// Total memory: ~25 MB (vs ~100 MB default)</span></code></pre>
+            </div>
+        </section>
+
+        <!-- Troubleshooting -->
+        <section id="troubleshooting">
+            <h2>Troubleshooting</h2>
+
+            <div class="decision">
+                <div class="decision-q">Acceptance rate too low (&lt; 30%)?</div>
+                <div class="decision-branches">
+                    <div class="decision-branch yes">
+                        <strong>Fix →</strong>
+                        1. Increase ρ_cpmmh (try 0.995)<br>
+                        2. Increase N_inner (try 512)<br>
+                        3. Decrease proposal scale
+                    </div>
+                    <div class="decision-branch no">
+                        <strong>If &gt; 60% →</strong>
+                        Decrease ρ_cpmmh to explore more
+                    </div>
+                </div>
+            </div>
+
+            <div class="decision">
+                <div class="decision-q">Parameters not tracking regime change?</div>
+                <div class="decision-branches">
+                    <div class="decision-branch yes">
+                        <strong>Fix →</strong>
+                        1. Increase Q (2× default)<br>
+                        2. Decrease a (try 0.95)<br>
+                        3. Enable adaptive Q scaling
+                    </div>
+                    <div class="decision-branch no">
+                        <strong>If oscillating →</strong>
+                        Decrease Q, increase a
+                    </div>
+                </div>
+            </div>
+
+            <div class="decision">
+                <div class="decision-q">ESS collapsing frequently?</div>
+                <div class="decision-branches">
+                    <div class="decision-branch yes">
+                        <strong>Fix →</strong>
+                        1. Increase N_inner<br>
+                        2. Decrease τ_outer (try 0.4)<br>
+                        3. Check for model misspecification
+                    </div>
+                    <div class="decision-branch no">
+                        <strong>If rarely rejuvenating →</strong>
+                        Increase τ_outer (try 0.6)
+                    </div>
+                </div>
+            </div>
+
+            <div class="decision">
+                <div class="decision-q">NLL spiking and not recovering?</div>
+                <div class="decision-branches">
+                    <div class="decision-branch yes">
+                        <strong>Fix →</strong>
+                        1. Major regime change — increase Q dramatically<br>
+                        2. Consider resetting filter with fresh prior<br>
+                        3. Check data for anomalies
+                    </div>
+                    <div class="decision-branch no">
+                        <strong>If slowly rising →</strong>
+                        Gradual drift — enable adaptive Q
+                    </div>
+                </div>
+            </div>
+
+            <div class="callout callout-warn">
+                <div class="callout-title">When All Else Fails</div>
+                <p>If the filter is severely misaligned (NLL &gt; 2× baseline for 500+ ticks), it may be faster to reinitialize from the prior rather than wait for drift to correct. This is a design choice: how much "memory" do you want to preserve vs. how quickly do you need to adapt?</p>
+            </div>
+        </section>
+    </main>
+
+    <footer class="footer">
+        <p>SMC² CUDA Tuning Guide · v1.0 · January 2026</p>
+    </footer>
+
+    <script>
+        // Smooth scroll for nav links
+        document.querySelectorAll('.nav-link').forEach(link => {
+            link.addEventListener('click', e => {
+                e.preventDefault();
+                const target = document.querySelector(link.getAttribute('href'));
+                if (target) {
+                    const offset = 60;
+                    window.scrollTo({
+                        top: target.getBoundingClientRect().top + window.pageYOffset - offset,
+                        behavior: 'smooth'
+                    });
+                }
+            });
+        });
+    </script>
+</body>
+</html>
