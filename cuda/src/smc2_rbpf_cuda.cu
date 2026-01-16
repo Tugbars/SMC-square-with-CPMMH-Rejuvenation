@@ -587,6 +587,8 @@ __global__ void kernel_copy_theta_particles(
 __global__ void kernel_copy_noise_arrays(
     const half* src_z_noise,
     half* dst_z_noise,
+    const half* src_u0_noise,
+    half* dst_u0_noise,
     const int* d_ancestors,
     int N_theta, int N_inner,
     int t_current, int noise_capacity
@@ -598,6 +600,7 @@ __global__ void kernel_copy_noise_arrays(
     
     int ancestor = d_ancestors[theta_idx];
     
+    /* Copy z_noise: layout [theta][t][inner] */
     int64_t dst_z_base = (int64_t)theta_idx * N_inner * (noise_capacity + 1);
     int64_t src_z_base = (int64_t)ancestor * N_inner * (noise_capacity + 1);
     
@@ -605,6 +608,16 @@ __global__ void kernel_copy_noise_arrays(
         int64_t src_idx = src_z_base + t * N_inner + inner_idx;
         int64_t dst_idx = dst_z_base + t * N_inner + inner_idx;
         dst_z_noise[dst_idx] = src_z_noise[src_idx];
+    }
+    
+    /* Copy u0_noise: layout [theta][t] - only thread 0 per block */
+    if (inner_idx == 0) {
+        int64_t dst_u0_base = (int64_t)theta_idx * (noise_capacity + 1);
+        int64_t src_u0_base = (int64_t)ancestor * (noise_capacity + 1);
+        
+        for (int t = 0; t <= t_current + 1; t++) {
+            dst_u0_noise[dst_u0_base + t] = src_u0_noise[src_u0_base + t];
+        }
     }
 }
 
@@ -1392,6 +1405,28 @@ void smc2_cuda_set_fixed_lag(SMC2StateCUDA* state, int L) {
     state->t_checkpoint = -1;  /* Reset checkpoint */
 }
 
+void smc2_cuda_set_proposal_std(SMC2StateCUDA* state, const float* std) {
+    if (std) {
+        memcpy(state->proposal_std, std, 8 * sizeof(float));
+    } else {
+        /* Reset to defaults */
+        state->proposal_std[0] = 0.01f;   /* rho */
+        state->proposal_std[1] = 0.02f;   /* sigma_z */
+        state->proposal_std[2] = 0.1f;    /* mu_base */
+        state->proposal_std[3] = 0.1f;    /* mu_scale */
+        state->proposal_std[4] = 0.15f;   /* mu_rate */
+        state->proposal_std[5] = 0.02f;   /* sigma_base */
+        state->proposal_std[6] = 0.02f;   /* sigma_scale */
+        state->proposal_std[7] = 0.15f;   /* sigma_rate */
+    }
+    /* Update constant memory */
+    CUDA_CHECK(cudaMemcpyToSymbol(d_proposal_std, state->proposal_std, 8 * sizeof(float)));
+}
+
+void smc2_cuda_set_cpmmh_rho(SMC2StateCUDA* state, float rho) {
+    state->cpmmh_rho = rho;
+}
+
 void smc2_cuda_init_from_prior(SMC2StateCUDA* state) {
     CUDA_CHECK(cudaMemcpyToSymbol(d_prior, &state->prior, sizeof(SVPrior)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_bounds, &state->bounds, sizeof(SVBounds)));
@@ -1493,6 +1528,8 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
         kernel_copy_noise_arrays<<<state->N_theta, state->N_inner>>>(
             state->d_z_noise[state->noise_buf],
             state->d_z_noise[other_buf],
+            state->d_u0_noise[state->noise_buf],
+            state->d_u0_noise[other_buf],
             state->d_ancestors,
             state->N_theta, state->N_inner,
             state->t_current, state->noise_capacity
