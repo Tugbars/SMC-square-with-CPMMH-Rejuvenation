@@ -10,6 +10,7 @@
 #include "smc2_noise_precision.cuh"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <math.h>
 #include <time.h>
 #include <curand.h>
@@ -74,6 +75,7 @@ __constant__ SVPrior  d_prior;
 __constant__ SVBounds d_bounds;
 __constant__ SVCurve  d_theta_curve;
 __constant__ float    d_proposal_std[8];
+__constant__ float    d_proposal_chol[64];  // Cholesky factor for adaptive proposals
 
 /*═══════════════════════════════════════════════════════════════════════════════
  * LOG PRIOR EVALUATION
@@ -477,6 +479,103 @@ __global__ void kernel_reset_outer_weights(
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
+ * KERNEL: Compute Particle Mean and Covariance
+ * 
+ * For adaptive Metropolis proposals (Haario et al. 2001).
+ * Computes empirical mean and covariance of θ-particles.
+ * 
+ * Launch with 1 block, N_theta threads (up to 1024).
+ * Shared memory: (8 + 36 + blockDim.x) * sizeof(float)
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+__global__ void kernel_compute_particle_moments(
+    ThetaParticlesSoA particles,
+    float* d_mean,      /* [8] output: parameter means */
+    float* d_cov,       /* [64] output: covariance matrix (row-major) */
+    int N_theta
+) {
+    extern __shared__ float s_data[];
+    float* s_scratch = s_data;  /* [blockDim.x] for reductions */
+    
+    int tid = threadIdx.x;
+    
+    /* Load parameters for this particle */
+    float p[8];
+    if (tid < N_theta) {
+        p[0] = particles.rho[tid];
+        p[1] = particles.sigma_z[tid];
+        p[2] = particles.mu_base[tid];
+        p[3] = particles.mu_scale[tid];
+        p[4] = particles.mu_rate[tid];
+        p[5] = particles.sigma_base[tid];
+        p[6] = particles.sigma_scale[tid];
+        p[7] = particles.sigma_rate[tid];
+    } else {
+        for (int i = 0; i < 8; i++) p[i] = 0.0f;
+    }
+    
+    /* Compute means via parallel reduction */
+    __shared__ float s_mean[8];
+    for (int i = 0; i < 8; i++) {
+        s_scratch[tid] = (tid < N_theta) ? p[i] : 0.0f;
+        __syncthreads();
+        
+        /* Block reduction */
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                s_scratch[tid] += s_scratch[tid + s];
+            }
+            __syncthreads();
+        }
+        
+        if (tid == 0) {
+            s_mean[i] = s_scratch[0] / (float)N_theta;
+        }
+        __syncthreads();
+    }
+    
+    /* Store means to global memory */
+    if (tid < 8) {
+        d_mean[tid] = s_mean[tid];
+    }
+    
+    /* Center the parameters */
+    float c[8];
+    for (int i = 0; i < 8; i++) {
+        c[i] = p[i] - s_mean[i];
+    }
+    
+    /* Compute covariance (lower triangle, then mirror) */
+    /* Cov(i,j) = E[(p_i - mu_i)(p_j - mu_j)] with Bessel correction */
+    float inv_N_1 = 1.0f / (float)(N_theta - 1);
+    
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j <= i; j++) {
+            /* Product for this particle */
+            float prod = (tid < N_theta) ? (c[i] * c[j]) : 0.0f;
+            
+            s_scratch[tid] = prod;
+            __syncthreads();
+            
+            /* Block reduction */
+            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+                if (tid < s) {
+                    s_scratch[tid] += s_scratch[tid + s];
+                }
+                __syncthreads();
+            }
+            
+            if (tid == 0) {
+                float cov_ij = s_scratch[0] * inv_N_1;
+                d_cov[i * 8 + j] = cov_ij;
+                d_cov[j * 8 + i] = cov_ij;  /* Symmetric */
+            }
+            __syncthreads();
+        }
+    }
+}
+
+/*═══════════════════════════════════════════════════════════════════════════════
  * KERNEL: Compute Outer ESS
  *═══════════════════════════════════════════════════════════════════════════════*/
 
@@ -768,15 +867,52 @@ void kernel_cpmmh_rejuvenate_fused_impl(
                                      s_mu_base_curr, s_mu_scale_curr, s_mu_rate_curr,
                                      s_sigma_base_curr, s_sigma_scale_curr, s_sigma_rate_curr);
         
-        /* Random walk proposal */
-        s_rho_prop = s_rho_curr + d_proposal_std[0] * curand_normal(&local_rng);
-        s_sigma_z_prop = s_sigma_z_curr + d_proposal_std[1] * curand_normal(&local_rng);
-        s_mu_base_prop = s_mu_base_curr + d_proposal_std[2] * curand_normal(&local_rng);
-        s_mu_scale_prop = s_mu_scale_curr + d_proposal_std[3] * curand_normal(&local_rng);
-        s_mu_rate_prop = s_mu_rate_curr + d_proposal_std[4] * curand_normal(&local_rng);
-        s_sigma_base_prop = s_sigma_base_curr + d_proposal_std[5] * curand_normal(&local_rng);
-        s_sigma_scale_prop = s_sigma_scale_curr + d_proposal_std[6] * curand_normal(&local_rng);
-        s_sigma_rate_prop = s_sigma_rate_curr + d_proposal_std[7] * curand_normal(&local_rng);
+        /* Random walk proposal - adaptive or fixed */
+        float z_rnd[8];
+        z_rnd[0] = curand_normal(&local_rng);
+        z_rnd[1] = curand_normal(&local_rng);
+        z_rnd[2] = curand_normal(&local_rng);
+        z_rnd[3] = curand_normal(&local_rng);
+        z_rnd[4] = curand_normal(&local_rng);
+        z_rnd[5] = curand_normal(&local_rng);
+        z_rnd[6] = curand_normal(&local_rng);
+        z_rnd[7] = curand_normal(&local_rng);
+        
+        float pert[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        float mix_u = curand_uniform(&local_rng);
+        
+        if (mix_u > 0.05f) {
+            /* 95%: Adaptive correlated proposal using Cholesky factor */
+            /* pert = L @ z where L is lower triangular */
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                float sum = 0.0f;
+                #pragma unroll
+                for (int j = 0; j <= i; j++) {
+                    sum += d_proposal_chol[i * 8 + j] * z_rnd[j];
+                }
+                pert[i] = sum;
+            }
+        } else {
+            /* 5%: Fixed independent proposals for ergodicity (Haario mixture) */
+            pert[0] = d_proposal_std[0] * z_rnd[0];
+            pert[1] = d_proposal_std[1] * z_rnd[1];
+            pert[2] = d_proposal_std[2] * z_rnd[2];
+            pert[3] = d_proposal_std[3] * z_rnd[3];
+            pert[4] = d_proposal_std[4] * z_rnd[4];
+            pert[5] = d_proposal_std[5] * z_rnd[5];
+            pert[6] = d_proposal_std[6] * z_rnd[6];
+            pert[7] = d_proposal_std[7] * z_rnd[7];
+        }
+        
+        s_rho_prop = s_rho_curr + pert[0];
+        s_sigma_z_prop = s_sigma_z_curr + pert[1];
+        s_mu_base_prop = s_mu_base_curr + pert[2];
+        s_mu_scale_prop = s_mu_scale_curr + pert[3];
+        s_mu_rate_prop = s_mu_rate_curr + pert[4];
+        s_sigma_base_prop = s_sigma_base_curr + pert[5];
+        s_sigma_scale_prop = s_sigma_scale_curr + pert[6];
+        s_sigma_rate_prop = s_sigma_rate_curr + pert[7];
         
         s_lp_prop = log_prior_theta(s_rho_prop, s_sigma_z_prop,
                                      s_mu_base_prop, s_mu_scale_prop, s_mu_rate_prop,
@@ -1183,7 +1319,7 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     
     state->N_theta = N_theta;
     state->N_inner = N_inner;
-    state->ess_threshold_outer = 0.3f;
+    state->ess_threshold_outer = 0.5f;
     state->ess_threshold_inner = 0.5f;
     state->K_rejuv = 5;  /* 5 MH steps for adequate diversification */
     
@@ -1282,18 +1418,17 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     state->theta_curve.base = 0.02f;
     state->theta_curve.scale = 0.08f;
     state->theta_curve.rate = 1.5f;
-
+    
     /* Proposal std */
     state->proposal_std[0] = 0.01f;
     state->proposal_std[1] = 0.02f;
-    state->proposal_std[2] = 0.25f; // mu_base (was 0.1)
-    state->proposal_std[3] = 0.25f; // mu_scale (was 0.1)
-    state->proposal_std[4] = 0.35f; // mu_rate (was 0.15)
-
+    state->proposal_std[2] = 0.1f;
+    state->proposal_std[3] = 0.1f;
+    state->proposal_std[4] = 0.15f;
     state->proposal_std[5] = 0.02f;
     state->proposal_std[6] = 0.02f;
-    state->proposal_std[7] = 0.35f; // sigma_rate (was 0.15)
-
+    state->proposal_std[7] = 0.15f;
+    
     /* Fixed-lag checkpoint (disabled by default, L=0 means full history) */
     state->fixed_lag_L = 0;
     state->t_checkpoint = -1;
@@ -1302,6 +1437,11 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     CUDA_CHECK(cudaMalloc(&state->d_checkpoint_var_h, N_total * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&state->d_checkpoint_log_w, N_total * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&state->d_checkpoint_ll, N_theta * sizeof(float)));
+    
+    /* Adaptive proposal scratch arrays */
+    CUDA_CHECK(cudaMalloc(&state->d_temp_mean, 8 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&state->d_temp_cov, 64 * sizeof(float)));
+    state->use_adaptive_proposals = true;  /* Enabled by default */
     
     return state;
 }
@@ -1365,6 +1505,10 @@ void smc2_cuda_free(SMC2StateCUDA* state) {
     cudaFree(state->d_checkpoint_var_h);
     cudaFree(state->d_checkpoint_log_w);
     cudaFree(state->d_checkpoint_ll);
+    
+    /* Free adaptive proposal scratch */
+    cudaFree(state->d_temp_mean);
+    cudaFree(state->d_temp_cov);
     
     free(state);
 }
@@ -1447,11 +1591,108 @@ void smc2_cuda_set_cpmmh_rho(SMC2StateCUDA* state, float rho) {
     state->cpmmh_rho = rho;
 }
 
+/*═══════════════════════════════════════════════════════════════════════════════
+ * Adaptive Proposal Covariance Update
+ * 
+ * Computes empirical covariance from particle population, performs Cholesky
+ * decomposition, applies optimal scaling (2.38²/d), and uploads to constant memory.
+ * 
+ * Reference: Roberts & Rosenthal (2001) - optimal scaling factor
+ *           Haario et al. (2001) - adaptive Metropolis algorithm
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+#define ADAPTIVE_SCALE_FACTOR 0.70805f  /* 2.38² / 8 */
+
+void smc2_update_adaptive_covariance(SMC2StateCUDA* state) {
+    if (!state->use_adaptive_proposals) return;
+    
+    float h_cov[64];
+    float h_chol[64] = {0};
+    
+    /* 1. Run moments kernel (single block, power-of-2 threads for reduction) */
+    /* Round up N_theta to next power of 2 for correct parallel reduction */
+    int block_size = 1;
+    while (block_size < state->N_theta && block_size < 1024) {
+        block_size *= 2;
+    }
+    int shared_size = block_size * sizeof(float);
+    
+    kernel_compute_particle_moments<<<1, block_size, shared_size>>>(
+        state->d_particles,
+        state->d_temp_mean,
+        state->d_temp_cov,
+        state->N_theta
+    );
+    CUDA_CHECK(cudaDeviceSynchronize());
+    
+    /* 2. Copy covariance to host */
+    CUDA_CHECK(cudaMemcpy(h_cov, state->d_temp_cov, 64 * sizeof(float), cudaMemcpyDeviceToHost));
+    
+    /* 3. Regularize diagonal (ensures positive definiteness) */
+    float epsilon = 1e-6f;
+    for (int i = 0; i < 8; i++) {
+        h_cov[i * 8 + i] += epsilon;
+    }
+    
+    /* 4. Cholesky decomposition: L such that LL^T = Cov */
+    bool chol_success = true;
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j <= i; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < j; k++) {
+                sum += h_chol[i * 8 + k] * h_chol[j * 8 + k];
+            }
+            
+            if (i == j) {
+                float val = h_cov[i * 8 + i] - sum;
+                if (val <= 0.0f) {
+                    chol_success = false;
+                    val = 1e-8f;  /* Fallback */
+                }
+                h_chol[i * 8 + j] = sqrtf(val);
+            } else {
+                float diag = h_chol[j * 8 + j];
+                if (diag > 1e-10f) {
+                    h_chol[i * 8 + j] = (h_cov[i * 8 + j] - sum) / diag;
+                } else {
+                    h_chol[i * 8 + j] = 0.0f;
+                }
+            }
+        }
+    }
+    
+    if (!chol_success) {
+        /* Fallback: use diagonal of covariance as independent proposals */
+        memset(h_chol, 0, 64 * sizeof(float));
+        for (int i = 0; i < 8; i++) {
+            float var = h_cov[i * 8 + i];
+            h_chol[i * 8 + i] = sqrtf(fmaxf(var, 1e-8f));
+        }
+    }
+    
+    /* 5. Apply optimal scaling: multiply L by sqrt(2.38²/d) */
+    float scale = sqrtf(ADAPTIVE_SCALE_FACTOR);
+    for (int i = 0; i < 64; i++) {
+        h_chol[i] *= scale;
+    }
+    
+    /* 6. Copy to constant memory */
+    CUDA_CHECK(cudaMemcpyToSymbol(d_proposal_chol, h_chol, 64 * sizeof(float)));
+}
+
 void smc2_cuda_init_from_prior(SMC2StateCUDA* state) {
     CUDA_CHECK(cudaMemcpyToSymbol(d_prior, &state->prior, sizeof(SVPrior)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_bounds, &state->bounds, sizeof(SVBounds)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_theta_curve, &state->theta_curve, sizeof(SVCurve)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_proposal_std, state->proposal_std, 8 * sizeof(float)));
+    
+    /* Initialize Cholesky factor to diagonal (independent proposals initially) */
+    float h_chol[64] = {0};
+    float scale = sqrtf(ADAPTIVE_SCALE_FACTOR);
+    for (int i = 0; i < 8; i++) {
+        h_chol[i * 8 + i] = state->proposal_std[i] * scale;
+    }
+    CUDA_CHECK(cudaMemcpyToSymbol(d_proposal_chol, h_chol, 64 * sizeof(float)));
     
     int N_total = state->N_theta * state->N_inner;
     unsigned long long rng_seed = (state->user_seed != 0) ? state->user_seed : 12345ULL;
@@ -1620,6 +1861,15 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
                 cp_ll = state->d_checkpoint_ll;
             }
         }
+        
+        /*─────────────────────────────────────────────────────────────────────────
+         * ADAPTIVE PROPOSAL COVARIANCE UPDATE
+         * 
+         * Compute empirical covariance from resampled particles and update
+         * the Cholesky factor for correlated MH proposals.
+         * Reference: Haario et al. (2001), Roberts & Rosenthal (2001)
+         *─────────────────────────────────────────────────────────────────────────*/
+        smc2_update_adaptive_covariance(state);
         
         #define DISPATCH_CPMMH(N) \
             kernel_cpmmh_rejuvenate_fused_impl<N><<<state->N_theta, N, cpmmh_shared_mem_size<N>()>>>( \

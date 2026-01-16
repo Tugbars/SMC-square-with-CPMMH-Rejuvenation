@@ -315,6 +315,11 @@ struct SMC2StateCUDA {
     int n_rejuv_accepts;
     int n_rejuv_total;
     
+    /* ═══ Adaptive Proposals (Haario et al. 2001) ═══ */
+    float* d_temp_mean;         /**< Scratch: particle mean [8] */
+    float* d_temp_cov;          /**< Scratch: particle covariance [64] */
+    bool use_adaptive_proposals; /**< Enable adaptive covariance (default: true) */
+    
     /* ═══ RNG ═══ */
     uint64_t user_seed;         /**< User-provided seed (0 = time-based) */
     uint64_t host_rng_state;    /**< Host-side xorshift64* state */
