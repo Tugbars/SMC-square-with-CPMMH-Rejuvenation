@@ -187,7 +187,7 @@ void test_parameter_learning(void) {
     /* Generate data using SVDataGenerator */
     SVDataGenerator gen;
     gen.seed(42);
-    gen.T = 500;
+    gen.T = 1000;
     /* Use default params: rho=0.95, sigma_z=0.15, etc. */
     gen.generate();
     
@@ -214,7 +214,7 @@ void test_parameter_learning(void) {
     printf("  True h: mean=%.3f, std=%.3f\n", h_mean, h_std);
     
     /* Initialize SMC² */
-    SMC2StateCUDA* state = smc2_cuda_alloc(256, 256);
+    SMC2StateCUDA* state = smc2_cuda_alloc(512, 256);
     
     /* Set reproducible seed */
     smc2_cuda_set_seed(state, 12345);

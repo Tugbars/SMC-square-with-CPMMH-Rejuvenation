@@ -453,6 +453,30 @@ __global__ void kernel_rbpf_step(
 }
 
 /*═══════════════════════════════════════════════════════════════════════════════
+ * KERNEL: Reset Outer Weights (SMC² with Refresh / IBIS-style)
+ * 
+ * After resample + MCMC rejuvenation, particles are approximate posterior samples.
+ * Their weights should be uniform - the evidence is encoded in which particles
+ * survived resampling and where MCMC moved them, not in cumulative likelihoods.
+ * 
+ * This prevents O(T) weight explosion and is standard in IBIS / SMC² with refresh.
+ * Reference: Chopin & Papaspiliopoulos (2020), Section 17.3.3
+ *═══════════════════════════════════════════════════════════════════════════════*/
+
+__global__ void kernel_reset_outer_weights(
+    ThetaParticlesSoA particles,
+    int N_theta
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N_theta) return;
+    
+    /* Reset to uniform weights */
+    particles.log_weight[idx] = 0.0f;                    /* log(1) = 0 */
+    particles.weight[idx] = 1.0f / (float)N_theta;       /* Normalized uniform */
+    particles.log_likelihood[idx] = 0.0f;                /* Fresh accumulator */
+}
+
+/*═══════════════════════════════════════════════════════════════════════════════
  * KERNEL: Compute Outer ESS
  *═══════════════════════════════════════════════════════════════════════════════*/
 
@@ -1159,9 +1183,9 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     
     state->N_theta = N_theta;
     state->N_inner = N_inner;
-    state->ess_threshold_outer = 0.5f;
+    state->ess_threshold_outer = 0.3f;
     state->ess_threshold_inner = 0.5f;
-    state->K_rejuv = 1;
+    state->K_rejuv = 5;  /* 5 MH steps for adequate diversification */
     
     int N_total = N_theta * N_inner;
     
@@ -1258,17 +1282,18 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     state->theta_curve.base = 0.02f;
     state->theta_curve.scale = 0.08f;
     state->theta_curve.rate = 1.5f;
-    
+
     /* Proposal std */
     state->proposal_std[0] = 0.01f;
     state->proposal_std[1] = 0.02f;
-    state->proposal_std[2] = 0.1f;
-    state->proposal_std[3] = 0.1f;
-    state->proposal_std[4] = 0.15f;
+    state->proposal_std[2] = 0.25f; // mu_base (was 0.1)
+    state->proposal_std[3] = 0.25f; // mu_scale (was 0.1)
+    state->proposal_std[4] = 0.35f; // mu_rate (was 0.15)
+
     state->proposal_std[5] = 0.02f;
     state->proposal_std[6] = 0.02f;
-    state->proposal_std[7] = 0.15f;
-    
+    state->proposal_std[7] = 0.35f; // sigma_rate (was 0.15)
+
     /* Fixed-lag checkpoint (disabled by default, L=0 means full history) */
     state->fixed_lag_L = 0;
     state->t_checkpoint = -1;
@@ -1645,6 +1670,22 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
             state->n_rejuv_total += state->N_theta;
         }
         #undef DISPATCH_CPMMH
+        
+        /*─────────────────────────────────────────────────────────────────────────
+         * WEIGHT RESET (SMC² with Refresh)
+         * 
+         * After resample + MCMC moves, particles are approximate posterior samples.
+         * Reset weights to uniform to prevent O(T) weight explosion.
+         * 
+         * The evidence from y_{1:t} is encoded in:
+         *   - Which particles survived resampling
+         *   - Where MCMC moved them
+         * NOT in cumulative log-likelihoods (which would double-count).
+         *─────────────────────────────────────────────────────────────────────────*/
+        kernel_reset_outer_weights<<<(state->N_theta + 255) / 256, 256>>>(
+            state->d_particles, state->N_theta
+        );
+        CUDA_CHECK(cudaDeviceSynchronize());
         
         kernel_compute_outer_ess<<<1, state->N_theta, 32 * sizeof(float)>>>(
             state->d_particles, state->d_ess, state->N_theta
