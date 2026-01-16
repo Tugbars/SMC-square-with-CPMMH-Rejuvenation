@@ -206,18 +206,19 @@ constexpr size_t cpmmh_sort_smem_size() {
 /**
  * @brief Total shared memory for RBPF forward step kernel
  * 
- * Layout:
- *   [0..31]          : Warp reduction scratch
- *   [32..32+N-1]     : s_weights / s_z (reused)
- *   [32+N..32+2N-1]  : s_cumsum / s_mu (reused)  
- *   [32+2N..32+3N-1] : s_var
- *   [32+3N..32+4N-1] : s_idx
- *   [32+4N..]        : CUB temp (if using CUB)
+ * Layout (after race condition fix - s_cumsum is no longer aliased):
+ *   [0..31]          : Warp reduction scratch (32 floats)
+ *   [32..32+N-1]     : s_z (N floats)
+ *   [32+N..32+2N-1]  : s_mu (N floats)
+ *   [32+2N..32+3N-1] : s_var (N floats)
+ *   [32+3N..32+4N-1] : s_cumsum (N floats) - DEDICATED, not aliased
+ *   [32+4N..32+5N-1] : s_idx (N ints = N floats worth)
+ *   [32+5N..]        : Sort temp (if using CUB)
  */
 template<int BLOCK_SIZE>
 __host__ __device__ __forceinline__
 constexpr size_t rbpf_shared_mem_size() {
-    size_t base = (32 + 4 * BLOCK_SIZE) * sizeof(float);
+    size_t base = (32 + 5 * BLOCK_SIZE) * sizeof(float);  /* Changed from 4 to 5 */
     size_t sort_temp = cpmmh_sort_smem_size<BLOCK_SIZE>();
     return base + sort_temp;
 }
@@ -232,7 +233,7 @@ constexpr size_t rbpf_shared_mem_size() {
  *   [32+2N..32+3N-1] : s_var
  *   [32+3N..32+4N-1] : s_cdf
  *   [32+4N..32+5N-1] : s_idx
- *   [32+5N..]        : CUB temp (if using CUB)
+ *   [32+5N..]        : Sort temp (if using CUB)
  */
 template<int BLOCK_SIZE>
 __host__ __device__ __forceinline__

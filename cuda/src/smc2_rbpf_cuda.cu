@@ -257,18 +257,15 @@ void kernel_rbpf_step_impl(
     
     if (theta_idx >= N_theta || inner_idx >= N_INNER) return;
     
-    /* Shared memory layout for CUB sort */
+    /* Shared memory layout - NO ALIASING to avoid race conditions */
     extern __shared__ char shared_raw[];
     float* s_reduction = reinterpret_cast<float*>(shared_raw);
-    float* s_z_sort = &s_reduction[32];
-    float* s_mu_sort = &s_z_sort[N_INNER];
-    float* s_var_sort = &s_mu_sort[N_INNER];
-    int* s_idx = reinterpret_cast<int*>(&s_var_sort[N_INNER]);
+    float* s_z = &s_reduction[32];           /* Particle z state for resampling */
+    float* s_mu = &s_z[N_INNER];             /* Particle mu state for resampling */
+    float* s_var = &s_mu[N_INNER];           /* Particle var state for resampling */
+    float* s_cumsum = &s_var[N_INNER];       /* CDF for resampling (dedicated, not aliased) */
+    int* s_idx = reinterpret_cast<int*>(&s_cumsum[N_INNER]);
     void* s_cub_temp = reinterpret_cast<void*>(&s_idx[N_INNER]);
-    
-    /* Alias for weights/cumsum (reuse s_z_sort, s_mu_sort before sort) */
-    float* s_weights = s_z_sort;
-    float* s_cumsum = s_mu_sort;
     
     /* Load θ parameters to shared memory */
     __shared__ float s_rho, s_sigma_z;
@@ -315,8 +312,17 @@ void kernel_rbpf_step_impl(
     
     /*─────────────────────────────────────────────────────────────────────────
      * RESAMPLE (always, for CPMMH determinism)
+     * 
+     * CRITICAL: Store particle state to shared memory BEFORE resampling.
+     * This avoids race conditions when reading ancestor state.
      *─────────────────────────────────────────────────────────────────────────*/
     {
+        /* Store ALL particle state to shared memory FIRST */
+        s_z[inner_idx] = z_tilde;
+        s_mu[inner_idx] = mu_h;
+        s_var[inner_idx] = var_h;
+        __syncthreads();
+        
         float log_max = block_reduce_max(log_w, s_reduction);
         if (inner_idx == 0) s_log_max = log_max;
         __syncthreads();
@@ -326,11 +332,8 @@ void kernel_rbpf_step_impl(
         if (inner_idx == 0) s_sum_w = sum_w;
         __syncthreads();
         
-        s_weights[inner_idx] = w_unnorm / s_sum_w;
-        __syncthreads();
-        
-        /* Build CDF via parallel scan */
-        s_cumsum[inner_idx] = s_weights[inner_idx];
+        /* Build CDF directly (no need for separate weights array) */
+        s_cumsum[inner_idx] = w_unnorm / s_sum_w;
         __syncthreads();
         block_inclusive_scan(s_cumsum, N_INNER);
         if (inner_idx == N_INNER - 1) s_cumsum[N_INNER - 1] = 1.0f;
@@ -346,10 +349,10 @@ void kernel_rbpf_step_impl(
         }
         int ancestor = lo;
         
-        /* Load ancestor state */
-        z_tilde = particles.inner_z[theta_idx * N_INNER + ancestor];
-        mu_h = particles.inner_mu_h[theta_idx * N_INNER + ancestor];
-        var_h = particles.inner_var_h[theta_idx * N_INNER + ancestor];
+        /* Load ancestor state from SHARED memory (race-free!) */
+        z_tilde = s_z[ancestor];
+        mu_h = s_mu[ancestor];
+        var_h = s_var[ancestor];
         log_w = -__logf((float)N_INNER);
         
         __syncthreads();
@@ -358,16 +361,16 @@ void kernel_rbpf_step_impl(
          * CPMMH Sort by μ_h (deterministic)
          *─────────────────────────────────────────────────────────────────────*/
         if ((t_current % SORT_EVERY_K) == 0) {
-            s_z_sort[inner_idx] = z_tilde;
-            s_mu_sort[inner_idx] = mu_h;
-            s_var_sort[inner_idx] = var_h;
+            s_z[inner_idx] = z_tilde;
+            s_mu[inner_idx] = mu_h;
+            s_var[inner_idx] = var_h;
             __syncthreads();
             
-            cpmmh_sort<N_INNER>(s_z_sort, s_mu_sort, s_var_sort, s_idx, s_cub_temp);
+            cpmmh_sort<N_INNER>(s_z, s_mu, s_var, s_idx, s_cub_temp);
             
-            z_tilde = s_z_sort[inner_idx];
-            mu_h = s_mu_sort[inner_idx];
-            var_h = s_var_sort[inner_idx];
+            z_tilde = s_z[inner_idx];
+            mu_h = s_mu[inner_idx];
+            var_h = s_var[inner_idx];
             __syncthreads();
         }
     }
