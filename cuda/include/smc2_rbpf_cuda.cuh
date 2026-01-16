@@ -756,6 +756,25 @@ void smc2_cuda_set_noise_capacity(SMC2StateCUDA* state, int capacity);
 void smc2_cuda_set_fixed_lag(SMC2StateCUDA* state, int L);
 
 /**
+ * @brief Set CPMMH proposal standard deviations
+ * 
+ * Use to adjust how aggressively rejuvenation explores.
+ * Setting all to 0 creates identity proposal (θ* = θ) for testing.
+ * 
+ * @param state   SMC² state
+ * @param std     Array of 8 proposal std values, or NULL for defaults
+ */
+void smc2_cuda_set_proposal_std(SMC2StateCUDA* state, const float* std);
+
+/**
+ * @brief Set CPMMH noise correlation
+ * 
+ * @param state  SMC² state  
+ * @param rho    Correlation coefficient (0 = independent, 1 = identical noise)
+ */
+void smc2_cuda_set_cpmmh_rho(SMC2StateCUDA* state, float rho);
+
+/**
  * @brief Initialize particles from prior
  * 
  * Samples θ ~ prior, initializes inner filters at stationary distribution.

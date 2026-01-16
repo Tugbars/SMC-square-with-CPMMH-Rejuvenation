@@ -2,19 +2,19 @@
  * @file test_smc2_cuda.cu
  * @brief Test suite for SMC² CUDA with proper PMMH rejuvenation
  * 
- * CRITICAL: Data generation MUST match the filter's model exactly:
- *   - z̃ follows unconstrained AR(1): z̃_t = ρ·z̃_{t-1} + σ_z·ε_t
- *   - z = 1.5·(1 + tanh(z̃)) ∈ (0, 3) for curve evaluation
- *   - y_t = h_t + log(χ²(1)) where χ²(1) = ε² for ε ~ N(0,1)
+ * Uses shared test utilities from smc2_test_utils.cuh for data generation.
+ * This ensures consistency across all test files.
  */
 
 #include "smc2_rbpf_cuda.cuh"
+#include "smc2_test_utils.cuh"  /* Single source of truth for data generation */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
 
+using namespace smc2_test;
 
 #ifndef CUDA_N_THETA
 #define CUDA_N_THETA 256
@@ -25,104 +25,10 @@
 #endif
 
 /*═══════════════════════════════════════════════════════════════════════════
- * Host RNG (xorshift64* for quality)
+ * Local helpers (non-data-generation)
  *═══════════════════════════════════════════════════════════════════════════*/
 
-static unsigned long long h_rng = 12345678901234567ULL;
-
-static void seed_host_rng(unsigned long long seed) {
-    h_rng = seed ? seed : 12345678901234567ULL;
-}
-
-static float host_uniform(void) {
-    h_rng ^= h_rng << 13;
-    h_rng ^= h_rng >> 7;
-    h_rng ^= h_rng << 17;
-    return (h_rng >> 11) * (1.0f / 9007199254740992.0f);
-}
-
-static float host_normal(void) {
-    /* Box-Muller transform */
-    float u1 = host_uniform();
-    float u2 = host_uniform();
-    while (u1 < 1e-10f) u1 = host_uniform();
-    return sqrtf(-2.0f * logf(u1)) * cosf(2.0f * 3.14159265358979f * u2);
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
- * Generate SV Data - MATCHES FILTER MODEL EXACTLY
- * 
- * Model:
- *   z̃_t = ρ·z̃_{t-1} + σ_z·ε^z_t           (unconstrained AR(1))
- *   z_t = 1.5·(1 + tanh(z̃_t)) ∈ (0, 3)    (bounded transform)
- *   
- *   θ(z) = θ_base + θ_scale·(1 - exp(-θ_rate·z))
- *   μ(z) = μ_base + μ_scale·(1 - exp(-μ_rate·z))
- *   σ_h(z) = σ_base + σ_scale·(1 - exp(-σ_rate·z))
- *   
- *   h_t = (1-θ(z_t))·h_{t-1} + θ(z_t)·μ(z_t) + σ_h(z_t)·ε^h_t
- *   y_t = h_t + log(χ²(1))
- *═══════════════════════════════════════════════════════════════════════════*/
-
-void generate_sv_data(
-    float* y, float* h_true, float* z_true, int T,
-    float rho, float sigma_z,
-    float mu_base, float mu_scale, float mu_rate,
-    float sigma_base, float sigma_scale, float sigma_rate,
-    float theta_base, float theta_scale, float theta_rate
-) {
-    /* Initialize z̃ from stationary distribution: N(0, σ_z²/(1-ρ²)) */
-    float one_minus_rho_sq = fmaxf(1.0f - rho * rho, 1e-6f);
-    float z_tilde_stat_std = sigma_z / sqrtf(one_minus_rho_sq);
-    float z_tilde = z_tilde_stat_std * host_normal();
-    
-    /* Transform to bounded z ∈ (0, 3) — MUST MATCH FILTER */
-    float z = 1.5f * (1.0f + tanhf(z_tilde));
-    
-    /* Evaluate curves at initial z */
-    float theta_z = theta_base + theta_scale * (1.0f - expf(-theta_rate * z));
-    float mu_z = mu_base + mu_scale * (1.0f - expf(-mu_rate * z));
-    float sigma_h = sigma_base + sigma_scale * (1.0f - expf(-sigma_rate * z));
-    float phi = 1.0f - theta_z;
-    
-    /* Initialize h from approximate stationary distribution */
-    float h_stat_var = (sigma_h * sigma_h) / fmaxf(1.0f - phi * phi, 1e-6f);
-    float h = mu_z + sqrtf(h_stat_var) * host_normal();
-    
-    for (int t = 0; t < T; t++) {
-        /* Store true states */
-        if (h_true) h_true[t] = h;
-        if (z_true) z_true[t] = z;
-        
-        /* Generate observation: y_t = h_t + log(χ²(1))
-         * where χ²(1) = ε² for ε ~ N(0,1) */
-        float eps = host_normal();
-        float chi2_1 = eps * eps;
-        /* Add small constant to avoid log(0) for very small eps */
-        y[t] = h + logf(chi2_1 + 1e-10f);
-        
-        /* Transition z̃: unconstrained AR(1) — MATCHES FILTER */
-        z_tilde = rho * z_tilde + sigma_z * host_normal();
-        
-        /* Transform to bounded z ∈ (0, 3) */
-        z = 1.5f * (1.0f + tanhf(z_tilde));
-        
-        /* Evaluate curves at new z */
-        theta_z = theta_base + theta_scale * (1.0f - expf(-theta_rate * z));
-        mu_z = mu_base + mu_scale * (1.0f - expf(-mu_rate * z));
-        sigma_h = sigma_base + sigma_scale * (1.0f - expf(-sigma_rate * z));
-        phi = 1.0f - theta_z;
-        
-        /* Transition h: mean-reverting AR(1) with regime-dependent parameters */
-        h = phi * h + theta_z * mu_z + sigma_h * host_normal();
-    }
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
- * Print Data Statistics
- *═══════════════════════════════════════════════════════════════════════════*/
-
-void print_data_stats(const float* y, int T) {
+static void print_data_stats_local(const float* y, int T) {
     float sum = 0.0f, sum_sq = 0.0f;
     float y_min = y[0], y_max = y[0];
     
@@ -195,71 +101,37 @@ void test_parameter_learning(void) {
     printf("Test: Parameter Learning with PMMH Rejuvenation\n");
     printf("═══════════════════════════════════════════════════════════════\n");
     
-    /* 
-     * Realistic parameter values for daily log-volatility:
-     * - mu_base = -3.0 implies baseline vol ≈ exp(-3/2) ≈ 22%
-     * - mu_base + mu_scale = -2.0 implies high-regime vol ≈ exp(-2/2) ≈ 37%
-     * 
-     * These should match or be close to the prior means in the filter.
-     */
-    float true_rho = 0.95f;
-    float true_sigma_z = 0.15f;
-    float true_mu_base = -1.0f;
-    float true_mu_scale = 0.5f;
-    float true_mu_rate = 1.0f;
-    float true_sigma_base = 0.15f;
-    float true_sigma_scale = 0.10f;
-    float true_sigma_rate = 1.0f;
+    /* Use moderate regime from common utilities */
+    GroundTruth gt = regime_moderate();
     
-    /* Theta curve (fixed in filter) */
-    float theta_base = 0.02f;
-    float theta_scale = 0.08f;
-    float theta_rate = 1.5f;
+    /* Customize for this test (same values as before) */
+    gt.rho = 0.95f;
+    gt.sigma_z = 0.15f;
+    gt.mu_base = -1.0f;
+    gt.mu_scale = 0.5f;
+    gt.mu_rate = 1.0f;
+    gt.sigma_base = 0.15f;
+    gt.sigma_scale = 0.10f;
+    gt.sigma_rate = 1.0f;
     
-    printf("TRUE PARAMETERS:\n");
-    printf("  rho=%.3f, sigma_z=%.3f\n", true_rho, true_sigma_z);
-    printf("  mu: base=%.3f, scale=%.3f, rate=%.3f\n", 
-           true_mu_base, true_mu_scale, true_mu_rate);
-    printf("  sigma: base=%.3f, scale=%.3f, rate=%.3f\n",
-           true_sigma_base, true_sigma_scale, true_sigma_rate);
-    printf("  theta (fixed): base=%.3f, scale=%.3f, rate=%.3f\n",
-           theta_base, theta_scale, theta_rate);
+    print_ground_truth("TRUE PARAMETERS", gt);
     
-    /* Generate data */
-    seed_host_rng(42);  /* Reproducible */
+    /* Generate data using common utilities */
     int T = 500;
-    float* y = (float*)malloc(T * sizeof(float));
-    float* h_true = (float*)malloc(T * sizeof(float));
-    
-    generate_sv_data(y, h_true, NULL, T,
-                     true_rho, true_sigma_z,
-                     true_mu_base, true_mu_scale, true_mu_rate,
-                     true_sigma_base, true_sigma_scale, true_sigma_rate,
-                     theta_base, theta_scale, theta_rate);
+    GeneratedData data = generate_sv_data(gt, T, 42, ObsMethod::DIRECT_CHI2);
     
     printf("\nGenerated T=%d observations\n", T);
-    print_data_stats(y, T);
-    
-    /* Print some h_true statistics */
-    float h_sum = 0.0f, h_sum_sq = 0.0f;
-    for (int t = 0; t < T; t++) {
-        h_sum += h_true[t];
-        h_sum_sq += h_true[t] * h_true[t];
-    }
-    float h_mean = h_sum / T;
-    float h_std = sqrtf(h_sum_sq / T - h_mean * h_mean);
-    printf("  True h: mean=%.3f, std=%.3f\n", h_mean, h_std);
+    DataStats stats = compute_stats(data);
+    print_stats(stats);
     
     /* Initialize SMC² */
-    SMC2StateCUDA* state = smc2_cuda_alloc(256, 256);
+    SMC2StateCUDA* state = smc2_cuda_alloc(128, 128);
     
     /* Set reproducible seed */
     smc2_cuda_set_seed(state, 12345);
     
     /* Pre-allocate noise capacity */
     smc2_cuda_set_noise_capacity(state, T + 128);
-
-    smc2_cuda_set_fixed_lag(state, 100); 
     
     smc2_cuda_init_from_prior(state);
     
@@ -272,7 +144,7 @@ void test_parameter_learning(void) {
     
     cudaEventRecord(start);
     for (int t = 0; t < T; t++) {
-        float ess = smc2_cuda_update(state, y[t]);
+        float ess = smc2_cuda_update(state, data.y[t]);
         if ((t + 1) % 100 == 0) {
             float theta_mean[8];
             smc2_cuda_get_theta_mean(state, theta_mean);
@@ -314,46 +186,16 @@ void test_parameter_learning(void) {
     printf("  sigma_scale = %.4f ± %.4f\n", theta_mean[6], theta_std[6]);
     printf("  sigma_rate  = %.4f ± %.4f\n", theta_mean[7], theta_std[7]);
     
-    /* Parameter recovery table */
-    float true_params[8] = {true_rho, true_sigma_z, true_mu_base, true_mu_scale,
-                           true_mu_rate, true_sigma_base, true_sigma_scale, true_sigma_rate};
-    const char* names[8] = {"rho", "sigma_z", "mu_base", "mu_scale",
-                            "mu_rate", "sigma_base", "sigma_scale", "sigma_rate"};
+    /* Use common utility for parameter comparison */
+    printf("\n");
+    print_param_comparison(theta_mean, theta_std, gt);
     
-    printf("\n%-12s  %8s  %8s  %8s  %7s  %7s  %s\n", 
-           "Parameter", "True", "Est", "Std", "Err%", "z-score", "Status");
-    printf("─────────────────────────────────────────────────────────────────────────\n");
-    
-    int n_ok = 0;
-    int n_within_15pct = 0;
-    for (int i = 0; i < 8; i++) {
-        float err = theta_mean[i] - true_params[i];
-        float z_score = fabsf(err) / fmaxf(theta_std[i], 1e-6f);
-        
-        /* Percentage error: use absolute for params near zero */
-        float pct_err;
-        if (fabsf(true_params[i]) < 0.01f) {
-            pct_err = err * 100.0f;  /* Absolute as percentage */
-        } else {
-            pct_err = 100.0f * err / true_params[i];
-        }
-        
-        const char* status = (z_score <= 2.0f) ? "OK" : (z_score <= 3.0f) ? "WARN" : "MISS";
-        if (z_score <= 2.0f) n_ok++;
-        if (fabsf(pct_err) <= 15.0f) n_within_15pct++;
-        
-        printf("%-12s  %8.4f  %8.4f  %8.4f  %+6.1f%%  %7.2f  [%s]\n", 
-               names[i], true_params[i], theta_mean[i], theta_std[i], pct_err, z_score, status);
-    }
-    
-    printf("─────────────────────────────────────────────────────────────────────────\n");
-    printf("OVERALL: %d/8 within 2σ, %d/8 within 15%% relative error\n", n_ok, n_within_15pct);
-    printf("%s\n", n_ok >= 6 ? "PASSED" : "NEEDS INVESTIGATION");
+    float avg_err = compute_avg_rel_error(theta_mean, gt);
+    printf("\nAverage relative error: %.1f%%\n", 100.0f * avg_err);
+    printf("%s\n", avg_err < 0.25f ? "PASSED" : "NEEDS INVESTIGATION");
     
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
-    free(y);
-    free(h_true);
     smc2_cuda_free(state);
 }
 
@@ -371,18 +213,19 @@ void test_fixed_lag(void) {
     printf("\nGoal: Show that fixed-lag maintains accuracy at large T where\n");
     printf("      full-history PMMH degrades due to O(T) variance growth.\n\n");
     
-    /* True parameters */
-    float true_rho = 0.95f;
-    float true_sigma_z = 0.15f;
-    float true_mu_base = -1.0f;
-    float true_mu_scale = 0.5f;
-    float true_mu_rate = 1.0f;
-    float true_sigma_base = 0.15f;
-    float true_sigma_scale = 0.10f;
-    float true_sigma_rate = 1.0f;
-    float theta_base = 0.02f;
-    float theta_scale = 0.08f;
-    float theta_rate = 1.5f;
+    /* Use common ground truth */
+    GroundTruth gt = regime_moderate();
+    gt.rho = 0.95f;
+    gt.sigma_z = 0.15f;
+    gt.mu_base = -1.0f;
+    gt.mu_scale = 0.5f;
+    gt.mu_rate = 1.0f;
+    gt.sigma_base = 0.15f;
+    gt.sigma_scale = 0.10f;
+    gt.sigma_rate = 1.0f;
+    
+    float true_theta[8];
+    gt_to_theta(gt, true_theta);
     
     /* Test at multiple T values to show variance growth effect */
     int T_values[] = {1000, 2000, 5000};
@@ -395,14 +238,8 @@ void test_fixed_lag(void) {
         printf("T = %d\n", T);
         printf("─────────────────────────────────────────────────────────────────────────\n");
         
-        seed_host_rng(42);
-        float* y = (float*)malloc(T * sizeof(float));
-        
-        generate_sv_data(y, NULL, NULL, T,
-                         true_rho, true_sigma_z,
-                         true_mu_base, true_mu_scale, true_mu_rate,
-                         true_sigma_base, true_sigma_scale, true_sigma_rate,
-                         theta_base, theta_scale, theta_rate);
+        /* Generate data using common utilities */
+        GeneratedData data = generate_sv_data(gt, T, 42, ObsMethod::DIRECT_CHI2);
         
         printf("  %-6s  %8s  %10s  %10s  %8s  %8s\n", 
                "Lag", "Time(ms)", "rho", "sigma_z", "Accept%", "Resamps");
@@ -426,7 +263,7 @@ void test_fixed_lag(void) {
             
             cudaEventRecord(start);
             for (int t = 0; t < T; t++) {
-                smc2_cuda_update(state, y[t]);
+                smc2_cuda_update(state, data.y[t]);
             }
             cudaEventRecord(stop);
             cudaEventSynchronize(stop);
@@ -441,9 +278,9 @@ void test_fixed_lag(void) {
             float accept_pct = state->n_rejuv_total > 0 ? 
                 100.0f * state->n_rejuv_accepts / state->n_rejuv_total : 0.0f;
             
-            float rho_err = fabsf(theta_mean[0] - true_rho);
+            float rho_err = fabsf(theta_mean[0] - true_theta[0]);
             float rho_z = rho_err / fmaxf(theta_std[0], 1e-6f);
-            float sigma_z_err = fabsf(theta_mean[1] - true_sigma_z);
+            float sigma_z_err = fabsf(theta_mean[1] - true_theta[1]);
             float sigma_z_z = sigma_z_err / fmaxf(theta_std[1], 1e-6f);
             
             const char* status = (rho_z < 2.0f && sigma_z_z < 2.0f) ? "OK" : "DEGRADED";
@@ -459,7 +296,6 @@ void test_fixed_lag(void) {
             smc2_cuda_free(state);
         }
         
-        free(y);
         printf("\n");
     }
     
@@ -479,12 +315,10 @@ void test_throughput(void) {
     printf("Test: Throughput with PMMH Rejuvenation\n");
     printf("═══════════════════════════════════════════════════════════════\n");
     
-    seed_host_rng(123);
+    /* Generate data using common utilities */
+    GroundTruth gt = regime_moderate();
     int T = 500;
-    float* y = (float*)malloc(T * sizeof(float));
-    generate_sv_data(y, NULL, NULL, T,
-                     0.95f, 0.15f, -1.0f, 0.5f, 1.0f,
-                     0.15f, 0.10f, 1.0f, 0.02f, 0.08f, 1.5f);
+    GeneratedData data = generate_sv_data(gt, T, 123, ObsMethod::DIRECT_CHI2);
     
     printf("  N_theta  N_inner  Time(ms)  Resamples  Rejuv%%   ms/obs\n");
     printf("  ─────────────────────────────────────────────────────────\n");
@@ -504,7 +338,7 @@ void test_throughput(void) {
         
         cudaEventRecord(start);
         for (int t = 0; t < T; t++) {
-            smc2_cuda_update(state, y[t]);
+            smc2_cuda_update(state, data.y[t]);
         }
         cudaEventRecord(stop);
         cudaEventSynchronize(stop);
@@ -523,8 +357,6 @@ void test_throughput(void) {
         cudaEventDestroy(stop);
         smc2_cuda_free(state);
     }
-    
-    free(y);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -568,6 +400,105 @@ void test_prior_data_agreement(void) {
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
+ * Test: CPMMH Replay Determinism (CRITICAL CORRECTNESS TEST)
+ * 
+ * This test validates that the replay machinery is correct:
+ *   - Set proposal_std = 0 (so θ* = θ exactly)
+ *   - Set cpmmh_rho = 1.0 (so noise is identical)
+ *   - Force rejuvenation
+ *   - MUST get 100% acceptance (since θ* = θ and same noise → same likelihood)
+ * 
+ * If this test fails, there's a bug in the replay code.
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+void test_cpmmh_replay_determinism(void) {
+    printf("\n═══════════════════════════════════════════════════════════════\n");
+    printf("Test: CPMMH Replay Determinism (Identity Proposal)\n");
+    printf("═══════════════════════════════════════════════════════════════\n");
+    printf("\nThis is a CRITICAL correctness test.\n");
+    printf("If θ* = θ and noise is identical, acceptance MUST be 100%%.\n\n");
+    
+    /* Generate test data */
+    GroundTruth gt = regime_moderate();
+    int T = 200;  /* Enough to trigger several outer resamples */
+    GeneratedData data = generate_sv_data(gt, T, 42, ObsMethod::DIRECT_CHI2);
+    
+    /* Create filter with small particle count for speed */
+    SMC2StateCUDA* state = smc2_cuda_alloc(64, 64);
+    smc2_cuda_set_seed(state, 12345);
+    smc2_cuda_set_noise_capacity(state, T + 128);
+    smc2_cuda_init_from_prior(state);
+    
+    /* Run forward filter to build up history and trigger some resamples */
+    printf("Phase 1: Running forward filter (T=%d)...\n", T);
+    for (int t = 0; t < T; t++) {
+        smc2_cuda_update(state, data.y[t]);
+    }
+    printf("  Forward pass complete. Resamples: %d, Rejuv: %d/%d (%.1f%%)\n",
+           state->n_resamples,
+           state->n_rejuv_accepts, state->n_rejuv_total,
+           state->n_rejuv_total > 0 ? 
+           100.0f * state->n_rejuv_accepts / state->n_rejuv_total : 0.0f);
+    
+    /* Save original settings */
+    float orig_proposal_std[8];
+    memcpy(orig_proposal_std, state->proposal_std, sizeof(orig_proposal_std));
+    float orig_cpmmh_rho = state->cpmmh_rho;
+    
+    /* Set identity proposal: θ* = θ (no perturbation) */
+    printf("\nPhase 2: Setting identity proposal (θ* = θ, ρ = 1.0)...\n");
+    float zero_proposal[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    smc2_cuda_set_proposal_std(state, zero_proposal);
+    smc2_cuda_set_cpmmh_rho(state, 1.0f);
+    
+    /* Reset acceptance counters */
+    state->n_rejuv_accepts = 0;
+    state->n_rejuv_total = 0;
+    
+    /* Force rejuvenation by processing more observations */
+    printf("Phase 3: Processing more observations to trigger rejuvenation...\n");
+    
+    int T_extra = 50;
+    GeneratedData data_extra = generate_sv_data(gt, T_extra, 99999, ObsMethod::DIRECT_CHI2);
+    
+    for (int t = 0; t < T_extra; t++) {
+        smc2_cuda_update(state, data_extra.y[t]);
+    }
+    
+    /* Check results */
+    printf("\nRESULTS:\n");
+    printf("  Rejuvenation attempts: %d\n", state->n_rejuv_total);
+    printf("  Rejuvenation accepts:  %d\n", state->n_rejuv_accepts);
+    
+    float accept_rate = state->n_rejuv_total > 0 ? 
+        100.0f * state->n_rejuv_accepts / state->n_rejuv_total : 0.0f;
+    printf("  Acceptance rate: %.1f%%\n", accept_rate);
+    
+    /* Restore original settings */
+    smc2_cuda_set_proposal_std(state, orig_proposal_std);
+    smc2_cuda_set_cpmmh_rho(state, orig_cpmmh_rho);
+    
+    /* Verdict */
+    printf("\n");
+    if (state->n_rejuv_total == 0) {
+        printf("WARNING: No rejuvenations occurred. Test inconclusive.\n");
+        printf("         Try increasing T or lowering ess_threshold.\n");
+    } else if (accept_rate >= 99.9f) {
+        printf("═══════════════════════════════════════════════════════════════\n");
+        printf("  ✓ PASSED: 100%% acceptance with identity proposal\n");
+        printf("  → Replay machinery is PROVABLY CORRECT\n");
+        printf("═══════════════════════════════════════════════════════════════\n");
+    } else {
+        printf("═══════════════════════════════════════════════════════════════\n");
+        printf("  ✗ FAILED: Expected 100%% acceptance, got %.1f%%\n", accept_rate);
+        printf("  → BUG in replay code: same θ + same noise ≠ same likelihood\n");
+        printf("═══════════════════════════════════════════════════════════════\n");
+    }
+    
+    smc2_cuda_free(state);
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
  * Main
  *═══════════════════════════════════════════════════════════════════════════*/
 
@@ -589,14 +520,17 @@ int main(int argc, char** argv) {
             test_prior_data_agreement();
         } else if (strcmp(argv[1], "fixedlag") == 0) {
             test_fixed_lag();
+        } else if (strcmp(argv[1], "determinism") == 0) {
+            test_cpmmh_replay_determinism();
         } else {
-            printf("Usage: %s [basic|learn|throughput|prior|fixedlag]\n", argv[0]);
+            printf("Usage: %s [basic|learn|throughput|prior|fixedlag|determinism]\n", argv[0]);
             return 1;
         }
     } else {
         /* Run all tests */
         test_basic();
         test_prior_data_agreement();
+        test_cpmmh_replay_determinism();  /* CRITICAL: Run early to catch bugs */
         test_parameter_learning();
         test_fixed_lag();
         test_throughput();

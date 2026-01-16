@@ -1392,6 +1392,28 @@ void smc2_cuda_set_fixed_lag(SMC2StateCUDA* state, int L) {
     state->t_checkpoint = -1;  /* Reset checkpoint */
 }
 
+void smc2_cuda_set_proposal_std(SMC2StateCUDA* state, const float* std) {
+    if (std) {
+        memcpy(state->proposal_std, std, 8 * sizeof(float));
+    } else {
+        /* Reset to defaults */
+        state->proposal_std[0] = 0.01f;   /* rho */
+        state->proposal_std[1] = 0.02f;   /* sigma_z */
+        state->proposal_std[2] = 0.1f;    /* mu_base */
+        state->proposal_std[3] = 0.1f;    /* mu_scale */
+        state->proposal_std[4] = 0.15f;   /* mu_rate */
+        state->proposal_std[5] = 0.02f;   /* sigma_base */
+        state->proposal_std[6] = 0.02f;   /* sigma_scale */
+        state->proposal_std[7] = 0.15f;   /* sigma_rate */
+    }
+    /* Update constant memory */
+    CUDA_CHECK(cudaMemcpyToSymbol(d_proposal_std, state->proposal_std, 8 * sizeof(float)));
+}
+
+void smc2_cuda_set_cpmmh_rho(SMC2StateCUDA* state, float rho) {
+    state->cpmmh_rho = rho;
+}
+
 void smc2_cuda_init_from_prior(SMC2StateCUDA* state) {
     CUDA_CHECK(cudaMemcpyToSymbol(d_prior, &state->prior, sizeof(SVPrior)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_bounds, &state->bounds, sizeof(SVBounds)));
