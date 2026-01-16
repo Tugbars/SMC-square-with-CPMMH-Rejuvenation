@@ -1,20 +1,15 @@
 /**
  * @file test_smc2_cuda.cu
  * @brief Test suite for SMC² CUDA with proper PMMH rejuvenation
- * 
- * CRITICAL: Data generation MUST match the filter's model exactly:
- *   - z̃ follows unconstrained AR(1): z̃_t = ρ·z̃_{t-1} + σ_z·ε_t
- *   - z = 1.5·(1 + tanh(z̃)) ∈ (0, 3) for curve evaluation
- *   - y_t = h_t + log(χ²(1)) where χ²(1) = ε² for ε ~ N(0,1)
  */
 
 #include "smc2_rbpf_cuda.cuh"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <math.h>
-#include <time.h>
-
+#include "sv_data_generator.cuh"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+#include <ctime>
 
 #ifndef CUDA_N_THETA
 #define CUDA_N_THETA 256
@@ -25,98 +20,92 @@
 #endif
 
 /*═══════════════════════════════════════════════════════════════════════════
- * Host RNG (xorshift64* for quality)
- *═══════════════════════════════════════════════════════════════════════════*/
-
-static unsigned long long h_rng = 12345678901234567ULL;
-
-static void seed_host_rng(unsigned long long seed) {
-    h_rng = seed ? seed : 12345678901234567ULL;
-}
-
-static float host_uniform(void) {
-    h_rng ^= h_rng << 13;
-    h_rng ^= h_rng >> 7;
-    h_rng ^= h_rng << 17;
-    return (h_rng >> 11) * (1.0f / 9007199254740992.0f);
-}
-
-static float host_normal(void) {
-    /* Box-Muller transform */
-    float u1 = host_uniform();
-    float u2 = host_uniform();
-    while (u1 < 1e-10f) u1 = host_uniform();
-    return sqrtf(-2.0f * logf(u1)) * cosf(2.0f * 3.14159265358979f * u2);
-}
-
-/*═══════════════════════════════════════════════════════════════════════════
- * Generate SV Data - MATCHES FILTER MODEL EXACTLY
+ * External Data File Reader
  * 
- * Model:
- *   z̃_t = ρ·z̃_{t-1} + σ_z·ε^z_t           (unconstrained AR(1))
- *   z_t = 1.5·(1 + tanh(z̃_t)) ∈ (0, 3)    (bounded transform)
- *   
- *   θ(z) = θ_base + θ_scale·(1 - exp(-θ_rate·z))
- *   μ(z) = μ_base + μ_scale·(1 - exp(-μ_rate·z))
- *   σ_h(z) = σ_base + σ_scale·(1 - exp(-σ_rate·z))
- *   
- *   h_t = (1-θ(z_t))·h_{t-1} + θ(z_t)·μ(z_t) + σ_h(z_t)·ε^h_t
- *   y_t = h_t + log(χ²(1))
+ * File format (binary):
+ *   - Header: T (int32), n_params (int32), params[n_params] (float32)
+ *   - Data: y[T], h_true[T], z_true[T] (all float32)
  *═══════════════════════════════════════════════════════════════════════════*/
 
-void generate_sv_data(
-    float* y, float* h_true, float* z_true, int T,
-    float rho, float sigma_z,
-    float mu_base, float mu_scale, float mu_rate,
-    float sigma_base, float sigma_scale, float sigma_rate,
-    float theta_base, float theta_scale, float theta_rate
-) {
-    /* Initialize z̃ from stationary distribution: N(0, σ_z²/(1-ρ²)) */
-    float one_minus_rho_sq = fmaxf(1.0f - rho * rho, 1e-6f);
-    float z_tilde_stat_std = sigma_z / sqrtf(one_minus_rho_sq);
-    float z_tilde = z_tilde_stat_std * host_normal();
-    
-    /* Transform to bounded z ∈ (0, 3) — MUST MATCH FILTER */
-    float z = 1.5f * (1.0f + tanhf(z_tilde));
-    
-    /* Evaluate curves at initial z */
-    float theta_z = theta_base + theta_scale * (1.0f - expf(-theta_rate * z));
-    float mu_z = mu_base + mu_scale * (1.0f - expf(-mu_rate * z));
-    float sigma_h = sigma_base + sigma_scale * (1.0f - expf(-sigma_rate * z));
-    float phi = 1.0f - theta_z;
-    
-    /* Initialize h from approximate stationary distribution */
-    float h_stat_var = (sigma_h * sigma_h) / fmaxf(1.0f - phi * phi, 1e-6f);
-    float h = mu_z + sqrtf(h_stat_var) * host_normal();
-    
-    for (int t = 0; t < T; t++) {
-        /* Store true states */
-        if (h_true) h_true[t] = h;
-        if (z_true) z_true[t] = z;
-        
-        /* Generate observation: y_t = h_t + log(χ²(1))
-         * where χ²(1) = ε² for ε ~ N(0,1) */
-        float eps = host_normal();
-        float chi2_1 = eps * eps;
-        /* Add small constant to avoid log(0) for very small eps */
-        y[t] = h + logf(chi2_1 + 1e-10f);
-        
-        /* Transition z̃: unconstrained AR(1) — MATCHES FILTER */
-        z_tilde = rho * z_tilde + sigma_z * host_normal();
-        
-        /* Transform to bounded z ∈ (0, 3) */
-        z = 1.5f * (1.0f + tanhf(z_tilde));
-        
-        /* Evaluate curves at new z */
-        theta_z = theta_base + theta_scale * (1.0f - expf(-theta_rate * z));
-        mu_z = mu_base + mu_scale * (1.0f - expf(-mu_rate * z));
-        sigma_h = sigma_base + sigma_scale * (1.0f - expf(-sigma_rate * z));
-        phi = 1.0f - theta_z;
-        
-        /* Transition h: mean-reverting AR(1) with regime-dependent parameters */
-        h = phi * h + theta_z * mu_z + sigma_h * host_normal();
+typedef struct {
+    int T;
+    float rho, sigma_z;
+    float mu_base, mu_scale, mu_rate;
+    float sigma_base, sigma_scale, sigma_rate;
+    float theta_base, theta_scale, theta_rate;
+    float* y;
+    float* h_true;
+    float* z_true;
+} SVDataFile;
+
+static int load_sv_data(const char* filename, SVDataFile* data) {
+    FILE* f = fopen(filename, "rb");
+    if (!f) {
+        fprintf(stderr, "Error: cannot open %s\n", filename);
+        return -1;
     }
+    
+    /* Read header */
+    int32_t T, n_params;
+    if (fread(&T, sizeof(int32_t), 1, f) != 1 ||
+        fread(&n_params, sizeof(int32_t), 1, f) != 1) {
+        fprintf(stderr, "Error: failed to read header\n");
+        fclose(f);
+        return -1;
+    }
+    
+    if (n_params != 11) {
+        fprintf(stderr, "Error: expected 11 params, got %d\n", n_params);
+        fclose(f);
+        return -1;
+    }
+    
+    data->T = T;
+    
+    /* Read parameters */
+    float params[11];
+    if (fread(params, sizeof(float), 11, f) != 11) {
+        fprintf(stderr, "Error: failed to read params\n");
+        fclose(f);
+        return -1;
+    }
+    
+    data->rho = params[0];
+    data->sigma_z = params[1];
+    data->mu_base = params[2];
+    data->mu_scale = params[3];
+    data->mu_rate = params[4];
+    data->sigma_base = params[5];
+    data->sigma_scale = params[6];
+    data->sigma_rate = params[7];
+    data->theta_base = params[8];
+    data->theta_scale = params[9];
+    data->theta_rate = params[10];
+    
+    /* Allocate and read data */
+    data->y = (float*)malloc(T * sizeof(float));
+    data->h_true = (float*)malloc(T * sizeof(float));
+    data->z_true = (float*)malloc(T * sizeof(float));
+    
+    if (fread(data->y, sizeof(float), T, f) != (size_t)T ||
+        fread(data->h_true, sizeof(float), T, f) != (size_t)T ||
+        fread(data->z_true, sizeof(float), T, f) != (size_t)T) {
+        fprintf(stderr, "Error: failed to read data arrays\n");
+        free(data->y); free(data->h_true); free(data->z_true);
+        fclose(f);
+        return -1;
+    }
+    
+    fclose(f);
+    return 0;
 }
+
+static void free_sv_data(SVDataFile* data) {
+    free(data->y);
+    free(data->h_true);
+    free(data->z_true);
+}
+
 
 /*═══════════════════════════════════════════════════════════════════════════
  * Print Data Statistics
@@ -195,59 +184,33 @@ void test_parameter_learning(void) {
     printf("Test: Parameter Learning with PMMH Rejuvenation\n");
     printf("═══════════════════════════════════════════════════════════════\n");
     
-    /* 
-     * Realistic parameter values for daily log-volatility:
-     * - mu_base = -3.0 implies baseline vol ≈ exp(-3/2) ≈ 22%
-     * - mu_base + mu_scale = -2.0 implies high-regime vol ≈ exp(-2/2) ≈ 37%
-     * 
-     * These should match or be close to the prior means in the filter.
-     */
-    float true_rho = 0.95f;
-    float true_sigma_z = 0.15f;
-    float true_mu_base = -1.0f;
-    float true_mu_scale = 0.5f;
-    float true_mu_rate = 1.0f;
-    float true_sigma_base = 0.15f;
-    float true_sigma_scale = 0.10f;
-    float true_sigma_rate = 1.0f;
-    
-    /* Theta curve (fixed in filter) */
-    float theta_base = 0.02f;
-    float theta_scale = 0.08f;
-    float theta_rate = 1.5f;
+    /* Generate data using SVDataGenerator */
+    SVDataGenerator gen;
+    gen.seed(42);
+    gen.T = 500;
+    /* Use default params: rho=0.95, sigma_z=0.15, etc. */
+    gen.generate();
     
     printf("TRUE PARAMETERS:\n");
-    printf("  rho=%.3f, sigma_z=%.3f\n", true_rho, true_sigma_z);
+    printf("  rho=%.3f, sigma_z=%.3f\n", gen.rho, gen.sigma_z);
     printf("  mu: base=%.3f, scale=%.3f, rate=%.3f\n", 
-           true_mu_base, true_mu_scale, true_mu_rate);
+           gen.mu_base, gen.mu_scale, gen.mu_rate);
     printf("  sigma: base=%.3f, scale=%.3f, rate=%.3f\n",
-           true_sigma_base, true_sigma_scale, true_sigma_rate);
+           gen.sigma_base, gen.sigma_scale, gen.sigma_rate);
     printf("  theta (fixed): base=%.3f, scale=%.3f, rate=%.3f\n",
-           theta_base, theta_scale, theta_rate);
+           gen.theta_base, gen.theta_scale, gen.theta_rate);
     
-    /* Generate data */
-    seed_host_rng(42);  /* Reproducible */
-    int T = 500;
-    float* y = (float*)malloc(T * sizeof(float));
-    float* h_true = (float*)malloc(T * sizeof(float));
-    
-    generate_sv_data(y, h_true, NULL, T,
-                     true_rho, true_sigma_z,
-                     true_mu_base, true_mu_scale, true_mu_rate,
-                     true_sigma_base, true_sigma_scale, true_sigma_rate,
-                     theta_base, theta_scale, theta_rate);
-    
-    printf("\nGenerated T=%d observations\n", T);
-    print_data_stats(y, T);
+    printf("\nGenerated T=%d observations\n", gen.T);
+    print_data_stats(gen.y, gen.T);
     
     /* Print some h_true statistics */
     float h_sum = 0.0f, h_sum_sq = 0.0f;
-    for (int t = 0; t < T; t++) {
-        h_sum += h_true[t];
-        h_sum_sq += h_true[t] * h_true[t];
+    for (int t = 0; t < gen.T; t++) {
+        h_sum += gen.h_true[t];
+        h_sum_sq += gen.h_true[t] * gen.h_true[t];
     }
-    float h_mean = h_sum / T;
-    float h_std = sqrtf(h_sum_sq / T - h_mean * h_mean);
+    float h_mean = h_sum / gen.T;
+    float h_std = sqrtf(h_sum_sq / gen.T - h_mean * h_mean);
     printf("  True h: mean=%.3f, std=%.3f\n", h_mean, h_std);
     
     /* Initialize SMC² */
@@ -257,7 +220,7 @@ void test_parameter_learning(void) {
     smc2_cuda_set_seed(state, 12345);
     
     /* Pre-allocate noise capacity */
-    smc2_cuda_set_noise_capacity(state, T + 128);
+    smc2_cuda_set_noise_capacity(state, gen.T + 128);
 
     smc2_cuda_set_fixed_lag(state, 100); 
     
@@ -271,8 +234,8 @@ void test_parameter_learning(void) {
     cudaEventCreate(&stop);
     
     cudaEventRecord(start);
-    for (int t = 0; t < T; t++) {
-        float ess = smc2_cuda_update(state, y[t]);
+    for (int t = 0; t < gen.T; t++) {
+        float ess = smc2_cuda_update(state, gen.y[t]);
         if ((t + 1) % 100 == 0) {
             float theta_mean[8];
             smc2_cuda_get_theta_mean(state, theta_mean);
@@ -293,7 +256,7 @@ void test_parameter_learning(void) {
     printf("\n═══════════════════════════════════════════════════════════════\n");
     printf("RESULTS\n");
     printf("═══════════════════════════════════════════════════════════════\n");
-    printf("  Time: %.1f ms (%.2f ms/obs)\n", ms, ms / T);
+    printf("  Time: %.1f ms (%.2f ms/obs)\n", ms, ms / gen.T);
     printf("  Resamples: %d\n", state->n_resamples);
     printf("  Rejuvenation: %d/%d accepted (%.1f%%)\n",
            state->n_rejuv_accepts, state->n_rejuv_total,
@@ -315,8 +278,8 @@ void test_parameter_learning(void) {
     printf("  sigma_rate  = %.4f ± %.4f\n", theta_mean[7], theta_std[7]);
     
     /* Parameter recovery table */
-    float true_params[8] = {true_rho, true_sigma_z, true_mu_base, true_mu_scale,
-                           true_mu_rate, true_sigma_base, true_sigma_scale, true_sigma_rate};
+    float true_params[8] = {gen.rho, gen.sigma_z, gen.mu_base, gen.mu_scale,
+                           gen.mu_rate, gen.sigma_base, gen.sigma_scale, gen.sigma_rate};
     const char* names[8] = {"rho", "sigma_z", "mu_base", "mu_scale",
                             "mu_rate", "sigma_base", "sigma_scale", "sigma_rate"};
     
@@ -352,9 +315,8 @@ void test_parameter_learning(void) {
     
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
-    free(y);
-    free(h_true);
     smc2_cuda_free(state);
+    /* gen destructor frees y, h_true, z_true automatically */
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -371,19 +333,6 @@ void test_fixed_lag(void) {
     printf("\nGoal: Show that fixed-lag maintains accuracy at large T where\n");
     printf("      full-history PMMH degrades due to O(T) variance growth.\n\n");
     
-    /* True parameters */
-    float true_rho = 0.95f;
-    float true_sigma_z = 0.15f;
-    float true_mu_base = -1.0f;
-    float true_mu_scale = 0.5f;
-    float true_mu_rate = 1.0f;
-    float true_sigma_base = 0.15f;
-    float true_sigma_scale = 0.10f;
-    float true_sigma_rate = 1.0f;
-    float theta_base = 0.02f;
-    float theta_scale = 0.08f;
-    float theta_rate = 1.5f;
-    
     /* Test at multiple T values to show variance growth effect */
     int T_values[] = {1000, 2000, 5000};
     int n_T = sizeof(T_values) / sizeof(T_values[0]);
@@ -395,14 +344,10 @@ void test_fixed_lag(void) {
         printf("T = %d\n", T);
         printf("─────────────────────────────────────────────────────────────────────────\n");
         
-        seed_host_rng(42);
-        float* y = (float*)malloc(T * sizeof(float));
-        
-        generate_sv_data(y, NULL, NULL, T,
-                         true_rho, true_sigma_z,
-                         true_mu_base, true_mu_scale, true_mu_rate,
-                         true_sigma_base, true_sigma_scale, true_sigma_rate,
-                         theta_base, theta_scale, theta_rate);
+        SVDataGenerator gen;
+        gen.seed(42);
+        gen.T = T;
+        gen.generate();
         
         printf("  %-6s  %8s  %10s  %10s  %8s  %8s\n", 
                "Lag", "Time(ms)", "rho", "sigma_z", "Accept%", "Resamps");
@@ -416,7 +361,7 @@ void test_fixed_lag(void) {
             
             SMC2StateCUDA* state = smc2_cuda_alloc(256, 256);
             smc2_cuda_set_seed(state, 12345);
-            smc2_cuda_set_noise_capacity(state, T + 128);
+            smc2_cuda_set_noise_capacity(state, gen.T + 128);
             smc2_cuda_set_fixed_lag(state, L);
             smc2_cuda_init_from_prior(state);
             
@@ -425,8 +370,8 @@ void test_fixed_lag(void) {
             cudaEventCreate(&stop);
             
             cudaEventRecord(start);
-            for (int t = 0; t < T; t++) {
-                smc2_cuda_update(state, y[t]);
+            for (int t = 0; t < gen.T; t++) {
+                smc2_cuda_update(state, gen.y[t]);
             }
             cudaEventRecord(stop);
             cudaEventSynchronize(stop);
@@ -441,9 +386,9 @@ void test_fixed_lag(void) {
             float accept_pct = state->n_rejuv_total > 0 ? 
                 100.0f * state->n_rejuv_accepts / state->n_rejuv_total : 0.0f;
             
-            float rho_err = fabsf(theta_mean[0] - true_rho);
+            float rho_err = fabsf(theta_mean[0] - gen.rho);
             float rho_z = rho_err / fmaxf(theta_std[0], 1e-6f);
-            float sigma_z_err = fabsf(theta_mean[1] - true_sigma_z);
+            float sigma_z_err = fabsf(theta_mean[1] - gen.sigma_z);
             float sigma_z_z = sigma_z_err / fmaxf(theta_std[1], 1e-6f);
             
             const char* status = (rho_z < 2.0f && sigma_z_z < 2.0f) ? "OK" : "DEGRADED";
@@ -458,8 +403,7 @@ void test_fixed_lag(void) {
             cudaEventDestroy(stop);
             smc2_cuda_free(state);
         }
-        
-        free(y);
+        /* gen destructor frees arrays automatically */
         printf("\n");
     }
     
@@ -479,12 +423,10 @@ void test_throughput(void) {
     printf("Test: Throughput with PMMH Rejuvenation\n");
     printf("═══════════════════════════════════════════════════════════════\n");
     
-    seed_host_rng(123);
-    int T = 500;
-    float* y = (float*)malloc(T * sizeof(float));
-    generate_sv_data(y, NULL, NULL, T,
-                     0.95f, 0.15f, -1.0f, 0.5f, 1.0f,
-                     0.15f, 0.10f, 1.0f, 0.02f, 0.08f, 1.5f);
+    SVDataGenerator gen;
+    gen.seed(123);
+    gen.T = 500;
+    gen.generate();
     
     printf("  N_theta  N_inner  Time(ms)  Resamples  Rejuv%%   ms/obs\n");
     printf("  ─────────────────────────────────────────────────────────\n");
@@ -495,7 +437,7 @@ void test_throughput(void) {
     for (int c = 0; c < n_configs; c++) {
         SMC2StateCUDA* state = smc2_cuda_alloc(configs[c][0], configs[c][1]);
         smc2_cuda_set_seed(state, 54321);
-        smc2_cuda_set_noise_capacity(state, T + 128);
+        smc2_cuda_set_noise_capacity(state, gen.T + 128);
         smc2_cuda_init_from_prior(state);
         
         cudaEvent_t start, stop;
@@ -503,8 +445,8 @@ void test_throughput(void) {
         cudaEventCreate(&stop);
         
         cudaEventRecord(start);
-        for (int t = 0; t < T; t++) {
-            smc2_cuda_update(state, y[t]);
+        for (int t = 0; t < gen.T; t++) {
+            smc2_cuda_update(state, gen.y[t]);
         }
         cudaEventRecord(stop);
         cudaEventSynchronize(stop);
@@ -517,14 +459,13 @@ void test_throughput(void) {
         
         printf("  %4d     %4d     %7.1f   %4d       %5.1f    %.3f\n",
                configs[c][0], configs[c][1], ms, state->n_resamples,
-               rejuv_pct, ms / T);
+               rejuv_pct, ms / gen.T);
         
         cudaEventDestroy(start);
         cudaEventDestroy(stop);
         smc2_cuda_free(state);
     }
     
-    free(y);
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
@@ -568,16 +509,170 @@ void test_prior_data_agreement(void) {
 }
 
 /*═══════════════════════════════════════════════════════════════════════════
+ * Test: Run from External Data File
+ * 
+ * Usage: test_smc2_cuda file <path.bin> [L=100] [seed=12345]
+ *═══════════════════════════════════════════════════════════════════════════*/
+
+void test_from_file(const char* filename, int fixed_lag_L, uint64_t filter_seed) {
+    printf("\n═══════════════════════════════════════════════════════════════\n");
+    printf("Test: Parameter Learning from External Data File\n");
+    printf("═══════════════════════════════════════════════════════════════\n");
+    printf("File: %s\n", filename);
+    printf("Fixed-lag L: %d\n", fixed_lag_L);
+    printf("Filter seed: %llu\n", (unsigned long long)filter_seed);
+    
+    /* Load data */
+    SVDataFile data;
+    if (load_sv_data(filename, &data) != 0) {
+        printf("ERROR: Failed to load data file\n");
+        return;
+    }
+    
+    printf("\nLoaded T=%d observations\n", data.T);
+    printf("\nTRUE PARAMETERS (from file):\n");
+    printf("  rho         = %.4f\n", data.rho);
+    printf("  sigma_z     = %.4f\n", data.sigma_z);
+    printf("  mu_base     = %.4f\n", data.mu_base);
+    printf("  mu_scale    = %.4f\n", data.mu_scale);
+    printf("  mu_rate     = %.4f\n", data.mu_rate);
+    printf("  sigma_base  = %.4f\n", data.sigma_base);
+    printf("  sigma_scale = %.4f\n", data.sigma_scale);
+    printf("  sigma_rate  = %.4f\n", data.sigma_rate);
+    printf("  theta (fixed): base=%.3f, scale=%.3f, rate=%.3f\n",
+           data.theta_base, data.theta_scale, data.theta_rate);
+    
+    /* Data statistics */
+    print_data_stats(data.y, data.T);
+    
+    float h_sum = 0.0f, h_sum_sq = 0.0f;
+    for (int t = 0; t < data.T; t++) {
+        h_sum += data.h_true[t];
+        h_sum_sq += data.h_true[t] * data.h_true[t];
+    }
+    float h_mean = h_sum / data.T;
+    float h_std = sqrtf(h_sum_sq / data.T - h_mean * h_mean);
+    printf("  True h: mean=%.3f, std=%.3f\n", h_mean, h_std);
+    
+    /* Initialize SMC² */
+    SMC2StateCUDA* state = smc2_cuda_alloc(256, 256);
+    smc2_cuda_set_seed(state, filter_seed);
+    smc2_cuda_set_noise_capacity(state, data.T + 128);
+    smc2_cuda_set_fixed_lag(state, fixed_lag_L);
+    smc2_cuda_init_from_prior(state);
+    
+    printf("\nRunning SMC² (N_theta=%d, N_inner=%d, K_rejuv=%d, L=%d)...\n",
+           state->N_theta, state->N_inner, state->K_rejuv, fixed_lag_L);
+    
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    
+    cudaEventRecord(start);
+    for (int t = 0; t < data.T; t++) {
+        float ess = smc2_cuda_update(state, data.y[t]);
+        if ((t + 1) % 100 == 0 || t == data.T - 1) {
+            float theta_mean[8];
+            smc2_cuda_get_theta_mean(state, theta_mean);
+            printf("  t=%4d: ESS=%5.1f, resamp=%2d, accept=%5.1f%%, "
+                   "rho=%.3f, σz=%.3f, μb=%.2f, σb=%.3f\n",
+                   t + 1, ess, state->n_resamples,
+                   state->n_rejuv_total > 0 ? 
+                   100.0f * state->n_rejuv_accepts / state->n_rejuv_total : 0.0f,
+                   theta_mean[0], theta_mean[1], theta_mean[2], theta_mean[5]);
+        }
+    }
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    
+    float ms;
+    cudaEventElapsedTime(&ms, start, stop);
+    
+    printf("\n═══════════════════════════════════════════════════════════════\n");
+    printf("RESULTS\n");
+    printf("═══════════════════════════════════════════════════════════════\n");
+    printf("  Time: %.1f ms (%.2f ms/obs)\n", ms, ms / data.T);
+    printf("  Resamples: %d\n", state->n_resamples);
+    printf("  Rejuvenation: %d/%d accepted (%.1f%%)\n",
+           state->n_rejuv_accepts, state->n_rejuv_total,
+           state->n_rejuv_total > 0 ?
+           100.0f * state->n_rejuv_accepts / state->n_rejuv_total : 0.0f);
+    
+    float theta_mean[8], theta_std[8];
+    smc2_cuda_get_theta_mean(state, theta_mean);
+    smc2_cuda_get_theta_std(state, theta_std);
+    
+    printf("\nESTIMATED (mean ± std):\n");
+    printf("  rho         = %.4f ± %.4f\n", theta_mean[0], theta_std[0]);
+    printf("  sigma_z     = %.4f ± %.4f\n", theta_mean[1], theta_std[1]);
+    printf("  mu_base     = %.4f ± %.4f\n", theta_mean[2], theta_std[2]);
+    printf("  mu_scale    = %.4f ± %.4f\n", theta_mean[3], theta_std[3]);
+    printf("  mu_rate     = %.4f ± %.4f\n", theta_mean[4], theta_std[4]);
+    printf("  sigma_base  = %.4f ± %.4f\n", theta_mean[5], theta_std[5]);
+    printf("  sigma_scale = %.4f ± %.4f\n", theta_mean[6], theta_std[6]);
+    printf("  sigma_rate  = %.4f ± %.4f\n", theta_mean[7], theta_std[7]);
+    
+    /* Parameter recovery table */
+    float true_params[8] = {data.rho, data.sigma_z, data.mu_base, data.mu_scale,
+                           data.mu_rate, data.sigma_base, data.sigma_scale, data.sigma_rate};
+    const char* names[8] = {"rho", "sigma_z", "mu_base", "mu_scale",
+                            "mu_rate", "sigma_base", "sigma_scale", "sigma_rate"};
+    
+    printf("\n%-12s  %8s  %8s  %8s  %7s  %7s  %s\n", 
+           "Parameter", "True", "Est", "Std", "Err%", "z-score", "Status");
+    printf("─────────────────────────────────────────────────────────────────────────\n");
+    
+    int n_ok = 0;
+    int n_within_15pct = 0;
+    for (int i = 0; i < 8; i++) {
+        float err = theta_mean[i] - true_params[i];
+        float z_score = fabsf(err) / fmaxf(theta_std[i], 1e-6f);
+        
+        float pct_err;
+        if (fabsf(true_params[i]) < 0.01f) {
+            pct_err = err * 100.0f;
+        } else {
+            pct_err = 100.0f * err / true_params[i];
+        }
+        
+        const char* status = (z_score <= 2.0f) ? "OK" : (z_score <= 3.0f) ? "WARN" : "MISS";
+        if (z_score <= 2.0f) n_ok++;
+        if (fabsf(pct_err) <= 15.0f) n_within_15pct++;
+        
+        printf("%-12s  %8.4f  %8.4f  %8.4f  %+6.1f%%  %7.2f  [%s]\n", 
+               names[i], true_params[i], theta_mean[i], theta_std[i], pct_err, z_score, status);
+    }
+    
+    printf("─────────────────────────────────────────────────────────────────────────\n");
+    printf("OVERALL: %d/8 within 2σ, %d/8 within 15%% relative error\n", n_ok, n_within_15pct);
+    printf("%s\n", n_ok >= 6 ? "PASSED" : "NEEDS INVESTIGATION");
+    
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    free_sv_data(&data);
+    smc2_cuda_free(state);
+}
+
+/*═══════════════════════════════════════════════════════════════════════════
  * Main
  *═══════════════════════════════════════════════════════════════════════════*/
 
+void print_usage(const char* prog) {
+    printf("Usage:\n");
+    printf("  %s                       Run all tests\n", prog);
+    printf("  %s basic                 Run basic smoke test\n", prog);
+    printf("  %s learn                 Run parameter learning test\n", prog);
+    printf("  %s throughput            Run throughput benchmark\n", prog);
+    printf("  %s prior                 Check prior/data agreement\n", prog);
+    printf("  %s fixedlag              Test fixed-lag performance\n", prog);
+    printf("  %s file <data.bin> [L] [seed]   Run from external data file\n", prog);
+}
+
 int main(int argc, char** argv) {
     printf("\n╔═══════════════════════════════════════════════════════════════╗\n");
-    printf("║  SMC² RBPF CUDA - Test Suite (with PMMH Rejuvenation)         ║\n");
-    printf("║  Data generation MATCHES filter z-transform (tanh)            ║\n");
+    printf("║  SMC² RBPF CUDA - Test Suite                                  ║\n");
     printf("╚═══════════════════════════════════════════════════════════════╝\n");
     
-    /* Check for specific test selection */
     if (argc > 1) {
         if (strcmp(argv[1], "basic") == 0) {
             test_basic();
@@ -589,12 +684,22 @@ int main(int argc, char** argv) {
             test_prior_data_agreement();
         } else if (strcmp(argv[1], "fixedlag") == 0) {
             test_fixed_lag();
+        } else if (strcmp(argv[1], "file") == 0) {
+            if (argc < 3) {
+                print_usage(argv[0]);
+                return 1;
+            }
+            int L = (argc > 3) ? atoi(argv[3]) : 100;
+            uint64_t seed = (argc > 4) ? strtoull(argv[4], NULL, 10) : 12345;
+            test_from_file(argv[2], L, seed);
+        } else if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
+            print_usage(argv[0]);
+            return 0;
         } else {
-            printf("Usage: %s [basic|learn|throughput|prior|fixedlag]\n", argv[0]);
+            print_usage(argv[0]);
             return 1;
         }
     } else {
-        /* Run all tests */
         test_basic();
         test_prior_data_agreement();
         test_parameter_learning();
