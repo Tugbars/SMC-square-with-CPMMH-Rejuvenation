@@ -1396,7 +1396,7 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     
     /* Default prior */
     state->prior.rho_mean = 0.95f; state->prior.rho_std = 0.02f;
-    state->prior.sigma_z_mean = 0.1f; state->prior.sigma_z_std = 0.05f;
+    state->prior.sigma_z_mean = 0.1f; state->prior.sigma_z_std = 0.1f;
     state->prior.mu_base_mean = -1.0f; state->prior.mu_base_std = 0.5f;
     state->prior.mu_scale_mean = 0.5f; state->prior.mu_scale_std = 0.3f;
     state->prior.mu_rate_mean = 1.0f; state->prior.mu_rate_std = 0.5f;
