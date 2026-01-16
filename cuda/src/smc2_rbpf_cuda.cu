@@ -7,6 +7,7 @@
  */
 
 #include "smc2_rbpf_cuda.cuh"
+#include "smc2_noise_precision.cuh"
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -130,8 +131,8 @@ __global__ void kernel_init_rng(curandState* states, unsigned long long seed, in
 __global__ void kernel_init_from_prior(
     ThetaParticlesSoA particles,
     int N_theta, int N_inner,
-    half* d_z_noise,
-    half* d_u0_noise,
+    noise_t* d_z_noise,
+    noise_t* d_u0_noise,
     int noise_capacity
 ) {
     int theta_idx = blockIdx.x;
@@ -197,19 +198,16 @@ __global__ void kernel_init_from_prior(
     float one_minus_rho_sq = fmaxf(1.0f - rho * rho, 1e-6f);
     float z_tilde_stat_std = sigma_z / sqrtf(one_minus_rho_sq);
     
-    /* Generate t=0 noise with FP16 round-trip */
+    /* Generate t=0 noise with precision-appropriate round-trip */
     float z_noise_raw = curand_normal(rng);
     int64_t z_noise_idx = (int64_t)theta_idx * N_inner * (noise_capacity + 1) + inner_idx;
-    half h_z_noise = __float2half(z_noise_raw);
-    d_z_noise[z_noise_idx] = h_z_noise;
-    float z_noise_init = __half2float(h_z_noise);
+    float z_noise_init = noise_store_roundtrip(d_z_noise, z_noise_idx, z_noise_raw);
     
     /* Thread 0: generate u0 noise */
     if (inner_idx == 0) {
         float u0_noise_raw = curand_normal(rng);
         int64_t u0_noise_idx = (int64_t)theta_idx * (noise_capacity + 1);
-        half h_u0_noise = __float2half(u0_noise_raw);
-        d_u0_noise[u0_noise_idx] = h_u0_noise;
+        noise_store(d_u0_noise, u0_noise_idx, u0_noise_raw);
     }
     
     /* Initialize z̃ and compute derived quantities */
@@ -246,8 +244,8 @@ void kernel_rbpf_step_impl(
     ThetaParticlesSoA particles,
     float y_obs,
     int N_theta,
-    half* d_z_noise,
-    half* d_u0_noise,
+    noise_t* d_z_noise,
+    noise_t* d_u0_noise,
     int t_current,
     int noise_capacity
 ) {
@@ -303,18 +301,15 @@ void kernel_rbpf_step_impl(
     int64_t z_noise_idx = z_noise_base + (int64_t)(t_current + 1) * N_INNER + inner_idx;
     int64_t u0_noise_idx = (int64_t)theta_idx * (noise_capacity + 1) + (t_current + 1);
     
-    /* Generate and store propagation noise (FP16 round-trip) */
+    /* Generate and store propagation noise (precision-appropriate round-trip) */
     float z_noise_raw = curand_normal(&local_rng);
-    half h_z_noise = __float2half(z_noise_raw);
-    d_z_noise[z_noise_idx] = h_z_noise;
-    float z_noise = __half2float(h_z_noise);
+    float z_noise = noise_store_roundtrip(d_z_noise, z_noise_idx, z_noise_raw);
     
     /* Thread 0: generate resampling noise */
     if (inner_idx == 0) {
         float u0_noise_raw = curand_normal(&local_rng);
-        half h_u0 = __float2half(u0_noise_raw);
-        d_u0_noise[u0_noise_idx] = h_u0;
-        s_u0 = u0_from_noise(__half2float(h_u0));
+        float u0_stored = noise_store_roundtrip(d_u0_noise, u0_noise_idx, u0_noise_raw);
+        s_u0 = u0_from_noise(u0_stored);
     }
     __syncthreads();
     
@@ -443,8 +438,8 @@ __global__ void kernel_rbpf_step(
     ThetaParticlesSoA particles,
     float y_obs,
     int N_theta, int N_inner,
-    half* d_z_noise,
-    half* d_u0_noise,
+    noise_t* d_z_noise,
+    noise_t* d_u0_noise,
     int t_current,
     int noise_capacity
 ) {
@@ -585,10 +580,10 @@ __global__ void kernel_copy_theta_particles(
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 __global__ void kernel_copy_noise_arrays(
-    const half* src_z_noise,
-    half* dst_z_noise,
-    const half* src_u0_noise,
-    half* dst_u0_noise,
+    const noise_t* src_z_noise,
+    noise_t* dst_z_noise,
+    const noise_t* src_u0_noise,
+    noise_t* dst_u0_noise,
     const int* d_ancestors,
     int N_theta, int N_inner,
     int t_current, int noise_capacity
@@ -674,10 +669,10 @@ void kernel_cpmmh_rejuvenate_fused_impl(
     ThetaParticlesSoA particles,
     ThetaParticlesSoA particles_scratch,
     const float* y_history,
-    half* d_z_noise_curr,
-    half* d_z_noise_other,
-    half* d_u0_noise_curr,
-    half* d_u0_noise_other,
+    noise_t* d_z_noise_curr,
+    noise_t* d_z_noise_other,
+    noise_t* d_u0_noise_curr,
+    noise_t* d_u0_noise_other,
     int t_current,
     int N_theta,
     int noise_capacity,
@@ -819,10 +814,10 @@ void kernel_cpmmh_rejuvenate_fused_impl(
         float z_tilde_stat_std = sigma_z / sqrtf(one_minus_rho_sq);
         
         /* Correlate t=0 noise */
-        float z_noise_curr_0 = __half2float(d_z_noise_curr[z_noise_base + inner_idx]);
+        float z_noise_curr_0 = noise_load(d_z_noise_curr, z_noise_base + inner_idx);
         float z_noise_fresh_0 = curand_normal(&local_rng);
         float z_noise_prop_0 = cpmmh_rho * z_noise_curr_0 + scale * z_noise_fresh_0;
-        d_z_noise_other[z_noise_base + inner_idx] = __float2half(z_noise_prop_0);
+        noise_store(d_z_noise_other, z_noise_base + inner_idx, z_noise_prop_0);
         
         z_tilde = z_tilde_stat_std * z_noise_prop_0;
         float z_init = z_tilde_to_z(z_tilde);
@@ -870,22 +865,19 @@ void kernel_cpmmh_rejuvenate_fused_impl(
         
         /* Generate correlated noise for t+1 */
         int64_t z_idx_t1 = z_noise_base + (int64_t)(t + 1) * N_INNER + inner_idx;
-        float z_noise_curr_t1 = __half2float(d_z_noise_curr[z_idx_t1]);
+        float z_noise_curr_t1 = noise_load(d_z_noise_curr, z_idx_t1);
         float z_noise_fresh_t1 = curand_normal(&local_rng);
         float z_noise_prop_t1_raw = cpmmh_rho * z_noise_curr_t1 + scale * z_noise_fresh_t1;
-        half h_prop_t1 = __float2half(z_noise_prop_t1_raw);
-        d_z_noise_other[z_idx_t1] = h_prop_t1;
-        float z_noise_prop_t1 = __half2float(h_prop_t1);
+        float z_noise_prop_t1 = noise_store_roundtrip(d_z_noise_other, z_idx_t1, z_noise_prop_t1_raw);
         
         /* Thread 0: correlate resampling noise */
         if (inner_idx == 0) {
             int64_t u0_idx_t1 = (int64_t)theta_idx * (noise_capacity + 1) + (t + 1);
-            float u0_noise_curr = __half2float(d_u0_noise_curr[u0_idx_t1]);
+            float u0_noise_curr = noise_load(d_u0_noise_curr, u0_idx_t1);
             float u0_noise_fresh = curand_normal(&local_rng);
             float u0_noise_prop_raw = cpmmh_rho * u0_noise_curr + scale * u0_noise_fresh;
-            half h_u0_prop = __float2half(u0_noise_prop_raw);
-            d_u0_noise_other[u0_idx_t1] = h_u0_prop;
-            s_u0_shared = u0_from_noise(__half2float(h_u0_prop));
+            float u0_stored = noise_store_roundtrip(d_u0_noise_other, u0_idx_t1, u0_noise_prop_raw);
+            s_u0_shared = u0_from_noise(u0_stored);
         }
         __syncthreads();
         
@@ -1040,10 +1032,10 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
     ThetaParticlesSoA particles,
     ThetaParticlesSoA particles_scratch,
     const float* y_history,
-    half* d_z_noise_curr,
-    half* d_z_noise_other,
-    half* d_u0_noise_curr,
-    half* d_u0_noise_other,
+    noise_t* d_z_noise_curr,
+    noise_t* d_z_noise_other,
+    noise_t* d_u0_noise_curr,
+    noise_t* d_u0_noise_other,
     int t_current,
     int N_theta, int N_inner,
     int noise_capacity,
@@ -1077,10 +1069,10 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 __global__ void kernel_commit_accepted_noise(
-    half* d_z_noise_0,
-    half* d_z_noise_1,
-    half* d_u0_noise_0,
-    half* d_u0_noise_1,
+    noise_t* d_z_noise_0,
+    noise_t* d_z_noise_1,
+    noise_t* d_u0_noise_0,
+    noise_t* d_u0_noise_1,
     const int* d_swap_flags,
     int N_theta, int N_inner,
     int t_current, int noise_capacity,
@@ -1234,10 +1226,10 @@ SMC2StateCUDA* smc2_cuda_alloc(int N_theta, int N_inner) {
     int64_t z_noise_size = (int64_t)N_theta * N_inner * (state->noise_capacity + 1);
     int64_t u0_noise_size = (int64_t)N_theta * (state->noise_capacity + 1);
     
-    CUDA_CHECK(cudaMalloc(&state->d_z_noise[0], z_noise_size * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&state->d_z_noise[1], z_noise_size * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&state->d_u0_noise[0], u0_noise_size * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&state->d_u0_noise[1], u0_noise_size * sizeof(half)));
+    CUDA_CHECK(cudaMalloc(&state->d_z_noise[0], noise_array_bytes(z_noise_size)));
+    CUDA_CHECK(cudaMalloc(&state->d_z_noise[1], noise_array_bytes(z_noise_size)));
+    CUDA_CHECK(cudaMalloc(&state->d_u0_noise[0], noise_array_bytes(u0_noise_size)));
+    CUDA_CHECK(cudaMalloc(&state->d_u0_noise[1], noise_array_bytes(u0_noise_size)));
     
     /* Default prior */
     state->prior.rho_mean = 0.95f; state->prior.rho_std = 0.02f;
@@ -1364,19 +1356,19 @@ void smc2_cuda_set_noise_capacity(SMC2StateCUDA* state, int capacity) {
     int64_t new_u0_size = (int64_t)state->N_theta * (capacity + 1);
     int64_t old_u0_size = (int64_t)state->N_theta * (state->noise_capacity + 1);
     
-    half *new_z_0, *new_z_1, *new_u0_0, *new_u0_1;
-    CUDA_CHECK(cudaMalloc(&new_z_0, new_z_size * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&new_z_1, new_z_size * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&new_u0_0, new_u0_size * sizeof(half)));
-    CUDA_CHECK(cudaMalloc(&new_u0_1, new_u0_size * sizeof(half)));
+    noise_t *new_z_0, *new_z_1, *new_u0_0, *new_u0_1;
+    CUDA_CHECK(cudaMalloc(&new_z_0, noise_array_bytes(new_z_size)));
+    CUDA_CHECK(cudaMalloc(&new_z_1, noise_array_bytes(new_z_size)));
+    CUDA_CHECK(cudaMalloc(&new_u0_0, noise_array_bytes(new_u0_size)));
+    CUDA_CHECK(cudaMalloc(&new_u0_1, noise_array_bytes(new_u0_size)));
     
     if (state->d_z_noise[0] && old_z_size > 0) {
         CUDA_CHECK(cudaMemcpy(new_z_0, state->d_z_noise[0], 
-                              old_z_size * sizeof(half), cudaMemcpyDeviceToDevice));
+                              noise_array_bytes(old_z_size), cudaMemcpyDeviceToDevice));
     }
     if (state->d_u0_noise[0] && old_u0_size > 0) {
         CUDA_CHECK(cudaMemcpy(new_u0_0, state->d_u0_noise[0],
-                              old_u0_size * sizeof(half), cudaMemcpyDeviceToDevice));
+                              noise_array_bytes(old_u0_size), cudaMemcpyDeviceToDevice));
     }
     
     cudaFree(state->d_z_noise[0]);
@@ -1617,10 +1609,10 @@ float smc2_cuda_update(SMC2StateCUDA* state, float y_obs) {
             int h_accepts = 0;
             CUDA_CHECK(cudaMemcpy(state->d_accepts, &h_accepts, sizeof(int), cudaMemcpyHostToDevice));
             
-            half* curr_noise = state->d_z_noise[state->noise_buf];
-            half* other_noise = state->d_z_noise[1 - state->noise_buf];
-            half* curr_u0 = state->d_u0_noise[state->noise_buf];
-            half* other_u0 = state->d_u0_noise[1 - state->noise_buf];
+            noise_t* curr_noise = state->d_z_noise[state->noise_buf];
+            noise_t* other_noise = state->d_z_noise[1 - state->noise_buf];
+            noise_t* curr_u0 = state->d_u0_noise[state->noise_buf];
+            noise_t* other_u0 = state->d_u0_noise[1 - state->noise_buf];
             
             switch (state->N_inner) {
                 case 64:  DISPATCH_CPMMH(64);  break;

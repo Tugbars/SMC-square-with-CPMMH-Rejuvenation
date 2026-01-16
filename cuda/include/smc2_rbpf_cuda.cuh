@@ -15,30 +15,30 @@
  * Three-Level Structure:
  * ----------------------
  * 
- *   ┌─────────────────────────────────────────────────────────────┐
+ *   ┌─────────────────────────────────────────────────────────────────┐
  *   │ OUTER: SMC² over θ-particles (N_theta = 256)                │
  *   │   - Parameters: ρ, σ_z, μ_base, μ_scale, μ_rate,            │
  *   │                 σ_base, σ_scale, σ_rate                     │
  *   │   - Weights: accumulated likelihood p̂(y_{1:t} | θ)          │
  *   │   - Resample when ESS < threshold                           │
  *   │   - Rejuvenate via CPMMH moves                              │
- *   └─────────────────────────────────────────────────────────────┘
+ *   └─────────────────────────────────────────────────────────────────┘
  *                              │
  *                              ▼
- *   ┌─────────────────────────────────────────────────────────────┐
+ *   ┌─────────────────────────────────────────────────────────────────┐
  *   │ INNER: RBPF over (z, h) state (N_inner = 256 per θ)         │
  *   │   - Regime z̃: particle approximation (N_inner samples)      │
  *   │   - Log-vol h: Rao-Blackwellized (analytic Kalman moments)  │
  *   │   - OCSN 10-component mixture for observation likelihood    │
- *   └─────────────────────────────────────────────────────────────┘
+ *   └─────────────────────────────────────────────────────────────────┘
  *                              │
  *                              ▼
- *   ┌─────────────────────────────────────────────────────────────┐
+ *   ┌─────────────────────────────────────────────────────────────────┐
  *   │ CPMMH: Correlated Pseudo-Marginal MH for rejuvenation       │
  *   │   - Correlates noise: z' = ρ·z + √(1-ρ²)·ε  (ρ ≈ 0.99)      │
  *   │   - Bucket sort after resampling preserves coupling         │
  *   │   - Full-history replay for correct MH ratio                │
- *   └─────────────────────────────────────────────────────────────┘
+ *   └─────────────────────────────────────────────────────────────────┘
  * 
  * 
  * CPMMH Coupling: Why We Sort After Resampling
@@ -101,6 +101,18 @@
  *   - Smooth transform → no gradient discontinuities
  * 
  * 
+ * Noise Precision Configuration
+ * ==============================
+ * 
+ * By default, noise arrays use FP32 for full precision.
+ * For bandwidth-critical applications with T < 500, define SMC2_NOISE_FP16:
+ * 
+ *     nvcc -DSMC2_NOISE_FP16 -o smc2_fp16 smc2_rbpf_cuda.cu
+ * 
+ * FP32: Full precision (DEFAULT), recommended for accuracy
+ * FP16: ~50% bandwidth, ~0.1% relative error per step
+ * 
+ * 
  * Performance Notes
  * =================
  * 
@@ -141,6 +153,9 @@
 #include <cuda_fp16.h>
 #include <curand_kernel.h>
 #include <stdint.h>
+
+/* Include noise precision abstraction - defines noise_t type */
+#include "smc2_noise_precision.cuh"
 
 /*═══════════════════════════════════════════════════════════════════════════════
  * SECTION 1: COMPILE-TIME CONFIGURATION
@@ -261,9 +276,9 @@ struct SMC2StateCUDA {
     int y_history_capacity;
     int t_current;           /**< Current timestep (0-indexed) */
     
-    /* ═══ CPMMH noise buffers (FP16, ping-pong) ═══ */
-    half* d_z_noise[2];      /**< Propagation noise [N_theta × N_inner × (T+1)] */
-    half* d_u0_noise[2];     /**< Resampling noise [N_theta × (T+1)] */
+    /* ═══ CPMMH noise buffers (FP16 or FP32 based on SMC2_NOISE_FP32, ping-pong) ═══ */
+    noise_t* d_z_noise[2];   /**< Propagation noise [N_theta × N_inner × (T+1)] */
+    noise_t* d_u0_noise[2];  /**< Resampling noise [N_theta × (T+1)] */
     int noise_buf;           /**< Active buffer index (0 or 1) */
     int noise_capacity;      /**< Max T for noise arrays */
     float cpmmh_rho;         /**< Noise correlation (default 0.99) */
@@ -310,8 +325,8 @@ struct SMC2StateCUDA {
  *═══════════════════════════════════════════════════════════════════════════════*/
 
 /* Note: Actual shared memory calculations are in Section 4.4 after CUB include:
- *   - rbpf_shared_mem_size_cub<BLOCK_SIZE>() for forward step
- *   - cpmmh_shared_mem_size_cub<BLOCK_SIZE>() for rejuvenation
+ *   - rbpf_shared_mem_size<BLOCK_SIZE>() for forward step
+ *   - cpmmh_shared_mem_size<BLOCK_SIZE>() for rejuvenation
  * 
  * These are templates because CUB temp storage size depends on BLOCK_SIZE.
  */
@@ -587,8 +602,8 @@ __global__ void kernel_init_rng(
 __global__ void kernel_init_from_prior(
     ThetaParticlesSoA particles,
     int N_theta, int N_inner,
-    half* d_z_noise,
-    half* d_u0_noise,
+    noise_t* d_z_noise,
+    noise_t* d_u0_noise,
     int noise_capacity
 );
 
@@ -611,8 +626,8 @@ __global__ void kernel_rbpf_step(
     ThetaParticlesSoA particles,
     float y_obs,
     int N_theta, int N_inner,
-    half* d_z_noise,
-    half* d_u0_noise,
+    noise_t* d_z_noise,
+    noise_t* d_u0_noise,
     int t_current,
     int noise_capacity
 );
@@ -651,8 +666,10 @@ __global__ void kernel_copy_theta_particles(
  * @brief Copy noise arrays after outer resampling (ping-pong)
  */
 __global__ void kernel_copy_noise_arrays(
-    const half* src_z_noise,
-    half* dst_z_noise,
+    const noise_t* src_z_noise,
+    noise_t* dst_z_noise,
+    const noise_t* src_u0_noise,
+    noise_t* dst_u0_noise,
     const int* d_ancestors,
     int N_theta, int N_inner,
     int t_current, int noise_capacity
@@ -673,10 +690,10 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
     ThetaParticlesSoA particles,
     ThetaParticlesSoA particles_scratch,
     const float* y_history,
-    half* d_z_noise_curr,
-    half* d_z_noise_other,
-    half* d_u0_noise_curr,
-    half* d_u0_noise_other,
+    noise_t* d_z_noise_curr,
+    noise_t* d_z_noise_other,
+    noise_t* d_u0_noise_curr,
+    noise_t* d_u0_noise_other,
     int t_current,
     int N_theta, int N_inner,
     int noise_capacity,
@@ -692,13 +709,14 @@ __global__ void kernel_cpmmh_rejuvenate_fused(
  * @brief Commit accepted CPMMH proposals (copy noise buffers)
  */
 __global__ void kernel_commit_accepted_noise(
-    half* d_z_noise_0,
-    half* d_z_noise_1,
-    half* d_u0_noise_0,
-    half* d_u0_noise_1,
+    noise_t* d_z_noise_0,
+    noise_t* d_z_noise_1,
+    noise_t* d_u0_noise_0,
+    noise_t* d_u0_noise_1,
     const int* d_swap_flags,
     int N_theta, int N_inner,
-    int t_current, int noise_capacity
+    int t_current, int noise_capacity,
+    int t_start
 );
 
 /*═══════════════════════════════════════════════════════════════════════════════
@@ -754,6 +772,27 @@ void smc2_cuda_set_noise_capacity(SMC2StateCUDA* state, int capacity);
  *   - Parameters may "track" slowly-drifting data (feature for finance)
  */
 void smc2_cuda_set_fixed_lag(SMC2StateCUDA* state, int L);
+
+/**
+ * @brief Set CPMMH noise correlation parameter
+ * 
+ * @param state  SMC² state
+ * @param rho    Correlation coefficient (default 0.99)
+ * 
+ * Higher values reduce PMMH variance but increase autocorrelation.
+ * Typical range: 0.95-0.999
+ */
+void smc2_cuda_set_cpmmh_rho(SMC2StateCUDA* state, float rho);
+
+/**
+ * @brief Set proposal standard deviations
+ * 
+ * @param state  SMC² state
+ * @param std    Array of 8 floats, or NULL to reset to defaults
+ * 
+ * Order: [rho, sigma_z, mu_base, mu_scale, mu_rate, sigma_base, sigma_scale, sigma_rate]
+ */
+void smc2_cuda_set_proposal_std(SMC2StateCUDA* state, const float* std);
 
 /**
  * @brief Initialize particles from prior
