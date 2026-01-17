@@ -3,15 +3,53 @@
  * 
  * Prior calibration for SMC² cold start problem.
  * 
- * Strategy:
- *   1. Buffer warmup data (50-100 observations)
- *   2. Compute statistics from log(y²) as proxy for latent volatility
- *   3. Map statistics → parameter estimates
- *   4. Set priors: centered on warmup, wide enough to cover historical regimes
- *   5. Filter adapts from there
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │  THE PROBLEM                                                            │
+ * │                                                                         │
+ * │  SMC² needs priors BEFORE seeing data, but bad priors cause failure.   │
+ * │  We want to center near the truth (efficient) while covering regime    │
+ * │  uncertainty (robust).                                                  │
+ * └─────────────────────────────────────────────────────────────────────────┘
  * 
- * Key insight: Prior CENTER comes from warmup, prior WIDTH comes from history.
- * This gets you in the ballpark while allowing for regime uncertainty.
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │  THE SOLUTION                                                           │
+ * │                                                                         │
+ * │                         PRIOR                                           │
+ * │                                                                         │
+ * │      Center (where)     ←───── Warmup data (current market)            │
+ * │      Width (how wide)   ←───── Historical bounds (past regimes)        │
+ * │                                                                         │
+ * └─────────────────────────────────────────────────────────────────────────┘
+ * 
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │  THE MAPPING                                                            │
+ * │                                                                         │
+ * │  We observe returns y_t, not latent volatility h_t. But:               │
+ * │                                                                         │
+ * │      log(y_t²) = h_t + log(ε_t²)                                       │
+ * │                        └─────── known noise (mean=-1.27, var=π²/2)     │
+ * │                                                                         │
+ * │  So statistics of log(y²) reveal latent parameters:                    │
+ * │                                                                         │
+ * │      ACF₁(log y²)   ──────►  ρ (persistence)                           │
+ * │      Var(log y²)    ──────►  σ_z (vol-of-vol)                          │
+ * │      Mean(log y²)   ──────►  μ_base (level)                            │
+ * │                                                                         │
+ * └─────────────────────────────────────────────────────────────────────────┘
+ * 
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │  WHY IT WORKS                                                           │
+ * │                                                                         │
+ * │  Scenario                      │ Result                                │
+ * │  ─────────────────────────────────────────────────────────────────     │
+ * │  Warmup=calm, stays calm       │ Center near truth, fast convergence   │
+ * │  Warmup=calm, crisis hits      │ Wide prior covers crisis → adapts     │
+ * │  Warmup=crisis, calms down     │ Wide prior covers calm → adapts       │
+ * │                                                                         │
+ * │  Width spans historical extremes, so filter always has particles       │
+ * │  in the right region. May converge slower if center is off, but        │
+ * │  won't fail catastrophically.                                          │
+ * └─────────────────────────────────────────────────────────────────────────┘
  * 
  * Usage:
  *   // 1. Buffer warmup data
