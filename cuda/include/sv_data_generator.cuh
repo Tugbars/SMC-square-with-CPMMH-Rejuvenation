@@ -38,8 +38,49 @@
 #include <cmath>
 #include <cstdio>
 
-/* Forward declaration - full definition in smc2_rbpf_cuda.cuh */
-struct SMC2StateCUDA;
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Minimal struct definitions for standalone use.
+ * If smc2_rbpf_cuda.cuh is included BEFORE this file, these are skipped.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+#ifndef SMC2_RBPF_CUDA_CUH
+
+struct SVPrior {
+    float rho_mean, rho_std;
+    float sigma_z_mean, sigma_z_std;
+    float mu_base_mean, mu_base_std;
+    float mu_scale_mean, mu_scale_std;
+    float mu_rate_mean, mu_rate_std;
+    float sigma_base_mean, sigma_base_std;
+    float sigma_scale_mean, sigma_scale_std;
+    float sigma_rate_mean, sigma_rate_std;
+};
+
+struct SVBounds {
+    float rho_min, rho_max;
+    float sigma_z_min, sigma_z_max;
+    float mu_base_min, mu_base_max;
+    float mu_scale_min, mu_scale_max;
+    float mu_rate_min, mu_rate_max;
+    float sigma_base_min, sigma_base_max;
+    float sigma_scale_min, sigma_scale_max;
+    float sigma_rate_min, sigma_rate_max;
+};
+
+struct SVCurve {
+    float base, scale, rate;
+};
+
+struct SMC2StateCUDA {
+    int N_theta;
+    int N_inner;
+    SVPrior prior;
+    SVBounds bounds;
+    SVCurve theta_curve;
+    /* Other fields omitted - only needed for validation */
+};
+
+#endif /* SMC2_RBPF_CUDA_CUH */
 
 struct SVDataGenerator {
     /* Parameters (set before calling generate()) */
@@ -116,6 +157,175 @@ struct SVDataGenerator {
     
     ~SVDataGenerator() { free_arrays(); }
     
+    /* =========================================================================
+     * REALISTIC PRESETS (SPY-calibrated from historical data)
+     * 
+     * The default parameters produce ~500% annual vol (stress testing).
+     * Use these presets for realistic equity-like data.
+     * 
+     * Key insight: mu_base controls the LEVEL of log-variance.
+     *   mu_base = -1   → ~500% annual vol (stress test)
+     *   mu_base = -10  → ~10% annual vol (calm equity)
+     *   mu_base = -7   → ~50% annual vol (crisis)
+     * ========================================================================= */
+    
+    /**
+     * @brief SPY-like calm regime (2017, 2019, 2021 style)
+     * 
+     * Characteristics:
+     *   - High persistence (ρ ≈ 0.98)
+     *   - Low vol-of-vol (σ_z ≈ 0.08)
+     *   - Annualized vol ~10-15%
+     */
+    void set_realistic_calm() {
+        rho = 0.98f;
+        sigma_z = 0.08f;
+        mu_base = -10.5f;       // → ~12% annual vol
+        mu_scale = 0.3f;
+        mu_rate = 1.0f;
+        sigma_base = 0.08f;
+        sigma_scale = 0.05f;
+        sigma_rate = 1.0f;
+        theta_base = 0.02f;
+        theta_scale = 0.08f;
+        theta_rate = 1.5f;
+    }
+    
+    /**
+     * @brief SPY-like crisis regime (2008, March 2020 style)
+     * 
+     * Characteristics:
+     *   - Lower persistence (ρ ≈ 0.85) - faster mean reversion
+     *   - High vol-of-vol (σ_z ≈ 0.30)
+     *   - Annualized vol ~40-60%
+     */
+    void set_realistic_crisis() {
+        rho = 0.85f;
+        sigma_z = 0.30f;
+        mu_base = -7.5f;        // → ~50% annual vol
+        mu_scale = 0.5f;
+        mu_rate = 1.0f;
+        sigma_base = 0.20f;
+        sigma_scale = 0.10f;
+        sigma_rate = 1.0f;
+        theta_base = 0.02f;
+        theta_scale = 0.08f;
+        theta_rate = 1.5f;
+    }
+    
+    /**
+     * @brief SPY-like moderate volatility (typical market, ~20% vol)
+     */
+    void set_realistic_moderate() {
+        rho = 0.94f;
+        sigma_z = 0.15f;
+        mu_base = -9.0f;        // → ~20% annual vol
+        mu_scale = 0.4f;
+        mu_rate = 1.0f;
+        sigma_base = 0.12f;
+        sigma_scale = 0.08f;
+        sigma_rate = 1.0f;
+        theta_base = 0.02f;
+        theta_scale = 0.08f;
+        theta_rate = 1.5f;
+    }
+    
+    /**
+     * @brief Generate data with regime transition (calm → crisis)
+     * 
+     * First half: calm regime
+     * Second half: crisis regime
+     * Useful for testing regime detection and adaptation.
+     * 
+     * @param transition_point  Timestep where regime changes (default: T/2)
+     */
+    void generate_with_regime_change(int transition_point = -1) {
+        free_arrays();
+        y = (float*)malloc(T * sizeof(float));
+        h_true = (float*)malloc(T * sizeof(float));
+        z_true = (float*)malloc(T * sizeof(float));
+        
+        if (transition_point < 0) transition_point = T / 2;
+        
+        /* Save crisis parameters */
+        float crisis_rho = 0.85f;
+        float crisis_sigma_z = 0.30f;
+        float crisis_mu_base = -7.5f;
+        float crisis_sigma_base = 0.20f;
+        
+        /* Start with calm */
+        set_realistic_calm();
+        
+        /* Initialize z̃ from stationary distribution */
+        float var_stat = (sigma_z * sigma_z) / fmaxf(1.0f - rho * rho, 1e-6f);
+        float z_tilde = sqrtf(var_stat) * normal();
+        float z = z_tilde_to_z(z_tilde);
+        
+        /* Initialize h */
+        float theta_z = eval_curve(theta_base, theta_scale, theta_rate, z);
+        float mu_z = eval_curve(mu_base, mu_scale, mu_rate, z);
+        float sigma_h = eval_curve(sigma_base, sigma_scale, sigma_rate, z);
+        float phi = 1.0f - theta_z;
+        float h_var = (sigma_h * sigma_h) / fmaxf(1.0f - phi * phi, 1e-6f);
+        float h = mu_z + sqrtf(h_var) * normal();
+        
+        for (int t = 0; t < T; t++) {
+            /* Switch to crisis at transition point */
+            if (t == transition_point) {
+                rho = crisis_rho;
+                sigma_z = crisis_sigma_z;
+                mu_base = crisis_mu_base;
+                sigma_base = crisis_sigma_base;
+            }
+            
+            h_true[t] = h;
+            z_true[t] = z;
+            
+            /* Observation: y = h + log(χ²(1)) */
+            float eps = normal();
+            y[t] = h + logf(eps * eps + 1e-10f);
+            
+            /* Transition z̃ */
+            z_tilde = rho * z_tilde + sigma_z * normal();
+            z = z_tilde_to_z(z_tilde);
+            
+            /* Transition h */
+            theta_z = eval_curve(theta_base, theta_scale, theta_rate, z);
+            mu_z = eval_curve(mu_base, mu_scale, mu_rate, z);
+            sigma_h = eval_curve(sigma_base, sigma_scale, sigma_rate, z);
+            phi = 1.0f - theta_z;
+            h = phi * h + theta_z * mu_z + sigma_h * normal();
+        }
+    }
+    
+    /**
+     * @brief Print preset info showing what each setting produces
+     */
+    static void print_preset_info() {
+        printf("\n");
+        printf("╔═══════════════════════════════════════════════════════════════╗\n");
+        printf("║  SVDataGenerator Presets                                      ║\n");
+        printf("╠═══════════════════════════════════════════════════════════════╣\n");
+        printf("║  Preset              │ Ann Vol │   ρ    │  σ_z  │  μ_base    ║\n");
+        printf("╠──────────────────────┼─────────┼────────┼───────┼────────────╣\n");
+        printf("║  (default)           │  ~500%%  │  0.95  │ 0.15  │   -1.0     ║\n");
+        printf("║  set_realistic_calm  │  ~12%%   │  0.98  │ 0.08  │  -10.5     ║\n");
+        printf("║  set_realistic_moderate│ ~20%%  │  0.94  │ 0.15  │   -9.0     ║\n");
+        printf("║  set_realistic_crisis│  ~50%%   │  0.85  │ 0.30  │   -7.5     ║\n");
+        printf("╠═══════════════════════════════════════════════════════════════╣\n");
+        printf("║  Usage:                                                       ║\n");
+        printf("║    SVDataGenerator gen;                                       ║\n");
+        printf("║    gen.set_realistic_calm();  // or _crisis, _moderate        ║\n");
+        printf("║    gen.T = 2000;                                              ║\n");
+        printf("║    gen.generate();                                            ║\n");
+        printf("║                                                               ║\n");
+        printf("║  For regime change:                                           ║\n");
+        printf("║    gen.T = 2000;                                              ║\n");
+        printf("║    gen.generate_with_regime_change(1000);  // switch at t=1000║\n");
+        printf("╚═══════════════════════════════════════════════════════════════╝\n");
+        printf("\n");
+    }
+    
     /* Print true parameters for reference */
     void print_true_params() const {
         printf("TRUE PARAMETERS:\n");
@@ -123,6 +333,11 @@ struct SVDataGenerator {
         printf("  mu: base=%.3f, scale=%.3f, rate=%.3f\n", mu_base, mu_scale, mu_rate);
         printf("  sigma: base=%.3f, scale=%.3f, rate=%.3f\n", sigma_base, sigma_scale, sigma_rate);
         printf("  theta (fixed): base=%.3f, scale=%.3f, rate=%.3f\n", theta_base, theta_scale, theta_rate);
+        
+        /* Compute implied volatility */
+        float daily_std = expf(mu_base / 2.0f);
+        float annual_vol = daily_std * sqrtf(252.0f) * 100.0f;
+        printf("  Implied annual vol: ~%.0f%%\n", annual_vol);
     }
     
     /* Print data statistics */
