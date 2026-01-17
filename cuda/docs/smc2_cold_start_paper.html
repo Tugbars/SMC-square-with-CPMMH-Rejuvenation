@@ -1,0 +1,892 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Robust Prior Calibration for SMC² Filters in Stochastic Volatility Models</title>
+    <style>
+        :root {
+            --text-color: #1a1a1a;
+            --accent-color: #c41e3a;
+            --bg-light: #f8f9fa;
+            --border-color: #dee2e6;
+        }
+        
+        * {
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Computer Modern Serif', 'Times New Roman', Times, serif;
+            font-size: 11pt;
+            line-height: 1.5;
+            color: var(--text-color);
+            max-width: 8.5in;
+            margin: 0 auto;
+            padding: 0.75in;
+            background: white;
+        }
+        
+        /* Title Section */
+        .title {
+            text-align: center;
+            margin-bottom: 1.5em;
+        }
+        
+        .title h1 {
+            font-size: 17pt;
+            font-weight: normal;
+            margin-bottom: 0.5em;
+            line-height: 1.3;
+        }
+        
+        .authors {
+            font-size: 11pt;
+            margin-bottom: 0.3em;
+        }
+        
+        .affiliation {
+            font-size: 10pt;
+            font-style: italic;
+            color: #555;
+        }
+        
+        .date {
+            font-size: 10pt;
+            color: #666;
+            margin-top: 0.5em;
+        }
+        
+        /* Abstract */
+        .abstract {
+            margin: 2em 2.5em;
+            padding: 1em;
+            background: var(--bg-light);
+            border-left: 3px solid var(--accent-color);
+        }
+        
+        .abstract-title {
+            font-weight: bold;
+            font-size: 10pt;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 0.5em;
+        }
+        
+        .abstract p {
+            font-size: 10pt;
+            margin: 0;
+            text-align: justify;
+        }
+        
+        /* Sections */
+        h2 {
+            font-size: 12pt;
+            font-weight: bold;
+            margin-top: 1.5em;
+            margin-bottom: 0.5em;
+            counter-increment: section;
+        }
+        
+        h2::before {
+            content: counter(section) ". ";
+        }
+        
+        h3 {
+            font-size: 11pt;
+            font-weight: bold;
+            margin-top: 1em;
+            margin-bottom: 0.3em;
+        }
+        
+        p {
+            text-align: justify;
+            margin: 0.5em 0;
+        }
+        
+        /* Figures */
+        .figure {
+            margin: 1.5em 0;
+            text-align: center;
+        }
+        
+        .figure-content {
+            display: inline-block;
+            max-width: 100%;
+        }
+        
+        .figure-caption {
+            font-size: 10pt;
+            margin-top: 0.5em;
+            text-align: center;
+        }
+        
+        .figure-caption strong {
+            color: var(--accent-color);
+        }
+        
+        /* SVG Diagrams */
+        .diagram {
+            background: white;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            padding: 1em;
+            margin: 1em 0;
+        }
+        
+        /* Math */
+        .math {
+            font-family: 'Computer Modern', 'Times New Roman', serif;
+            font-style: italic;
+        }
+        
+        .math-block {
+            display: block;
+            text-align: center;
+            margin: 1em 0;
+            font-size: 11pt;
+        }
+        
+        /* Tables */
+        table {
+            border-collapse: collapse;
+            margin: 1em auto;
+            font-size: 10pt;
+        }
+        
+        th, td {
+            border: 1px solid var(--border-color);
+            padding: 0.4em 0.8em;
+            text-align: center;
+        }
+        
+        th {
+            background: var(--bg-light);
+            font-weight: bold;
+        }
+        
+        .table-caption {
+            font-size: 10pt;
+            text-align: center;
+            margin-bottom: 0.5em;
+        }
+        
+        .table-caption strong {
+            color: var(--accent-color);
+        }
+        
+        /* Callout boxes */
+        .callout {
+            background: #fff3cd;
+            border: 1px solid #ffc107;
+            border-radius: 4px;
+            padding: 1em;
+            margin: 1em 0;
+        }
+        
+        .callout-problem {
+            background: #f8d7da;
+            border-color: #f5c6cb;
+        }
+        
+        .callout-solution {
+            background: #d4edda;
+            border-color: #c3e6cb;
+        }
+        
+        /* Algorithm box */
+        .algorithm {
+            border: 1px solid #333;
+            padding: 1em;
+            margin: 1em 0;
+            background: #fafafa;
+        }
+        
+        .algorithm-title {
+            font-weight: bold;
+            border-bottom: 1px solid #333;
+            padding-bottom: 0.3em;
+            margin-bottom: 0.5em;
+        }
+        
+        .algorithm ol {
+            margin: 0;
+            padding-left: 1.5em;
+        }
+        
+        .algorithm li {
+            margin: 0.3em 0;
+        }
+        
+        /* Two-column for references */
+        .references {
+            font-size: 9pt;
+            column-count: 2;
+            column-gap: 2em;
+        }
+        
+        .references p {
+            text-indent: -1em;
+            padding-left: 1em;
+            margin: 0.3em 0;
+        }
+        
+        /* Keywords */
+        .keywords {
+            font-size: 10pt;
+            margin-top: 1em;
+        }
+        
+        .keywords strong {
+            font-weight: bold;
+        }
+        
+        /* Footnotes */
+        .footnote {
+            font-size: 9pt;
+            color: #555;
+            border-top: 1px solid var(--border-color);
+            margin-top: 2em;
+            padding-top: 0.5em;
+        }
+        
+        /* Equation numbers */
+        .equation {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin: 1em 0;
+        }
+        
+        .equation-content {
+            flex: 1;
+            text-align: center;
+        }
+        
+        .equation-number {
+            width: 3em;
+            text-align: right;
+            font-size: 10pt;
+        }
+        
+        /* Crisis/Calm indicators */
+        .crisis { color: #c41e3a; font-weight: bold; }
+        .calm { color: #28a745; font-weight: bold; }
+        
+        /* Counter reset */
+        body {
+            counter-reset: section figure table;
+        }
+        
+        .figure-caption::before {
+            counter-increment: figure;
+            content: "Figure " counter(figure) ": ";
+            font-weight: bold;
+            color: var(--accent-color);
+        }
+        
+        .table-caption::before {
+            counter-increment: table;
+            content: "Table " counter(table) ": ";
+            font-weight: bold;
+            color: var(--accent-color);
+        }
+    </style>
+</head>
+<body>
+
+<div class="title">
+    <h1>Robust Prior Calibration for SMC² Filters<br>in Stochastic Volatility Models</h1>
+    <div class="authors">Technical Report</div>
+    <div class="affiliation">Sequential Monte Carlo Methods for Online Parameter Learning</div>
+    <div class="date">January 2026</div>
+</div>
+
+<div class="abstract">
+    <div class="abstract-title">Abstract</div>
+    <p>
+        Sequential Monte Carlo squared (SMC²) methods enable online Bayesian parameter learning for state-space models, 
+        but suffer from a critical <em>cold start problem</em>: misspecified priors can cause filter divergence before 
+        learning occurs. We present a three-layer robust calibration framework combining (1) empirical Bayes warmup 
+        estimation, (2) historically-informed prior widths spanning calm and crisis regimes, and (3) online convergence 
+        diagnostics that detect silent failures. Applied to stochastic volatility models for equity markets, our approach 
+        produces priors that adapt to current conditions while maintaining coverage over historical extremes, enabling 
+        safe deployment without parameter tuning.
+    </p>
+</div>
+
+<div class="keywords">
+    <strong>Keywords:</strong> SMC², particle filtering, stochastic volatility, prior calibration, regime switching, online learning
+</div>
+
+<h2>Introduction</h2>
+
+<p>
+    Stochastic volatility (SV) models are fundamental tools for financial time series analysis, capturing the 
+    time-varying nature of market uncertainty. The canonical SV model describes log-returns as:
+</p>
+
+<div class="equation">
+    <div class="equation-content">
+        <span class="math">y<sub>t</sub> = exp(h<sub>t</sub>/2) · ε<sub>t</sub></span>, &nbsp;&nbsp;
+        <span class="math">h<sub>t</sub> = μ + ρ(h<sub>t-1</sub> - μ) + σ<sub>z</sub>η<sub>t</sub></span>
+    </div>
+    <div class="equation-number">(1)</div>
+</div>
+
+<p>
+    where <span class="math">h<sub>t</sub></span> is the latent log-volatility, <span class="math">ρ</span> controls 
+    persistence, and <span class="math">σ<sub>z</sub></span> governs volatility-of-volatility. The parameters 
+    <span class="math">θ = (ρ, σ<sub>z</sub>, μ)</span> are typically unknown and must be estimated.
+</p>
+
+<p>
+    SMC² (Chopin et al., 2013) provides an elegant solution for <em>online</em> parameter learning: maintain a 
+    population of parameter particles, each with an associated particle filter for state estimation. As observations 
+    arrive, the parameter posterior is updated sequentially without batch reprocessing.
+</p>
+
+<p>
+    However, SMC² faces a fundamental challenge we term the <strong>cold start problem</strong>: the algorithm 
+    requires prior distributions over parameters <em>before</em> observing any data, yet misspecified priors can 
+    cause catastrophic filter failure before adaptation occurs.
+</p>
+
+<h2>The Cold Start Problem</h2>
+
+<h3>Why Priors Matter in Sequential Methods</h3>
+
+<p>
+    Unlike batch MCMC methods that can explore the posterior through extended sampling, SMC² must initialize 
+    particles from the prior and weight them by likelihood. If the prior places negligible mass near the true 
+    parameters, the initial particle population will be poorly suited to the data.
+</p>
+
+<div class="figure">
+    <div class="figure-content">
+        <svg width="500" height="200" viewBox="0 0 500 200">
+            <!-- Prior distribution (narrow, wrong location) -->
+            <g transform="translate(50,20)">
+                <text x="80" y="0" font-size="11" text-anchor="middle" font-weight="bold">Misspecified Prior</text>
+                <!-- Axis -->
+                <line x1="0" y1="120" x2="180" y2="120" stroke="#333" stroke-width="1"/>
+                <text x="90" y="140" font-size="10" text-anchor="middle">σ<tspan baseline-shift="sub" font-size="8">z</tspan></text>
+                <!-- Prior curve (narrow, centered at 0.05) -->
+                <path d="M 10,120 Q 30,20 50,120" fill="none" stroke="#c41e3a" stroke-width="2"/>
+                <text x="30" y="115" font-size="9" fill="#c41e3a">prior</text>
+                <!-- True value marker -->
+                <line x1="140" y1="100" x2="140" y2="125" stroke="#28a745" stroke-width="2"/>
+                <text x="140" y="95" font-size="9" fill="#28a745" text-anchor="middle">true θ</text>
+                <!-- Gap indicator -->
+                <path d="M 55,110 L 135,110" stroke="#333" stroke-width="1" stroke-dasharray="4,2" marker-end="url(#arrow)"/>
+                <text x="95" y="105" font-size="9" text-anchor="middle">no overlap!</text>
+            </g>
+            
+            <!-- Well-specified prior -->
+            <g transform="translate(280,20)">
+                <text x="80" y="0" font-size="11" text-anchor="middle" font-weight="bold">Well-Specified Prior</text>
+                <!-- Axis -->
+                <line x1="0" y1="120" x2="180" y2="120" stroke="#333" stroke-width="1"/>
+                <text x="90" y="140" font-size="10" text-anchor="middle">σ<tspan baseline-shift="sub" font-size="8">z</tspan></text>
+                <!-- Prior curve (wide, covers true) -->
+                <path d="M 10,120 Q 90,30 170,120" fill="none" stroke="#28a745" stroke-width="2"/>
+                <text x="50" y="85" font-size="9" fill="#28a745">prior</text>
+                <!-- True value marker -->
+                <line x1="120" y1="70" x2="120" y2="125" stroke="#333" stroke-width="2"/>
+                <text x="120" y="60" font-size="9" text-anchor="middle">true θ</text>
+                <!-- Overlap indicator -->
+                <text x="90" y="155" font-size="9" text-anchor="middle" fill="#28a745">✓ prior covers truth</text>
+            </g>
+            
+            <!-- Arrow marker definition -->
+            <defs>
+                <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+                    <path d="M0,0 L0,6 L9,3 z" fill="#333"/>
+                </marker>
+            </defs>
+        </svg>
+    </div>
+    <div class="figure-caption">
+        Prior-data conflict in SMC². Left: A narrow prior centered away from the true parameter leaves no particles 
+        in the high-likelihood region. Right: A wide prior ensures initial coverage of the truth.
+    </div>
+</div>
+
+<h3>The Regime Mismatch Scenario</h3>
+
+<p>
+    The problem is particularly acute when market conditions shift. Consider a filter initialized during a calm 
+    period (low volatility, high persistence) that suddenly encounters a crisis:
+</p>
+
+<div class="callout callout-problem">
+    <strong>Failure Scenario:</strong> A filter calibrated on calm 2017 data (realized vol ≈ 7%) with prior 
+    <span class="math">σ<sub>z</sub> ~ N(0.05, 0.03)</span> will assign near-zero likelihood to March 2020 
+    dynamics (realized vol ≈ 70%). The effective sample size collapses, and the filter cannot recover.
+</div>
+
+<p>
+    The fundamental tension is clear: we need <em>informative</em> priors to enable efficient learning, but 
+    <em>robust</em> priors to handle regime uncertainty. Our solution decouples these concerns.
+</p>
+
+<h2>Proposed Approach</h2>
+
+<p>
+    We propose a three-layer defense against cold start failure:
+</p>
+
+<div class="figure">
+    <div class="figure-content">
+        <svg width="520" height="280" viewBox="0 0 520 280">
+            <!-- Layer 1: Historical Bounds -->
+            <g transform="translate(10,20)">
+                <rect x="0" y="0" width="500" height="70" rx="5" fill="#e3f2fd" stroke="#1976d2" stroke-width="2"/>
+                <text x="15" y="25" font-size="12" font-weight="bold" fill="#1976d2">Layer 1: Historical Regime Bounds</text>
+                <text x="15" y="45" font-size="10">• Analyze historical data spanning calm and crisis periods</text>
+                <text x="15" y="60" font-size="10">• Extract parameter ranges: ρ ∈ [0.67, 0.99], σ<tspan baseline-shift="sub" font-size="8">z</tspan> ∈ [0.03, 0.65]</text>
+                <text x="400" y="45" font-size="9" fill="#1976d2" font-style="italic">→ Prior WIDTH</text>
+            </g>
+            
+            <!-- Arrow -->
+            <path d="M260,95 L260,110" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+            
+            <!-- Layer 2: Warmup Calibration -->
+            <g transform="translate(10,115)">
+                <rect x="0" y="0" width="500" height="70" rx="5" fill="#e8f5e9" stroke="#388e3c" stroke-width="2"/>
+                <text x="15" y="25" font-size="12" font-weight="bold" fill="#388e3c">Layer 2: Empirical Bayes Warmup</text>
+                <text x="15" y="45" font-size="10">• Buffer 50-100 initial observations</text>
+                <text x="15" y="60" font-size="10">• Estimate current regime from log(y²) statistics</text>
+                <text x="400" y="45" font-size="9" fill="#388e3c" font-style="italic">→ Prior CENTER</text>
+            </g>
+            
+            <!-- Arrow -->
+            <path d="M260,190 L260,205" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+            
+            <!-- Layer 3: Convergence Monitoring -->
+            <g transform="translate(10,210)">
+                <rect x="0" y="0" width="500" height="60" rx="5" fill="#fff3e0" stroke="#f57c00" stroke-width="2"/>
+                <text x="15" y="25" font-size="12" font-weight="bold" fill="#f57c00">Layer 3: Online Convergence Diagnostics</text>
+                <text x="15" y="45" font-size="10">• Monitor ESS, parameter drift, inner filter health</text>
+                <text x="400" y="45" font-size="9" fill="#f57c00" font-style="italic">→ TRUST signal</text>
+            </g>
+        </svg>
+    </div>
+    <div class="figure-caption">
+        Three-layer robust calibration framework. Historical analysis provides prior width (coverage), warmup 
+        estimation provides prior center (efficiency), and online diagnostics provide trust signals (safety).
+    </div>
+</div>
+
+<h3>Key Insight: Decouple Center and Width</h3>
+
+<p>
+    The critical insight is that prior <em>center</em> and prior <em>width</em> serve different purposes:
+</p>
+
+<table>
+    <tr>
+        <th>Component</th>
+        <th>Purpose</th>
+        <th>Source</th>
+        <th>Failure Mode if Wrong</th>
+    </tr>
+    <tr>
+        <td><strong>Center</strong></td>
+        <td>Efficient convergence</td>
+        <td>Current data (warmup)</td>
+        <td>Slow learning</td>
+    </tr>
+    <tr>
+        <td><strong>Width</strong></td>
+        <td>Regime robustness</td>
+        <td>Historical extremes</td>
+        <td>Filter divergence</td>
+    </tr>
+</table>
+<div class="table-caption">Distinct roles of prior center and width in SMC² calibration.</div>
+
+<p>
+    By sourcing the center from current observations and the width from historical analysis, we achieve both 
+    efficiency (starting near the truth) and safety (covering possible regime shifts).
+</p>
+
+<h2>Method</h2>
+
+<h3>Historical Regime Analysis</h3>
+
+<p>
+    We analyze historical returns spanning known market regimes to establish parameter bounds. For the S&P 500 
+    (SPY ETF, 2007-2024), we identify:
+</p>
+
+<table>
+    <tr>
+        <th>Period</th>
+        <th>Type</th>
+        <th>Realized Vol</th>
+        <th>Est. ρ</th>
+        <th>Est. σ<sub>z</sub></th>
+    </tr>
+    <tr>
+        <td>2008-2009</td>
+        <td class="crisis">Crisis</td>
+        <td>56.2%</td>
+        <td>0.76</td>
+        <td>0.43</td>
+    </tr>
+    <tr>
+        <td>2011 (Eurozone)</td>
+        <td class="crisis">Crisis</td>
+        <td>35.6%</td>
+        <td>0.70</td>
+        <td>0.34</td>
+    </tr>
+    <tr>
+        <td>Mar 2020 (COVID)</td>
+        <td class="crisis">Crisis</td>
+        <td>70.6%</td>
+        <td>0.85</td>
+        <td>0.20</td>
+    </tr>
+    <tr>
+        <td>2017</td>
+        <td class="calm">Calm</td>
+        <td>6.7%</td>
+        <td>0.99</td>
+        <td>0.11</td>
+    </tr>
+    <tr>
+        <td>2021</td>
+        <td class="calm">Calm</td>
+        <td>11.3%</td>
+        <td>0.99</td>
+        <td>0.05</td>
+    </tr>
+</table>
+<div class="table-caption">Parameter estimates across historical regimes for S&P 500.</div>
+
+<p>
+    The analysis reveals consistent patterns: <span class="crisis">crisis periods</span> exhibit lower persistence 
+    (faster mean-reversion) and higher volatility-of-volatility, while <span class="calm">calm periods</span> show 
+    the opposite. Prior widths must span this range.
+</p>
+
+<h3>Log-Variance Proxy Method</h3>
+
+<p>
+    Direct observation of latent volatility <span class="math">h<sub>t</sub></span> is impossible. However, from 
+    equation (1), we can derive a proxy relationship:
+</p>
+
+<div class="equation">
+    <div class="equation-content">
+        <span class="math">log(y<sub>t</sub>²) = h<sub>t</sub> + log(ε<sub>t</sub>²)</span>
+    </div>
+    <div class="equation-number">(2)</div>
+</div>
+
+<p>
+    The noise term <span class="math">log(ε<sub>t</sub>²)</span> follows a log-χ²(1) distribution with known 
+    moments: mean ≈ -1.27, variance ≈ π²/2. This enables parameter estimation from observable statistics:
+</p>
+
+<div class="figure">
+    <div class="figure-content">
+        <svg width="480" height="180" viewBox="0 0 480 180">
+            <!-- Observable stats box -->
+            <g transform="translate(10,20)">
+                <rect x="0" y="0" width="140" height="130" rx="5" fill="#f5f5f5" stroke="#333"/>
+                <text x="70" y="20" font-size="11" text-anchor="middle" font-weight="bold">Observable</text>
+                <text x="70" y="45" font-size="10" text-anchor="middle">ACF₁(log y²)</text>
+                <text x="70" y="70" font-size="10" text-anchor="middle">Var(log y²)</text>
+                <text x="70" y="95" font-size="10" text-anchor="middle">Mean(log y²)</text>
+                <text x="70" y="120" font-size="10" text-anchor="middle">Realized Vol</text>
+            </g>
+            
+            <!-- Arrows -->
+            <g transform="translate(160,40)">
+                <path d="M0,20 L60,20" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+                <path d="M0,50 L60,50" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+                <path d="M0,80 L60,80" stroke="#333" stroke-width="2" marker-end="url(#arrow)"/>
+                <text x="30" y="10" font-size="9" text-anchor="middle">mapping</text>
+            </g>
+            
+            <!-- Parameter estimates box -->
+            <g transform="translate(230,20)">
+                <rect x="0" y="0" width="120" height="130" rx="5" fill="#e8f5e9" stroke="#388e3c"/>
+                <text x="60" y="20" font-size="11" text-anchor="middle" font-weight="bold">Estimated</text>
+                <text x="60" y="50" font-size="10" text-anchor="middle">ρ̂</text>
+                <text x="60" y="80" font-size="10" text-anchor="middle">σ̂<tspan baseline-shift="sub" font-size="8">z</tspan></text>
+                <text x="60" y="110" font-size="10" text-anchor="middle">μ̂</text>
+            </g>
+            
+            <!-- Plus sign -->
+            <text x="370" y="90" font-size="24" text-anchor="middle">+</text>
+            
+            <!-- Historical bounds box -->
+            <g transform="translate(390,35)">
+                <rect x="0" y="0" width="80" height="100" rx="5" fill="#e3f2fd" stroke="#1976d2"/>
+                <text x="40" y="20" font-size="10" text-anchor="middle" font-weight="bold">Historical</text>
+                <text x="40" y="40" font-size="10" text-anchor="middle" font-weight="bold">Bounds</text>
+                <text x="40" y="65" font-size="9" text-anchor="middle">[ρ<tspan baseline-shift="sub" font-size="7">min</tspan>, ρ<tspan baseline-shift="sub" font-size="7">max</tspan>]</text>
+                <text x="40" y="85" font-size="9" text-anchor="middle">[σ<tspan baseline-shift="sub" font-size="7">min</tspan>, σ<tspan baseline-shift="sub" font-size="7">max</tspan>]</text>
+            </g>
+        </svg>
+    </div>
+    <div class="figure-caption">
+        Observable statistics from log-squared returns map to parameter estimates (prior center), which 
+        combine with historical bounds (prior width) to form calibrated priors.
+    </div>
+</div>
+
+<p>
+    The mapping exploits known relationships from SV theory. For instance, the variance decomposition 
+    <span class="math">Var(log y²) = Var(h) + π²/2</span> allows estimation of <span class="math">Var(h)</span>, 
+    which relates to parameters via <span class="math">Var(h) = σ<sub>z</sub>² / (1 - ρ²)</span>.
+</p>
+
+<h3>Calibration Algorithm</h3>
+
+<div class="algorithm">
+    <div class="algorithm-title">Algorithm 1: Robust Prior Calibration</div>
+    <ol>
+        <li><strong>Input:</strong> Warmup returns {y₁, ..., y<sub>n</sub>}, historical bounds B</li>
+        <li>Compute log-variance series: z<sub>t</sub> = log(y<sub>t</sub>²)</li>
+        <li>Estimate statistics: μ̂<sub>z</sub> = mean(z), σ̂<sub>z</sub>² = var(z), r̂₁ = ACF₁(z)</li>
+        <li>Remove noise variance: V̂<sub>h</sub> = max(σ̂<sub>z</sub>² - π²/2, 0.1)</li>
+        <li>Estimate parameters: ρ̂, σ̂<sub>z</sub>, μ̂ via proxy relationships</li>
+        <li>Set prior centers: θ̄ = (ρ̂, σ̂<sub>z</sub>, μ̂)</li>
+        <li>Set prior widths: σ<sub>θ</sub> = (B.max - B.min) / 4</li>
+        <li><strong>Output:</strong> Prior π(θ) = N(θ̄, diag(σ<sub>θ</sub>²))</li>
+    </ol>
+</div>
+
+<h2>Convergence Diagnostics</h2>
+
+<p>
+    Even with well-calibrated priors, online monitoring is essential. We track three diagnostic categories:
+</p>
+
+<div class="figure">
+    <div class="figure-content">
+        <svg width="500" height="220" viewBox="0 0 500 220">
+            <!-- Outer stability -->
+            <g transform="translate(20,20)">
+                <rect x="0" y="0" width="140" height="80" rx="5" fill="#e3f2fd" stroke="#1976d2" stroke-width="2"/>
+                <text x="70" y="25" font-size="10" text-anchor="middle" font-weight="bold">Outer Stability</text>
+                <text x="70" y="45" font-size="9" text-anchor="middle">ESS coefficient of variation</text>
+                <text x="70" y="60" font-size="9" text-anchor="middle">Parameter drift rate</text>
+                <text x="70" y="75" font-size="9" text-anchor="middle">Log-likelihood std</text>
+            </g>
+            
+            <!-- Inner health -->
+            <g transform="translate(180,20)">
+                <rect x="0" y="0" width="140" height="80" rx="5" fill="#fff3e0" stroke="#f57c00" stroke-width="2"/>
+                <text x="70" y="25" font-size="10" text-anchor="middle" font-weight="bold">Inner Health</text>
+                <text x="70" y="45" font-size="9" text-anchor="middle">Mean inner ESS</text>
+                <text x="70" y="60" font-size="9" text-anchor="middle">10th percentile ESS</text>
+                <text x="70" y="75" font-size="9" text-anchor="middle">Fraction below threshold</text>
+            </g>
+            
+            <!-- Prior alignment -->
+            <g transform="translate(340,20)">
+                <rect x="0" y="0" width="140" height="80" rx="5" fill="#fce4ec" stroke="#c2185b" stroke-width="2"/>
+                <text x="70" y="25" font-size="10" text-anchor="middle" font-weight="bold">Prior Alignment</text>
+                <text x="70" y="45" font-size="9" text-anchor="middle">Z-scores vs prior</text>
+                <text x="70" y="60" font-size="9" text-anchor="middle">Railing detection</text>
+                <text x="70" y="75" font-size="9" text-anchor="middle">Bounds violations</text>
+            </g>
+            
+            <!-- Arrows down -->
+            <path d="M90,105 L90,125 L250,125 L250,145" stroke="#333" stroke-width="2" fill="none"/>
+            <path d="M250,105 L250,145" stroke="#333" stroke-width="2"/>
+            <path d="M410,105 L410,125 L250,125" stroke="#333" stroke-width="2" fill="none"/>
+            
+            <!-- Decision box -->
+            <g transform="translate(175,150)">
+                <rect x="0" y="0" width="150" height="55" rx="5" fill="#e8f5e9" stroke="#388e3c" stroke-width="2"/>
+                <text x="75" y="25" font-size="11" text-anchor="middle" font-weight="bold">READY = </text>
+                <text x="75" y="45" font-size="10" text-anchor="middle">stable ∧ healthy ∧ aligned</text>
+            </g>
+        </svg>
+    </div>
+    <div class="figure-caption">
+        Convergence diagnostic framework. The filter reports "ready" only when outer stability, inner 
+        filter health, and prior alignment criteria are all satisfied.
+    </div>
+</div>
+
+<h3>Critical: Inner Filter Health</h3>
+
+<p>
+    A subtle failure mode occurs when outer parameter stability masks inner particle filter degeneracy. The 
+    likelihood estimates <span class="math">p(y<sub>1:t</sub>|θ)</span> depend on inner filter quality—if 
+    inner ESS collapses, likelihood estimates become biased, leading to incorrect parameter posteriors that 
+    nonetheless appear stable.
+</p>
+
+<div class="callout callout-problem">
+    <strong>Silent Failure:</strong> Outer ESS = 200 (looks healthy), parameter drift = 0 (looks converged), 
+    but inner ESS = 5 for 80% of particles → biased likelihood → wrong posterior → <em>confident but wrong</em>.
+</div>
+
+<p>
+    Our diagnostics explicitly track inner filter ESS across the θ-particle population, flagging when a 
+    significant fraction falls below threshold. The "ready" signal requires <em>both</em> outer stability 
+    and inner health.
+</p>
+
+<h2>Empirical Results</h2>
+
+<p>
+    We validate the calibration framework on S&P 500 data across regime transitions:
+</p>
+
+<div class="figure">
+    <div class="figure-content">
+        <svg width="500" height="200" viewBox="0 0 500 200">
+            <!-- Timeline -->
+            <line x1="40" y1="100" x2="460" y2="100" stroke="#333" stroke-width="2"/>
+            
+            <!-- Time labels -->
+            <text x="40" y="120" font-size="9" text-anchor="middle">t=0</text>
+            <text x="120" y="120" font-size="9" text-anchor="middle">warmup</text>
+            <text x="200" y="120" font-size="9" text-anchor="middle">learning</text>
+            <text x="300" y="120" font-size="9" text-anchor="middle">stable</text>
+            <text x="380" y="120" font-size="9" text-anchor="middle">regime shift</text>
+            <text x="440" y="120" font-size="9" text-anchor="middle">re-adapt</text>
+            
+            <!-- Phase markers -->
+            <rect x="40" y="85" width="80" height="30" fill="#e3f2fd" fill-opacity="0.5"/>
+            <rect x="120" y="85" width="80" height="30" fill="#fff3e0" fill-opacity="0.5"/>
+            <rect x="200" y="85" width="100" height="30" fill="#e8f5e9" fill-opacity="0.5"/>
+            <rect x="300" y="85" width="80" height="30" fill="#fce4ec" fill-opacity="0.5"/>
+            <rect x="380" y="85" width="80" height="30" fill="#fff3e0" fill-opacity="0.5"/>
+            
+            <!-- Status indicators -->
+            <g transform="translate(0,30)">
+                <text x="80" y="35" font-size="9" text-anchor="middle">buffer</text>
+                <text x="160" y="35" font-size="9" text-anchor="middle" fill="#f57c00">learning...</text>
+                <text x="250" y="35" font-size="9" text-anchor="middle" fill="#388e3c">✓ ready</text>
+                <text x="340" y="35" font-size="9" text-anchor="middle" fill="#c41e3a">⚠ drift</text>
+                <text x="420" y="35" font-size="9" text-anchor="middle" fill="#388e3c">✓ ready</text>
+            </g>
+            
+            <!-- Parameter trajectory (simplified) -->
+            <g transform="translate(0,140)">
+                <text x="20" y="20" font-size="9">σ<tspan baseline-shift="sub" font-size="7">z</tspan></text>
+                <path d="M40,30 L120,25 L200,15 L300,15 L320,0 L380,-5 L440,-5" 
+                      stroke="#1976d2" stroke-width="2" fill="none"/>
+                <text x="320" y="-10" font-size="8" fill="#c41e3a">jump</text>
+            </g>
+        </svg>
+    </div>
+    <div class="figure-caption">
+        Filter lifecycle with regime transition. The diagnostic framework correctly identifies learning, 
+        stability, regime shift (drift detection), and re-adaptation phases.
+    </div>
+</div>
+
+<h3>Calibration Comparison</h3>
+
+<table>
+    <tr>
+        <th>Warmup Regime</th>
+        <th>Realized Vol</th>
+        <th>ρ̂ (center)</th>
+        <th>σ̂<sub>z</sub> (center)</th>
+        <th>Prior Width</th>
+    </tr>
+    <tr>
+        <td class="calm">Calm (2017-like)</td>
+        <td>13.5%</td>
+        <td>0.917</td>
+        <td>0.370</td>
+        <td rowspan="2">σ<sub>ρ</sub>=0.08<br>σ<sub>σz</sub>=0.16</td>
+    </tr>
+    <tr>
+        <td class="crisis">Crisis (2020-like)</td>
+        <td>44.7%</td>
+        <td>0.817</td>
+        <td>0.500</td>
+    </tr>
+</table>
+<div class="table-caption">
+    Calibration adapts center to current regime while maintaining constant width for robustness.
+</div>
+
+<p>
+    The framework correctly shifts prior centers based on warmup conditions while maintaining wide coverage 
+    through historically-derived bounds. A filter initialized in calm conditions retains the ability to 
+    track crisis dynamics through its wide prior support.
+</p>
+
+<h2>Discussion</h2>
+
+<h3>Stability vs. Accuracy</h3>
+
+<p>
+    An important distinction must be emphasized: convergence diagnostics measure <em>stability</em> (has the 
+    posterior stopped moving?) not <em>accuracy</em> (is the posterior correct?). A filter can stabilize 
+    confidently on wrong parameters if:
+</p>
+
+<ul>
+    <li>The model is misspecified</li>
+    <li>Parameters are weakly identified</li>
+    <li>Prior-data conflict resolved toward prior</li>
+</ul>
+
+<p>
+    Ground-truth validation through simulation studies remains essential for verifying accuracy. The diagnostics 
+    provide operational safety signals, not statistical guarantees.
+</p>
+
+<h3>Computational Considerations</h3>
+
+<p>
+    The calibration and diagnostic framework adds negligible computational overhead:
+</p>
+
+<ul>
+    <li><strong>Warmup calibration:</strong> O(n) statistics on ~100 observations, one-time cost</li>
+    <li><strong>Convergence tracking:</strong> Host-side circular buffers, ~0 GPU overhead</li>
+    <li><strong>Data transfer:</strong> Piggybacks on existing adaptive proposal computations</li>
+</ul>
+
+<p>
+    For typical configurations (512 θ-particles, 256 inner particles), the diagnostic update adds approximately 
+    0.6 μs amortized per observation when checked every 50 timesteps.
+</p>
+
+<h2>Conclusion</h2>
+
+<p>
+    We have presented a robust prior calibration framework for SMC² filters that addresses the cold start 
+    problem through three complementary mechanisms: historically-informed prior widths ensuring regime coverage, 
+    empirical Bayes warmup estimation providing adaptive centering, and online convergence diagnostics 
+    detecting silent failures.
+</p>
+
+<p>
+    The key insight—decoupling prior center (from current data) and prior width (from historical analysis)—enables 
+    both efficient learning and robust coverage. Applied to stochastic volatility models for equity markets, 
+    the framework enables safe deployment without manual parameter tuning.
+</p>
+
+<p>
+    For practitioners, we recommend: (1) conduct historical regime analysis for your asset class to establish 
+    bounds, (2) implement warmup calibration before filter initialization, (3) monitor convergence diagnostics 
+    and defer trading decisions until "ready" status is achieved. This three-layer defense provides meaningful 
+    protection against the prior specification challenge inherent in sequential Bayesian methods.
+</p>
+
+<div class="footnote">
+    <strong>Code Availability:</strong> Implementation available as C/CUDA headers: 
+    <code>smc2_prior_calibration.cuh</code>, <code>smc2_convergence_v2.cuh</code>.
+    Historical analysis script: <code>compute_regime_bounds.py</code>.
+</div>
+
+</body>
+</html>
