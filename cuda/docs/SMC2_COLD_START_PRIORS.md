@@ -234,9 +234,21 @@ int main() {
 
 ---
 
-## Diagnostics: Monitor, Don't Act
+## Diagnostics: Stability ≠ Accuracy
 
-Even with good calibration, monitor posterior-prior divergence as a health metric:
+**Critical distinction**: A stable filter can converge confidently to WRONG parameters.
+
+| What diagnostics measure | What they DON'T measure |
+|--------------------------|------------------------|
+| ✓ Stability - posterior stopped moving | ✗ Accuracy - posterior is correct |
+| ✓ Degeneracy - ESS health | ✗ Model specification |
+| ✓ Inner filter quality | ✗ Identifiability |
+
+**To verify accuracy**: Run simulation studies with known ground truth.
+
+### Convergence Diagnostics (v2)
+
+Even with good calibration, monitor filter health:
 
 ```cpp
 typedef struct {
