@@ -27,6 +27,7 @@ endif()
 # =============================================================================
 
 option(SMC2_USE_CUB_SORT "Use CUB BlockRadixSort instead of Bitonic (slower but standard)" OFF)
+option(SMC2_BUILD_TESTS "Build test executables" ON)
 
 # =============================================================================
 # Find CUDA Toolkit
@@ -123,38 +124,11 @@ if(WIN32)
 endif()
 
 # =============================================================================
-# Test Executable
+# Tests (delegated to test/CMakeLists.txt)
 # =============================================================================
 
-add_executable(test_smc2_cuda
-    test/test_smc2_cuda.cu
-)
-
-target_compile_options(test_smc2_cuda PRIVATE ${CUDA_COMMON_OPTIONS})
-
-# Propagate sort backend to test
-if(SMC2_USE_CUB_SORT)
-    target_compile_definitions(test_smc2_cuda PRIVATE SMC2_USE_CUB_SORT)
-endif()
-
-target_link_libraries(test_smc2_cuda 
-    PRIVATE 
-        smc2_rbpf_cuda
-        CUDA::cudart
-        CUDA::curand
-)
-
-set_target_properties(test_smc2_cuda PROPERTIES
-    CUDA_SEPARABLE_COMPILATION ON
-    CXX_STANDARD 17
-    CUDA_STANDARD 17
-    CUDA_ARCHITECTURES 120
-)
-
-if(WIN32)
-    target_compile_options(test_smc2_cuda PRIVATE ${CUDA_WIN_OPTIONS})
-else()
-    target_link_libraries(test_smc2_cuda PRIVATE m)
+if(SMC2_BUILD_TESTS)
+    add_subdirectory(test)
 endif()
 
 # =============================================================================
@@ -172,9 +146,13 @@ message(STATUS "  ┌───────────────────�
 message(STATUS "  │ SMC² RBPF CUDA                                              │")
 message(STATUS "  │                                                             │")
 message(STATUS "  │   Library:  smc2_rbpf_cuda                                  │")
-message(STATUS "  │   Test:     test_smc2_cuda                                  │")
 message(STATUS "  │   Target:   sm_120 (RTX 5080 Blackwell)                     │")
 message(STATUS "  │   CUDA:     ${CUDAToolkit_VERSION}")
 message(STATUS "  │   Sort:     ${SORT_BACKEND}")
+if(SMC2_BUILD_TESTS)
+message(STATUS "  │   Tests:    ON                                              │")
+else()
+message(STATUS "  │   Tests:    OFF                                             │")
+endif()
 message(STATUS "  └─────────────────────────────────────────────────────────────┘")
 message(STATUS "")

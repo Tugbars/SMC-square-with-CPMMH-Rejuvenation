@@ -21,7 +21,7 @@
  *   ./test_convergence <name>    # Specific test
  */
 
-#include "smc2_convergence_v2.cuh"
+#include "smc2_convergence.cuh"
 #include <cstdio>
 #include <cmath>
 #include <cstring>

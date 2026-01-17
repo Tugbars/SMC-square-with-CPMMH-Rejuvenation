@@ -72,6 +72,15 @@
 #include <cstdio>
 #include <cstring>
 
+/* Cross-platform alloca */
+#ifdef _WIN32
+    #include <malloc.h>
+    #define SMC2_ALLOCA(size) _alloca(size)
+#else
+    #include <alloca.h>
+    #define SMC2_ALLOCA(size) alloca(size)
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -235,7 +244,7 @@ static inline int smc2_compute_warmup_stats(
     stats->n_obs = n;
     
     /* Compute log(y²) for non-zero returns */
-    float* log_y2 = (float*)alloca(n * sizeof(float));
+    float* log_y2 = (float*)SMC2_ALLOCA(n * sizeof(float));
     int valid = 0;
     
     for (int i = 0; i < n; i++) {
