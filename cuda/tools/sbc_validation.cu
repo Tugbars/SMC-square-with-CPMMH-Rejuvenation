@@ -97,7 +97,13 @@ static float rand_normal() {
 }
 
 /* ============================================================================
- * Sample from Prior (with bounds clamping)
+ * Sample from Truncated Normal (rejection sampling)
+ * 
+ * IMPORTANT: The filter uses truncated priors (P(θ)=0 outside bounds).
+ * We must sample the SAME distribution, not clamp/censor.
+ * 
+ * Clamping piles probability mass at boundaries → breaks SBC.
+ * Rejection sampling maintains correct truncated normal density.
  * ============================================================================ */
 
 struct TrueParams {
@@ -111,33 +117,61 @@ struct TrueParams {
     float sigma_rate;
 };
 
+static float sample_truncated_normal(float mean, float std, float min_val, float max_val) {
+    float val;
+    int attempts = 0;
+    const int max_attempts = 1000;
+    
+    do {
+        val = mean + std * rand_normal();
+        attempts++;
+        
+        /* Fallback for extremely tight bounds or pathological cases */
+        if (attempts > max_attempts) {
+            /* Sample uniform within bounds as safe fallback */
+            val = min_val + rand_uniform() * (max_val - min_val);
+            break;
+        }
+    } while (val < min_val || val > max_val);
+    
+    return val;
+}
+
 static TrueParams sample_from_prior(const SMC2PriorGPU& prior, const SVBounds& bounds) {
     TrueParams theta;
     
-    /* Sample and clamp to bounds */
-    theta.rho = prior.rho_mean + prior.rho_std * rand_normal();
-    theta.rho = fmaxf(bounds.rho_min, fminf(bounds.rho_max, theta.rho));
+    /* Rejection sampling for each parameter */
+    theta.rho = sample_truncated_normal(
+        prior.rho_mean, prior.rho_std,
+        bounds.rho_min, bounds.rho_max);
     
-    theta.sigma_z = prior.sigma_z_mean + prior.sigma_z_std * rand_normal();
-    theta.sigma_z = fmaxf(bounds.sigma_z_min, fminf(bounds.sigma_z_max, theta.sigma_z));
+    theta.sigma_z = sample_truncated_normal(
+        prior.sigma_z_mean, prior.sigma_z_std,
+        bounds.sigma_z_min, bounds.sigma_z_max);
     
-    theta.mu_base = prior.mu_base_mean + prior.mu_base_std * rand_normal();
-    theta.mu_base = fmaxf(bounds.mu_base_min, fminf(bounds.mu_base_max, theta.mu_base));
+    theta.mu_base = sample_truncated_normal(
+        prior.mu_base_mean, prior.mu_base_std,
+        bounds.mu_base_min, bounds.mu_base_max);
     
-    theta.mu_scale = prior.mu_scale_mean + prior.mu_scale_std * rand_normal();
-    theta.mu_scale = fmaxf(bounds.mu_scale_min, fminf(bounds.mu_scale_max, theta.mu_scale));
+    theta.mu_scale = sample_truncated_normal(
+        prior.mu_scale_mean, prior.mu_scale_std,
+        bounds.mu_scale_min, bounds.mu_scale_max);
     
-    theta.mu_rate = prior.mu_rate_mean + prior.mu_rate_std * rand_normal();
-    theta.mu_rate = fmaxf(bounds.mu_rate_min, fminf(bounds.mu_rate_max, theta.mu_rate));
+    theta.mu_rate = sample_truncated_normal(
+        prior.mu_rate_mean, prior.mu_rate_std,
+        bounds.mu_rate_min, bounds.mu_rate_max);
     
-    theta.sigma_base = prior.sigma_base_mean + prior.sigma_base_std * rand_normal();
-    theta.sigma_base = fmaxf(bounds.sigma_base_min, fminf(bounds.sigma_base_max, theta.sigma_base));
+    theta.sigma_base = sample_truncated_normal(
+        prior.sigma_base_mean, prior.sigma_base_std,
+        bounds.sigma_base_min, bounds.sigma_base_max);
     
-    theta.sigma_scale = prior.sigma_scale_mean + prior.sigma_scale_std * rand_normal();
-    theta.sigma_scale = fmaxf(bounds.sigma_scale_min, fminf(bounds.sigma_scale_max, theta.sigma_scale));
+    theta.sigma_scale = sample_truncated_normal(
+        prior.sigma_scale_mean, prior.sigma_scale_std,
+        bounds.sigma_scale_min, bounds.sigma_scale_max);
     
-    theta.sigma_rate = prior.sigma_rate_mean + prior.sigma_rate_std * rand_normal();
-    theta.sigma_rate = fmaxf(bounds.sigma_rate_min, fminf(bounds.sigma_rate_max, theta.sigma_rate));
+    theta.sigma_rate = sample_truncated_normal(
+        prior.sigma_rate_mean, prior.sigma_rate_std,
+        bounds.sigma_rate_min, bounds.sigma_rate_max);
     
     return theta;
 }
