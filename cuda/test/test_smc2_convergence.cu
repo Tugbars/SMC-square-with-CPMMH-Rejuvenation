@@ -72,7 +72,7 @@ void test_vanishing_denominator(void) {
     printf("\n[Test 1] Vanishing Denominator (Drift Floor Fix)\n");
     
     SMC2ConvergenceTracker tracker;
-    smc2_conv_init(&tracker, 256, 256);
+    smc2_conv_init(&tracker, 1024, 512);
     
     /* Set priors (used for floor calculation) */
     float prior_mean[8] = {0.95f, 0.15f, -1.0f, 0.5f, 1.0f, 0.15f, 0.10f, 1.0f};
@@ -128,7 +128,7 @@ void test_negative_loglik_std(void) {
     printf("\n[Test 2] Negative Log-Likelihood Std Calculation\n");
     
     SMC2ConvergenceTracker tracker;
-    smc2_conv_init(&tracker, 256, 256);
+    smc2_conv_init(&tracker, 1024, 512);
     
     float theta_mean[8] = {0.95f, 0.15f, -1.0f, 0.5f, 1.0f, 0.15f, 0.10f, 1.0f};
     float theta_var[8] = {0.001f, 0.001f, 0.01f, 0.01f, 0.01f, 0.001f, 0.001f, 0.01f};
@@ -172,7 +172,7 @@ void test_circular_buffer_wraparound(void) {
     printf("\n[Test 3] Circular Buffer Wraparound\n");
     
     SMC2ConvergenceTracker tracker;
-    smc2_conv_init(&tracker, 256, 256);
+    smc2_conv_init(&tracker, 1024, 512);
     
     float theta_mean[8] = {0.90f, 0.10f, -1.0f, 0.5f, 1.0f, 0.15f, 0.10f, 1.0f};
     float theta_var[8] = {0.01f, 0.01f, 0.1f, 0.1f, 0.1f, 0.01f, 0.01f, 0.1f};
@@ -216,7 +216,7 @@ void test_happy_path(void) {
     printf("\n[Test 4] Happy Path (Static Params → Ready)\n");
     
     SMC2ConvergenceTracker tracker;
-    smc2_conv_init(&tracker, 256, 256);
+    smc2_conv_init(&tracker, 1024, 512);
     
     float prior_mean[8] = {0.90f, 0.10f, 0.0f, 0.5f, 1.0f, 0.15f, 0.10f, 1.0f};
     float prior_std[8] = {0.10f, 0.10f, 1.0f, 0.5f, 0.5f, 0.10f, 0.10f, 0.5f};
@@ -288,7 +288,7 @@ void test_regime_change(void) {
     printf("\n[Test 5] Regime Change Detection\n");
     
     SMC2ConvergenceTracker tracker;
-    smc2_conv_init(&tracker, 256, 256);
+    smc2_conv_init(&tracker, 1024, 512);
     
     float theta_mean[8] = {0.95f, 0.15f, -1.0f, 0.5f, 1.0f, 0.15f, 0.10f, 1.0f};
     float theta_var[8] = {0.001f, 0.001f, 0.01f, 0.01f, 0.01f, 0.001f, 0.001f, 0.01f};
@@ -353,8 +353,8 @@ void test_broken_inner_filter(void) {
     printf("\n[Test 6] Broken Inner Filter (Critical Health Check)\n");
     
     SMC2ConvergenceTracker tracker;
-    int N_theta = 256;
-    int N_inner = 256;
+    int N_theta = 1024;
+    int N_inner = 512;
     smc2_conv_init(&tracker, N_theta, N_inner);
     
     /* Outer filter looks PERFECT */
@@ -413,7 +413,7 @@ void test_nan_inf_handling(void) {
     printf("\n[Test 7] NaN/Inf Handling\n");
     
     SMC2ConvergenceTracker tracker;
-    smc2_conv_init(&tracker, 256, 256);
+    smc2_conv_init(&tracker, 1024, 512);
     
     float theta_mean_normal[8] = {0.95f, 0.15f, -1.0f, 0.5f, 1.0f, 0.15f, 0.10f, 1.0f};
     float theta_var_normal[8] = {0.01f, 0.01f, 0.1f, 0.1f, 0.1f, 0.01f, 0.01f, 0.1f};
